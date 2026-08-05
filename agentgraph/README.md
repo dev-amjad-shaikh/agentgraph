@@ -4,7 +4,7 @@
 
 `agentgraph` models agent workflows as **cyclic graphs over shared state**. Every state key is a versioned *channel* with per-key reducer semantics; nodes are async functions returning partial updates; execution follows a Pregel/BSP super-step model with first-class checkpoints, interrupts, streaming events, and dynamic fan-out. Dual-licensed under MIT OR Apache-2.0.
 
-> **Status: v0.2.0.** The public API surface — modules, types, and trait signatures in `src/` — is stable to build against. The state/reducer engine, graph builder + compile-time validation, Pregel/BSP executor super-step loop, in-memory, JSON-file, and Postgres checkpointers, `ChatModel` abstraction with token streaming, OpenAI-compatible client, parallel `ToolExecutor`, and the prebuilt ReAct agent (`react::create_react_agent`) are implemented and tested, with four runnable examples under [`examples/`](examples/). An axum HTTP/SSE server lives in the sibling [`agentgraph-server`](../agentgraph-server) crate. See the [roadmap](#roadmap) for what's next.
+> **Status: v0.3.0.** The public API surface — modules, types, and trait signatures in `src/` — is stable to build against. The state/reducer engine, graph builder + compile-time validation, Pregel/BSP executor super-step loop, in-memory, JSON-file, and Postgres checkpointers, `ChatModel` abstraction with token streaming, OpenAI-compatible client, parallel `ToolExecutor`, the prebuilt ReAct agent (`react::create_react_agent`), the MCP client, remote nodes (`RemoteNode`), and executor `tracing` instrumentation are implemented and tested, with four runnable examples under [`examples/`](examples/). An axum HTTP/SSE server lives in the sibling [`agentgraph-server`](../agentgraph-server) crate. See the [roadmap](#roadmap) for what's next.
 
 ## Why Rust?
 
@@ -28,12 +28,14 @@ The trade-off is deliberate: you give up Python's runtime monkey-patching and ge
 - **Token streaming** — `ChatModel::chat_stream` delivers incremental `TokenChunk`s through a callback (the OpenAI-compatible client decodes real SSE deltas; the default impl falls back to one chunk for source compatibility). Forward them into the executor's event channel (`Executor::with_token_tx` / `RunConfig::token_tx`) to surface `GraphEvent::Token` — the LangGraph `messages` stream mode.
 - **LLM & tool layer** — a minimal `ChatModel` trait, an `OpenAiCompatibleClient` (works with OpenAI, vLLM, Ollama, LM Studio, Azure-compatible gateways), and a `ToolRegistry` / `ToolExecutor` that dispatches tool calls **in parallel**, preserves call order, and isolates per-tool failures — everything needed for the ReAct pattern.
 - **`Command` routing** — nodes can override static edges with `NodeOutput::route(Command::goto(...))`, unifying state transition and control flow the way LangGraph's `Command` does.
+- **MCP client** *(v0.3)* — the `mcp` module lets an `agentgraph` `Tool` call any MCP server's tools over stdio transport. MCP tool servers register into `ToolRegistry` / `ToolExecutor` exactly like native tools, so the prebuilt ReAct agent drives them with no graph changes.
+- **Remote nodes** *(v0.3)* — the `remote` module's `RemoteNode` POSTs node execution to worker services over HTTP; the companion `agentgraph-worker` crate is the SDK that serves your handlers. HITL interrupts cross the wire — a remote node can suspend the run and resume with a human payload just like a local node.
 
 ## Quickstart
 
 ```toml
 [dependencies]
-agentgraph = "0.2"
+agentgraph = "0.3"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
@@ -202,6 +204,8 @@ Design rules worth knowing:
 | Streaming events | ✅ stream modes | ✅ typed `GraphEvent` stream over `tokio::mpsc`, incl. `Token` deltas (`messages` mode) |
 | Parallel node execution | ✅ (asyncio) | ✅ (tokio `JoinSet`, no GIL) |
 | Prebuilt ReAct agent | ✅ `create_react_agent` | ✅ `react::create_react_agent(model, tools)` assembles the standard `agent → tools → agent` loop |
+| MCP tool interop | ✅ MCP adapters | ✅ `mcp` client module — call MCP servers' tools from `Tool` impls (v0.3) |
+| Remote / distributed nodes | ✅ (LangGraph Platform workers) | ✅ `RemoteNode` + `agentgraph-worker` SDK, interrupts cross the wire (v0.3) |
 | Ecosystem & integrations | ✅ huge | ❌ young — provider traits are designed to wrap Rig / async-openai / genai |
 | Runtime cost | interpreter + GC | single static binary |
 
@@ -214,7 +218,7 @@ Design rules worth knowing:
 | Checkpointing / resume | ❌ | 🟡 session persistence (Postgres); no versioned checkpoint model | ❌ | ✅ versioned, thread-scoped; time-travel listing |
 | HITL interrupts | ❌ | 🟡 `WaitForInput` pause | ❌ | ✅ interrupt → checkpoint → resume protocol |
 | `Send`-style fan-out | ❌ | ❌ | ❌ | ✅ |
-| Maturity | ~8k stars, production users | ~350 stars, single maintainer | ~570 stars, v1.0 (2026) | v0.2.0 |
+| Maturity | ~8k stars, production users | ~350 stars, single maintainer | ~570 stars, v1.0 (2026) | v0.3.0 |
 
 **Positioning:** `agentgraph` is the orchestration *core*, not another provider client. Its `ChatModel` trait is deliberately minimal so you can bring Rig, `async-openai`, or `genai` as the provider layer — the same pairing `graph-flow` demonstrates. The wedge no Rust crate ships today is the LangGraph quartet — state graph + durable checkpointing + HITL interrupts + resumable execution — as first-class, production-grade primitives.
 
@@ -239,11 +243,15 @@ See [`examples/README.md`](examples/README.md) for a guided tour of all four.
 - [x] **Prebuilt ReAct agent** — one-call `react::create_react_agent(model, tools)` assembling the standard loop ✅ shipped
 - [x] **Token streaming** — `ChatModel::chat_stream` + `GraphEvent::Token` (the `messages` stream mode) ✅ shipped in v0.2.0
 - [x] **Live agent example** — `examples/live_agent.rs` against any OpenAI-compatible endpoint ✅ shipped in v0.2.0
-- [ ] **PyO3 / napi-rs bindings** — Python & Node adoption of the Rust engine, behind feature flags
-- [ ] **MCP / A2A interop** — call MCP tool servers (e.g. memory servers) and speak the agent-to-agent protocol
-- [ ] **OpenTelemetry** — tracing spans per super-step/node/LLM call, GenAI semantic conventions
+- [x] **MCP client** — call MCP tool servers (e.g. memory servers) from `Tool` impls over stdio ✅ shipped in v0.3.0
+- [x] **Remote nodes + `agentgraph-worker`** — `RemoteNode` executes nodes on remote worker services; HITL interrupts cross the wire ✅ shipped in v0.3.0
+- [x] **Executor tracing** — `tracing` spans through the super-step loop ✅ shipped in v0.3.0
+- [ ] **OpenTelemetry** — OTLP export per super-step/node/LLM call, GenAI semantic conventions
 - [ ] **WASM target** — run graphs in the browser or edge runtimes (sans native checkpointers)
 - [ ] **Provider adapters** — thin `ChatModel` impls over Rig, `async-openai`, `genai`
+- [x] ~~**PyO3 / napi-rs bindings**~~ — **rejected**: the HTTP/SSE server is the polyglot interop layer; see [docs/roadmap.md](../docs/roadmap.md)
+
+The platform-wide roadmap — shipped phases, this cycle's workstreams, Phase C/D candidates — lives in [docs/roadmap.md](../docs/roadmap.md).
 
 ## Contributing
 

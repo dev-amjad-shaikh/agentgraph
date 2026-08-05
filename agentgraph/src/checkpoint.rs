@@ -117,6 +117,12 @@ impl Checkpointer for InMemoryCheckpointer {
                 checkpoint.id, checkpoint.thread_id
             )));
         }
+        tracing::debug!(
+            thread_id = %checkpoint.thread_id,
+            checkpoint_id = %checkpoint.id,
+            step = checkpoint.step,
+            "checkpoint stored (in-memory)"
+        );
         entry.push(checkpoint);
         Ok(())
     }
@@ -262,7 +268,15 @@ impl JsonFileCheckpointer {
                 Ok(cp) => checkpoints.push(cp),
                 // Graceful degradation: one corrupt file must not poison the
                 // whole thread's history.
-                Err(_) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        thread_id = %thread_id,
+                        path = %path.display(),
+                        error = %e,
+                        "skipping corrupt checkpoint file during scan"
+                    );
+                    continue;
+                }
             }
         }
         checkpoints.sort_by(|a, b| a.step.cmp(&b.step).then(a.created_at.cmp(&b.created_at)));
@@ -305,7 +319,15 @@ impl Checkpointer for JsonFileCheckpointer {
             &self.latest_path(&checkpoint.thread_id),
             checkpoint.id.as_bytes(),
         )
-        .await
+        .await?;
+        tracing::debug!(
+            thread_id = %checkpoint.thread_id,
+            checkpoint_id = %checkpoint.id,
+            step = checkpoint.step,
+            path = %path.display(),
+            "checkpoint persisted (json file)"
+        );
+        Ok(())
     }
 
     async fn get_latest(&self, thread_id: &str) -> Result<Option<Checkpoint>> {
@@ -317,8 +339,14 @@ impl Checkpointer for JsonFileCheckpointer {
                 let id = id.trim();
                 if !id.is_empty() {
                     let path = self.checkpoint_path(thread_id, id);
-                    if let Ok(cp) = Self::read_checkpoint(&path).await {
-                        return Ok(Some(cp));
+                    match Self::read_checkpoint(&path).await {
+                        Ok(cp) => return Ok(Some(cp)),
+                        Err(e) => tracing::warn!(
+                            thread_id = %thread_id,
+                            path = %path.display(),
+                            error = %e,
+                            "latest pointer target unreadable; falling back to directory scan"
+                        ),
                     }
                 }
             }

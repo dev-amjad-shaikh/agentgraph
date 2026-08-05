@@ -77,6 +77,12 @@ pub fn create_react_agent(model: Arc<dyn ChatModel>, tools: ToolRegistry) -> Res
             let tool_schemas = tool_schemas.clone();
             async move {
                 let messages = read_messages(ctx.state())?;
+                tracing::debug!(
+                    node = AGENT_NODE,
+                    messages = messages.len(),
+                    tools = tool_schemas.len(),
+                    "calling chat model"
+                );
                 let response = model.chat(&messages, &tool_schemas).await?;
                 let appended = serde_json::to_value(&response.message)?;
                 // A single message object is fine: AddMessages accepts one
@@ -103,6 +109,17 @@ pub fn create_react_agent(model: Arc<dyn ChatModel>, tools: ToolRegistry) -> Res
             }
             // execute_batch never fails as a whole: per-call errors become
             // `ERROR: ...` tool messages so the model can observe them.
+            let tool_names: Vec<&str> = last
+                .tool_calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect();
+            tracing::debug!(
+                node = TOOLS_NODE,
+                calls = last.tool_calls.len(),
+                tools = ?tool_names,
+                "dispatching tool calls"
+            );
             let results = tool_executor.execute_batch(&last.tool_calls).await;
             let appended = serde_json::to_value(&results)?;
             Ok(NodeOutput::update(MESSAGES_CHANNEL, appended))

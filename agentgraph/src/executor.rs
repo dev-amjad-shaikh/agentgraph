@@ -26,6 +26,21 @@
 //! A graph *cycle* (e.g. the ReAct loop `agent → tools → agent`) is not
 //! call-stack recursion — it is nodes being re-scheduled across super-steps,
 //! which is why the guard is `max_steps`, not a stack limit.
+//!
+//! # Observability
+//!
+//! The executor emits `tracing` telemetry throughout a run (no subscriber is
+//! installed by the library — the application chooses one):
+//!
+//! - `agentgraph.run` (INFO span) — one per [`Executor::run`] call, carrying
+//!   `thread_id` and `max_steps`; parent of everything below.
+//! - `agentgraph.super_step` (DEBUG span) — one per super-step, carrying
+//!   `step` and `active_nodes`; covers plan → barrier → merge → route.
+//! - `agentgraph.node` (INFO span) — one per spawned node task, carrying
+//!   `node` and `step`; attached to the `JoinSet` task via `.instrument()`.
+//! - DEBUG event on each barrier merge (channels written), INFO events on
+//!   interrupt and run completion (`steps`, `duration_ms`), WARN events on
+//!   node failure (with a `retryable` classification).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -34,6 +49,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
+use tracing::Instrument;
 
 use crate::checkpoint::{Checkpoint, Checkpointer};
 use crate::error::{AgentGraphError, Result};
@@ -321,6 +337,32 @@ impl Executor {
         initial_state: State,
         config: RunConfig,
     ) -> Result<ExecutionOutcome> {
+        // Run-level span: every super-step, node, and checkpoint trace in the
+        // run attaches to it. Attached via `.instrument()` (never `.enter()`)
+        // so no span guard is held across `.await` points and the returned
+        // future stays `Send`.
+        let run_span = tracing::info_span!(
+            "agentgraph.run",
+            thread_id = %config.thread_id,
+            max_steps = config.max_steps,
+            resume = config.resume.is_some(),
+        );
+        self.run_inner(graph, spec, initial_state, config)
+            .instrument(run_span)
+            .await
+    }
+
+    /// The instrumented body of [`Executor::run`]; see that method's docs for
+    /// the super-step algorithm.
+    async fn run_inner(
+        &self,
+        graph: &Graph,
+        spec: &StateSpec,
+        initial_state: State,
+        config: RunConfig,
+    ) -> Result<ExecutionOutcome> {
+        let started = std::time::Instant::now();
+
         // ---- initialization / resume ----
         //
         // On resume the checkpointed state and next-node set take precedence
@@ -357,6 +399,11 @@ impl Executor {
                 .collect();
             pending_resume = config.resume.clone();
             if active.is_empty() {
+                tracing::info!(
+                    steps = 0,
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    "run complete"
+                );
                 return Ok(ExecutionOutcome::Done(state));
             }
         } else {
@@ -378,262 +425,346 @@ impl Executor {
                 )));
             }
 
-            // -- plan: the active set is fully determined at this point.
-            Self::emit(
-                &config,
-                GraphEvent::SuperStep {
-                    step,
-                    active_nodes: active.iter().map(|t| t.name.clone()).collect(),
-                },
+            // One span per super-step covering plan -> barrier -> merge ->
+            // route (and the boundary checkpoint). The step body runs in a
+            // dedicated method so the whole body is one instrumented future.
+            let step_span = tracing::debug_span!(
+                "agentgraph.super_step",
+                step = step,
+                active_nodes = active.len(),
             );
 
-            // -- compute: run every active node concurrently over an
-            //    immutable snapshot of the start-of-step state. Scoped
-            //    (Send) state is overlaid onto that invocation's private
-            //    copy of the snapshot, so fan-out items never collide in
-            //    the shared state.
-            let snapshot = state.clone();
-            let mut join_set: JoinSet<(String, Result<NodeOutput>)> = JoinSet::new();
-
-            for task in &active {
-                let node = graph.node(&task.name).ok_or_else(|| {
-                    AgentGraphError::Graph(format!(
-                        "routing activated unknown node `{}`",
-                        task.name
-                    ))
-                })?;
-
-                let mut node_state = snapshot.clone();
-                if let Some(scoped) = &task.scoped {
-                    match scoped {
-                        Value::Object(map) => {
-                            for (channel, value) in map {
-                                node_state.insert(channel.clone(), value.clone());
-                            }
-                        }
-                        other => {
-                            return Err(AgentGraphError::InvalidUpdate(format!(
-                                "Send scoped state for node `{}` must be a JSON object, \
-                                 got {other}",
-                                task.name
-                            )));
-                        }
-                    }
-                }
-
-                let ctx = NodeContext::new(
-                    node_state,
-                    NodeConfig {
-                        thread_id: config.thread_id.clone(),
-                        step,
-                        resume: pending_resume.clone(),
-                        extra: HashMap::new(),
-                    },
-                );
-                let name = task.name.clone();
-                Self::emit(
+            let transition = self
+                .execute_super_step(
+                    graph,
+                    spec,
                     &config,
-                    GraphEvent::NodeStart {
-                        node: name.clone(),
-                        step,
-                    },
-                );
-                join_set.spawn(async move { (name, node.run(ctx).await) });
+                    &mut state,
+                    &active,
+                    step,
+                    &mut pending_resume,
+                )
+                .instrument(step_span)
+                .await?;
+
+            match transition {
+                StepTransition::Next(next) => {
+                    active = next;
+                    step += 1;
+                    steps_run += 1;
+                }
+                StepTransition::Finish(outcome) => {
+                    if !outcome.is_interrupted() {
+                        tracing::info!(
+                            steps = steps_run + 1,
+                            duration_ms = started.elapsed().as_millis() as u64,
+                            "run complete"
+                        );
+                    }
+                    return Ok(outcome);
+                }
             }
-            // The resume value is consumed by the first super-step after a resume.
-            pending_resume = None;
+        }
+    }
 
-            // -- barrier: collect every node result. The step is
-            //    transactional: on any failure the JoinSet is dropped
-            //    (aborting stragglers) and the step's writes are discarded.
-            let mut writes: Vec<(String, HashMap<String, Value>)> = Vec::new();
-            let mut commands: Vec<Command> = Vec::new();
-            let mut ran_nodes: Vec<String> = Vec::new();
+    /// Executes one super-step: plan -> compute -> barrier -> merge -> route
+    /// -> boundary checkpoint. Returns the next active set, or
+    /// [`StepTransition::Finish`] with the terminal outcome when the run ends
+    /// (`Done`) or suspends (`Interrupted`).
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_super_step(
+        &self,
+        graph: &Graph,
+        spec: &StateSpec,
+        config: &RunConfig,
+        state: &mut State,
+        active: &[ActiveTask],
+        step: usize,
+        pending_resume: &mut Option<Value>,
+    ) -> Result<StepTransition> {
+        // -- plan: the active set is fully determined at this point.
+        Self::emit(
+            config,
+            GraphEvent::SuperStep {
+                step,
+                active_nodes: active.iter().map(|t| t.name.clone()).collect(),
+            },
+        );
 
-            while let Some(joined) = join_set.join_next().await {
-                let (name, result) = joined.map_err(|e| {
-                    AgentGraphError::Node(format!(
-                        "node task failed to join (panic or cancellation): {e}"
-                    ))
-                })?;
-                match result {
-                    Ok(output) => {
-                        Self::emit(
-                            &config,
-                            GraphEvent::NodeEnd {
-                                node: name.clone(),
-                                step,
-                            },
-                        );
-                        if let Some(command) = output.command {
-                            if !command.goto.is_empty() {
-                                commands.push(command);
-                            }
+        // -- compute: run every active node concurrently over an
+        //    immutable snapshot of the start-of-step state. Scoped
+        //    (Send) state is overlaid onto that invocation's private
+        //    copy of the snapshot, so fan-out items never collide in
+        //    the shared state.
+        let snapshot = state.clone();
+        let mut join_set: JoinSet<(String, Result<NodeOutput>)> = JoinSet::new();
+
+        for task in active {
+            let node = graph.node(&task.name).ok_or_else(|| {
+                AgentGraphError::Graph(format!("routing activated unknown node `{}`", task.name))
+            })?;
+
+            let mut node_state = snapshot.clone();
+            if let Some(scoped) = &task.scoped {
+                match scoped {
+                    Value::Object(map) => {
+                        for (channel, value) in map {
+                            node_state.insert(channel.clone(), value.clone());
                         }
-                        ran_nodes.push(name.clone());
-                        writes.push((name, output.updates));
                     }
-                    Err(AgentGraphError::Interrupt { value }) => {
-                        // Suspend the run: discard the in-flight step and
-                        // persist a checkpoint scheduling the interrupted
-                        // node to re-run on resume.
-                        let checkpoint = Checkpoint::new(
-                            config.thread_id.clone(),
-                            step,
-                            state.clone(),
-                            vec![name],
-                        );
-                        let checkpoint_id = checkpoint.id.clone();
-                        if let Some(checkpointer) = &self.checkpointer {
-                            checkpointer.put(checkpoint).await?;
-                            Self::emit(
-                                &config,
-                                GraphEvent::CheckpointSaved {
-                                    checkpoint_id: checkpoint_id.clone(),
-                                    step,
-                                },
-                            );
-                        }
-                        return Ok(ExecutionOutcome::Interrupted {
-                            value,
-                            state,
-                            checkpoint_id,
-                        });
-                    }
-                    Err(e) => {
-                        return Err(AgentGraphError::Node(format!(
-                            "node `{name}` failed at super-step {step}: {e}"
+                    other => {
+                        return Err(AgentGraphError::InvalidUpdate(format!(
+                            "Send scoped state for node `{}` must be a JSON object, \
+                             got {other}",
+                            task.name
                         )));
                     }
                 }
             }
 
-            // -- merge: reducers + LastValue single-write validation. On
-            //    error the mutated state is dropped with the run
-            //    (transactional super-step).
-            let mut merged_updates = serde_json::Map::new();
-            for (_node, updates) in &writes {
-                for (channel, value) in updates {
-                    merged_updates.insert(channel.clone(), value.clone());
-                }
-            }
-            spec.apply_super_step(&mut state, writes)?;
-            if !merged_updates.is_empty() {
-                Self::emit(
-                    &config,
-                    GraphEvent::StateUpdate {
-                        step,
-                        updates: merged_updates,
-                    },
-                );
-            }
+            let ctx = NodeContext::new(
+                node_state,
+                NodeConfig {
+                    thread_id: config.thread_id.clone(),
+                    step,
+                    resume: pending_resume.clone(),
+                    extra: HashMap::new(),
+                },
+            );
+            let name = task.name.clone();
+            Self::emit(
+                config,
+                GraphEvent::NodeStart {
+                    node: name.clone(),
+                    step,
+                },
+            );
+            // A JoinSet polls tasks independently of the spawning task's
+            // context, so the per-node span is attached to each spawned
+            // future explicitly via `.instrument()`.
+            let node_span = tracing::info_span!("agentgraph.node", node = %name, step = step);
+            join_set.spawn(async move { (name, node.run(ctx).await) }.instrument(node_span));
+        }
+        // The resume value is consumed by the first super-step after a resume.
+        *pending_resume = None;
 
-            // -- route: Command::goto overrides the static edge set;
-            //    otherwise evaluate outgoing edges of every node that ran
-            //    against the post-barrier state.
-            let mut next: Vec<ActiveTask> = Vec::new();
-            let mut planned: HashSet<String> = HashSet::new();
+        // -- barrier: collect every node result. The step is
+        //    transactional: on any failure the JoinSet is dropped
+        //    (aborting stragglers) and the step's writes are discarded.
+        let mut writes: Vec<(String, HashMap<String, Value>)> = Vec::new();
+        let mut commands: Vec<Command> = Vec::new();
+        let mut ran_nodes: Vec<String> = Vec::new();
+        let mut interrupted: Option<(String, Value)> = None;
 
-            if !commands.is_empty() {
-                for command in &commands {
-                    for target in &command.goto {
-                        if !graph.has_node(target) {
-                            return Err(AgentGraphError::Graph(format!(
-                                "Command::goto references unknown node `{target}`"
-                            )));
-                        }
-                        if planned.insert(target.clone()) {
-                            next.push(ActiveTask {
-                                name: target.clone(),
-                                scoped: None,
-                            });
-                        }
-                    }
-                }
-            } else {
-                let mut evaluated: HashSet<String> = HashSet::new();
-                for name in &ran_nodes {
-                    // Fan-out invocations of the same node share one edge set;
-                    // evaluate it once.
-                    if !evaluated.insert(name.clone()) {
-                        continue;
-                    }
-                    for edge in graph.outgoing_edges(name) {
-                        match edge {
-                            Edge::Direct { to, .. } => {
-                                if planned.insert(to.clone()) {
-                                    next.push(ActiveTask {
-                                        name: to.clone(),
-                                        scoped: None,
-                                    });
-                                }
-                            }
-                            Edge::Conditional { router, .. } => {
-                                match router(state.clone()).await? {
-                                    Route::Node(target) => {
-                                        if !graph.has_node(&target) {
-                                            return Err(AgentGraphError::Graph(format!(
-                                                "conditional router from `{name}` returned \
-                                                 unknown node `{target}`"
-                                            )));
-                                        }
-                                        if planned.insert(target.clone()) {
-                                            next.push(ActiveTask {
-                                                name: target,
-                                                scoped: None,
-                                            });
-                                        }
-                                    }
-                                    Route::Send(sends) => {
-                                        for send in sends {
-                                            if !graph.has_node(&send.node) {
-                                                return Err(AgentGraphError::Graph(format!(
-                                                    "Route::Send from `{name}` targets unknown \
-                                                     node `{}`",
-                                                    send.node
-                                                )));
-                                            }
-                                            // Each Send is its own invocation with its own
-                                            // scoped state, even when several target the
-                                            // same node.
-                                            next.push(ActiveTask {
-                                                name: send.node,
-                                                scoped: Some(send.state),
-                                            });
-                                        }
-                                    }
-                                    Route::End => {}
-                                }
-                            }
+        while let Some(joined) = join_set.join_next().await {
+            let (name, result) = joined.map_err(|e| {
+                AgentGraphError::Node(format!(
+                    "node task failed to join (panic or cancellation): {e}"
+                ))
+            })?;
+            match result {
+                Ok(output) => {
+                    Self::emit(
+                        config,
+                        GraphEvent::NodeEnd {
+                            node: name.clone(),
+                            step,
+                        },
+                    );
+                    if let Some(command) = output.command {
+                        if !command.goto.is_empty() {
+                            commands.push(command);
                         }
                     }
+                    ran_nodes.push(name.clone());
+                    writes.push((name, output.updates));
+                }
+                Err(AgentGraphError::Interrupt { value }) => {
+                    // Record the suspension and stop the barrier loop; the
+                    // JoinSet is dropped below to abort stragglers.
+                    interrupted = Some((name, value));
+                    break;
+                }
+                Err(e) => {
+                    // LLM and tool failures are the transient, retryable
+                    // error classes; everything else is a hard failure.
+                    let retryable = matches!(e, AgentGraphError::Llm(_) | AgentGraphError::Tool(_));
+                    tracing::warn!(
+                        node = %name,
+                        step = step,
+                        error = %e,
+                        retryable = retryable,
+                        "node failed; super-step aborted and its writes discarded"
+                    );
+                    return Err(AgentGraphError::Node(format!(
+                        "node `{name}` failed at super-step {step}: {e}"
+                    )));
                 }
             }
+        }
 
-            // -- checkpoint at the super-step boundary.
+        if let Some((name, value)) = interrupted {
+            // Suspend the run: discard the in-flight step and persist a
+            // checkpoint scheduling the interrupted node to re-run on
+            // resume. Dropping the JoinSet first aborts stragglers,
+            // preserving the transactional suspension point.
+            drop(join_set);
+            tracing::info!(
+                node = %name,
+                step = step,
+                "node interrupted; run suspended (resumable via RunConfig::resume)"
+            );
+            let checkpoint =
+                Checkpoint::new(config.thread_id.clone(), step, state.clone(), vec![name]);
+            let checkpoint_id = checkpoint.id.clone();
             if let Some(checkpointer) = &self.checkpointer {
-                let next_names: Vec<String> = next.iter().map(|t| t.name.clone()).collect();
-                let checkpoint =
-                    Checkpoint::new(config.thread_id.clone(), step, state.clone(), next_names);
-                let checkpoint_id = checkpoint.id.clone();
                 checkpointer.put(checkpoint).await?;
                 Self::emit(
-                    &config,
+                    config,
                     GraphEvent::CheckpointSaved {
-                        checkpoint_id,
+                        checkpoint_id: checkpoint_id.clone(),
                         step,
                     },
                 );
             }
-
-            // -- terminate or schedule the next super-step.
-            if next.is_empty() {
-                return Ok(ExecutionOutcome::Done(state));
-            }
-            active = next;
-            step += 1;
-            steps_run += 1;
+            return Ok(StepTransition::Finish(ExecutionOutcome::Interrupted {
+                value,
+                state: state.clone(),
+                checkpoint_id,
+            }));
         }
+
+        // -- merge: reducers + LastValue single-write validation. On
+        //    error the mutated state is dropped with the run
+        //    (transactional super-step).
+        let mut merged_updates = serde_json::Map::new();
+        for (_node, updates) in &writes {
+            for (channel, value) in updates {
+                merged_updates.insert(channel.clone(), value.clone());
+            }
+        }
+        spec.apply_super_step(state, writes)?;
+        let channels_written: Vec<&str> = merged_updates.keys().map(String::as_str).collect();
+        tracing::debug!(
+            step = step,
+            channels = ?channels_written,
+            "merged node updates at super-step barrier"
+        );
+        if !merged_updates.is_empty() {
+            Self::emit(
+                config,
+                GraphEvent::StateUpdate {
+                    step,
+                    updates: merged_updates,
+                },
+            );
+        }
+
+        // -- route: Command::goto overrides the static edge set;
+        //    otherwise evaluate outgoing edges of every node that ran
+        //    against the post-barrier state.
+        let mut next: Vec<ActiveTask> = Vec::new();
+        let mut planned: HashSet<String> = HashSet::new();
+
+        if !commands.is_empty() {
+            for command in &commands {
+                for target in &command.goto {
+                    if !graph.has_node(target) {
+                        return Err(AgentGraphError::Graph(format!(
+                            "Command::goto references unknown node `{target}`"
+                        )));
+                    }
+                    if planned.insert(target.clone()) {
+                        next.push(ActiveTask {
+                            name: target.clone(),
+                            scoped: None,
+                        });
+                    }
+                }
+            }
+        } else {
+            let mut evaluated: HashSet<String> = HashSet::new();
+            for name in &ran_nodes {
+                // Fan-out invocations of the same node share one edge set;
+                // evaluate it once.
+                if !evaluated.insert(name.clone()) {
+                    continue;
+                }
+                for edge in graph.outgoing_edges(name) {
+                    match edge {
+                        Edge::Direct { to, .. } => {
+                            if planned.insert(to.clone()) {
+                                next.push(ActiveTask {
+                                    name: to.clone(),
+                                    scoped: None,
+                                });
+                            }
+                        }
+                        Edge::Conditional { router, .. } => {
+                            match router(state.clone()).await? {
+                                Route::Node(target) => {
+                                    if !graph.has_node(&target) {
+                                        return Err(AgentGraphError::Graph(format!(
+                                            "conditional router from `{name}` returned \
+                                             unknown node `{target}`"
+                                        )));
+                                    }
+                                    if planned.insert(target.clone()) {
+                                        next.push(ActiveTask {
+                                            name: target,
+                                            scoped: None,
+                                        });
+                                    }
+                                }
+                                Route::Send(sends) => {
+                                    for send in sends {
+                                        if !graph.has_node(&send.node) {
+                                            return Err(AgentGraphError::Graph(format!(
+                                                "Route::Send from `{name}` targets unknown \
+                                                 node `{}`",
+                                                send.node
+                                            )));
+                                        }
+                                        // Each Send is its own invocation with its own
+                                        // scoped state, even when several target the
+                                        // same node.
+                                        next.push(ActiveTask {
+                                            name: send.node,
+                                            scoped: Some(send.state),
+                                        });
+                                    }
+                                }
+                                Route::End => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // -- checkpoint at the super-step boundary.
+        if let Some(checkpointer) = &self.checkpointer {
+            let next_names: Vec<String> = next.iter().map(|t| t.name.clone()).collect();
+            let checkpoint =
+                Checkpoint::new(config.thread_id.clone(), step, state.clone(), next_names);
+            let checkpoint_id = checkpoint.id.clone();
+            checkpointer.put(checkpoint).await?;
+            Self::emit(
+                config,
+                GraphEvent::CheckpointSaved {
+                    checkpoint_id,
+                    step,
+                },
+            );
+        }
+
+        // -- terminate or schedule the next super-step.
+        if next.is_empty() {
+            return Ok(StepTransition::Finish(ExecutionOutcome::Done(
+                state.clone(),
+            )));
+        }
+        Ok(StepTransition::Next(next))
     }
 
     /// Best-effort event emission: a full or closed channel never aborts a run.
@@ -652,6 +783,13 @@ struct ActiveTask {
     scoped: Option<Value>,
 }
 
+/// The control-flow result of a single super-step: either the next active
+/// set (the loop continues) or the terminal run outcome (the loop breaks).
+enum StepTransition {
+    Next(Vec<ActiveTask>),
+    Finish(ExecutionOutcome),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -660,6 +798,7 @@ mod tests {
     use crate::llm::ChatModel;
     use crate::state::Reducer;
     use serde_json::json;
+    use std::sync::Mutex;
 
     #[tokio::test]
     async fn linear_two_node_graph_executes_in_order() {
@@ -945,5 +1084,105 @@ mod tests {
             }
         }
         assert_eq!(deltas, ["Hel", "lo"]);
+    }
+
+    /// A minimal `tracing::Subscriber` that records formatted event fields
+    /// (`name=value` pairs) into a shared buffer, so tests can assert on the
+    /// executor's instrumentation. Implemented directly against the
+    /// `tracing` crate's own `Subscriber` trait (re-exported from
+    /// `tracing-core`) — no `tracing-subscriber` dependency required.
+    #[derive(Clone, Default)]
+    struct EventCapture {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    /// Formats an event's fields as `"name=value "` pairs.
+    struct FieldVisitor(String);
+
+    impl tracing::field::Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, "{}={:?} ", field.name(), value);
+        }
+    }
+
+    impl tracing::Subscriber for EventCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            // Spans are irrelevant to these assertions; one id serves all.
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = FieldVisitor(String::new());
+            event.record(&mut visitor);
+            self.events.lock().unwrap().push(visitor.0);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// The instrumentation must be observability-only: installing a
+    /// subscriber changes nothing about the run's outcome, and the expected
+    /// telemetry (merge debug event, run-completion info event) is emitted.
+    #[tokio::test]
+    async fn instrumentation_emits_events_without_changing_outcome() {
+        let capture = EventCapture::default();
+        let events = capture.events.clone();
+        // Global default subscriber, deliberately NOT a thread-local
+        // `set_default`: callsite interest is cached process-wide and lazily
+        // (re)registered from whichever thread first hits a callsite, so a
+        // thread-local subscriber races with the other tests in this binary
+        // that run graphs concurrently (they rebuild the cache against the
+        // no-subscriber global default and our events get silently dropped).
+        // A global default makes every thread's rebuild see this subscriber.
+        // Setting it is additive — other tests neither set nor assert on
+        // subscribers, and captured events from concurrent runs only help the
+        // `any()` assertions below. `set_global_default` may only be called
+        // once per process; this is the only test that installs a subscriber.
+        tracing::subscriber::set_global_default(capture)
+            .expect("no other test may install a global tracing subscriber");
+
+        let spec = StateSpec::new().channel("log", Reducer::Append);
+        let mut builder = GraphBuilder::new();
+        builder.add_node("only", |_ctx: NodeContext| async {
+            Ok(NodeOutput::update("log", json!("x")))
+        });
+        builder.set_entry_point("only");
+        let graph = builder.compile().unwrap();
+
+        let outcome = Executor::new()
+            .run(&graph, &spec, State::new(), RunConfig::new("t-tracing"))
+            .await
+            .unwrap();
+
+        // Identical semantics: the run completes with the expected state.
+        match outcome {
+            ExecutionOutcome::Done(state) => {
+                assert_eq!(state.get("log"), Some(&json!(["x"])));
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+
+        let captured = events.lock().unwrap();
+        assert!(
+            captured.iter().any(|e| e.contains("channels")),
+            "expected a merge debug event listing written channels, got: {captured:?}"
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|e| e.contains("steps") && e.contains("duration_ms")),
+            "expected a run-completion info event with steps and duration_ms, got: {captured:?}"
+        );
     }
 }

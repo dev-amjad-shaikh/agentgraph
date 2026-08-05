@@ -77,6 +77,12 @@ pub struct RunPayload {
     /// queue onto the per-thread run queue).
     #[serde(default)]
     pub multitask_strategy: Option<String>,
+
+    /// Run through a named assistant (see `POST /assistants`). The
+    /// assistant must be bound to the same graph as the thread; its
+    /// `config.recursion_limit` applies when the payload does not set one.
+    #[serde(default)]
+    pub assistant_id: Option<String>,
 }
 
 /// How a second run on a busy thread is handled.
@@ -221,10 +227,14 @@ pub(crate) struct RunSnapshot {
     pub checkpoint_ids: Arc<StdMutex<Vec<String>>>,
 }
 
-/// Public-ish view of a run (used by the rollback endpoint).
+/// Public-ish view of a run (used by the rollback and status endpoints).
 pub(crate) struct RunInfo {
     pub thread_id: String,
+    pub graph: String,
+    pub attempt: usize,
     pub status: RunStatus,
+    /// The terminal JSON once the run has finished (`None` while active).
+    pub terminal: Option<Value>,
     pub checkpoint_ids: Arc<StdMutex<Vec<String>>>,
 }
 
@@ -333,6 +343,7 @@ impl RunManager {
                 inner
                     .active_by_thread
                     .insert(handle.thread_id.clone(), handle.run_id.clone());
+                handle.status = RunStatus::Running;
                 inner.runs.insert(handle.run_id.clone(), handle);
                 Ok(ScheduleDecision::Started)
             }
@@ -357,7 +368,10 @@ impl RunManager {
         let inner = self.inner.lock().await;
         inner.runs.get(run_id).map(|h| RunInfo {
             thread_id: h.thread_id.clone(),
+            graph: h.graph.clone(),
+            attempt: h.attempt,
             status: h.status,
+            terminal: h.terminal.borrow().clone(),
             checkpoint_ids: Arc::clone(&h.checkpoint_ids),
         })
     }
@@ -374,7 +388,10 @@ impl RunManager {
         let mut inner = self.inner.lock().await;
         let handle = inner.runs.get_mut(run_id)?;
         handle.status = status;
-        let _ = handle.terminal.send(Some(terminal));
+        // `send_replace` (not `send`) so the terminal JSON is stored even
+        // when no waiter holds a receiver (background runs); status polling
+        // via `info` reads it back through `watch::Sender::borrow`.
+        handle.terminal.send_replace(Some(terminal));
         let thread_id = handle.thread_id.clone();
 
         if inner

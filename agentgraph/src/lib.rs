@@ -58,8 +58,10 @@ pub mod error;
 pub mod executor;
 pub mod graph;
 pub mod llm;
+pub mod mcp;
 pub mod node;
 pub mod react;
+pub mod remote;
 pub mod state;
 pub mod tool;
 

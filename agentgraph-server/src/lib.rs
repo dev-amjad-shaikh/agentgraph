@@ -22,7 +22,7 @@
 //! # }
 //! ```
 //!
-//! ## Endpoint inventory (v0.1, Phase A of the design doc)
+//! ## Endpoint inventory (v0.2)
 //!
 //! | Endpoint | Purpose |
 //! |---|---|
@@ -36,15 +36,28 @@
 //! | `POST /threads/{id}/runs/wait` | blocking run: terminal result as JSON |
 //! | `POST /threads/{id}/runs/stream` | run with SSE streaming (`updates`/`values`/`messages`/`metadata`/`error`/`end`) |
 //! | `DELETE /threads/{id}/runs/{run_id}` | rollback: delete a finished run's checkpoints |
+//! | `GET /runs/{run_id}` | run status polling (plus `output`/`error`/`interrupt` once terminal) |
+//! | `POST /assistants` | create a named graph alias with config metadata |
+//! | `GET /assistants` / `GET /assistants/{id}` | list / fetch assistants |
+//! | `POST /crons` | schedule recurring runs (interval secs or 5-field cron expr) |
+//! | `GET /crons` / `DELETE /crons/{id}` | list / delete crons |
+//! | `PUT /store/{ns}/{key}` | upsert a JSON value in a namespace (`201` create, `200` replace) |
+//! | `GET /store/{ns}/{key}` / `DELETE /store/{ns}/{key}` | fetch / delete one item |
+//! | `GET /store/{ns}` | list a namespace's items |
 //!
-//! Runs support `command.resume` (HITL), `config.recursion_limit`, and the
-//! `reject` / `enqueue` multitask strategies (one active run per thread).
+//! Runs support `command.resume` (HITL), `config.recursion_limit`, the
+//! `reject` / `enqueue` multitask strategies (one active run per thread),
+//! and `assistant_id` (resolved to its bound graph, with the assistant's
+//! `config.recursion_limit` as a default).
 
+mod assistants;
 mod auth;
+mod crons;
 mod error;
 mod routes;
 mod runs;
 mod sse;
+mod store;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

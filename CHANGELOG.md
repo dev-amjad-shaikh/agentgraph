@@ -1,6 +1,15 @@
 # Changelog
 
-All notable changes to the agentgraph platform. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); crates are versioned independently (`agentgraph`, then `agentgraph-server`).
+All notable changes to the agentgraph platform. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); crates are versioned independently (`agentgraph`, `agentgraph-server`, `agentgraph-worker`).
+
+## [0.3.0] — 2026-08-05
+
+### Added
+
+- **MCP client** *(agentgraph)* — the `mcp` module calls any MCP server's tools from `agentgraph` `Tool` impls over stdio transport; MCP tool servers register into `ToolRegistry` / `ToolExecutor` exactly like native tools.
+- **Remote nodes + `agentgraph-worker`** *(agentgraph / new crate)* — the `remote` module's `RemoteNode` POSTs node execution to worker services over HTTP; the new `agentgraph-worker` crate is the SDK that serves user handlers. HITL interrupts cross the wire, so remote nodes can suspend and resume runs like local nodes.
+- **Server API completion** *(agentgraph-server v0.2)* — fills out the Agent-Protocol surface from the [design doc](docs/agentgraph-server-design.md): `GET /runs/{id}`, assistants, crons, and the KV store.
+- **Executor tracing instrumentation** *(agentgraph)* — `tracing` spans through the super-step loop (per super-step, node, and checkpoint), laying the foundation for OpenTelemetry export.
 
 ## [2026-08-05] — agentgraph 0.2.0, agentgraph-server 0.1.0
 
