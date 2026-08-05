@@ -1,0 +1,25 @@
+[package]
+name = "agentgraph-server"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "axum HTTP/SSE server for agentgraph: an Agent-Protocol subset with threads, background runs, checkpoints, and resumable streaming."
+keywords = ["agent", "graph", "llm", "server", "langgraph"]
+categories = ["asynchronous", "network-programming"]
+
+[dependencies]
+agentgraph = { path = "../agentgraph" }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+async-trait = "0.1"
+tower = { version = "0.5", features = ["util"] }
+tokio = { version = "1", features = ["full", "test-util"] }

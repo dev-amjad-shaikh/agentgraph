@@ -1,0 +1,10 @@
+# Rust
+target/
+**/*.rs.bk
+
+# Checkpoint / demo data produced by examples
+agentgraph-server/data/
+data/
+
+# OS
+.DS_Store
