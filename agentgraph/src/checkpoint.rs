@@ -83,6 +83,81 @@ pub trait Checkpointer: Send + Sync {
 
     /// All checkpoints for a thread, oldest first (time-travel listing).
     async fn list(&self, thread_id: &str) -> Result<Vec<Checkpoint>>;
+
+    /// Fetch one specific checkpoint of a thread by id (time-travel handle).
+    ///
+    /// The default implementation lists the thread and finds the id, which is
+    /// correct (if not maximally efficient) for every reasonable backend.
+    /// Returns `None` when the thread has no checkpoint with that id.
+    async fn get_by_id(&self, thread_id: &str, checkpoint_id: &str) -> Result<Option<Checkpoint>> {
+        let all = self.list(thread_id).await?;
+        Ok(all.into_iter().find(|c| c.id == checkpoint_id))
+    }
+
+    /// Fork a thread's history into a new thread (time travel).
+    ///
+    /// Copies the source thread's checkpoints — oldest first — into
+    /// `dst_thread`, preserving each checkpoint's `id`, `step`, `state`,
+    /// `next_nodes`, and `created_at`; only the `thread_id` changes. When
+    /// `at_checkpoint_id` is given, only checkpoints up to and including that
+    /// checkpoint are copied (fork from a mid-history point); when `None`,
+    /// the full history is copied. Returns the number of checkpoints copied.
+    ///
+    /// The default implementation re-`put`s each selected checkpoint with the
+    /// destination thread id. This is correct for every implementation whose
+    /// `put` uniqueness scope is per-thread — including both shipped impls
+    /// ([`InMemoryCheckpointer`] keys its map by thread, and
+    /// [`JsonFileCheckpointer`] stores under `{dir}/{thread_id}/`), so reused
+    /// ids cannot collide across threads. An implementation whose `put`
+    /// enforces globally unique ids, or whose storage path ignores
+    /// `checkpoint.thread_id`, **must override this method** (e.g. a SQL
+    /// backend with a global primary key would mint fresh ids or insert with
+    /// an explicit thread column).
+    ///
+    /// Errors when the source thread has no checkpoints, when
+    /// `at_checkpoint_id` does not exist on the source thread, or when
+    /// `src_thread == dst_thread` (ids would collide within one thread).
+    async fn fork_thread(
+        &self,
+        src_thread: &str,
+        dst_thread: &str,
+        at_checkpoint_id: Option<&str>,
+    ) -> Result<usize> {
+        if src_thread == dst_thread {
+            return Err(AgentGraphError::Checkpoint(format!(
+                "cannot fork thread `{src_thread}` onto itself: checkpoint ids would collide"
+            )));
+        }
+        let all = self.list(src_thread).await?;
+        if all.is_empty() {
+            return Err(AgentGraphError::Checkpoint(format!(
+                "cannot fork thread `{src_thread}`: no checkpoints found"
+            )));
+        }
+        let selected: Vec<Checkpoint> = match at_checkpoint_id {
+            None => all,
+            Some(id) => {
+                let pos = all.iter().position(|c| c.id == id).ok_or_else(|| {
+                    AgentGraphError::Checkpoint(format!(
+                        "cannot fork thread `{src_thread}`: unknown checkpoint id `{id}`"
+                    ))
+                })?;
+                all[..=pos].to_vec()
+            }
+        };
+        let copied = selected.len();
+        for mut checkpoint in selected {
+            checkpoint.thread_id = dst_thread.to_string();
+            self.put(checkpoint).await?;
+        }
+        tracing::info!(
+            src_thread = %src_thread,
+            dst_thread = %dst_thread,
+            copied = copied,
+            "thread history forked"
+        );
+        Ok(copied)
+    }
 }
 
 /// In-memory checkpointer: fast, thread-safe, lost on restart. Suitable for
@@ -561,5 +636,159 @@ mod tests {
         std::fs::write(tmp.0.join("t1").join("latest"), [0xff, 0xfe, 0x00]).unwrap();
         let latest = store.get_latest("t1").await.unwrap().unwrap();
         assert_eq!(latest.id, good_id);
+    }
+
+    #[tokio::test]
+    async fn get_by_id_hit_and_miss() {
+        let store = InMemoryCheckpointer::new();
+        let cp0 = cp("t1", 0);
+        let id0 = cp0.id.clone();
+        store.put(cp0).await.unwrap();
+        store.put(cp("t1", 1)).await.unwrap();
+        store.put(cp("t2", 0)).await.unwrap();
+
+        let hit = store.get_by_id("t1", &id0).await.unwrap().unwrap();
+        assert_eq!(hit.id, id0);
+        assert_eq!(hit.step, 0);
+        assert_eq!(hit.thread_id, "t1");
+
+        // Unknown id on an existing thread, and any id on an unknown thread.
+        assert!(store.get_by_id("t1", "no-such-id").await.unwrap().is_none());
+        assert!(store.get_by_id("t2", &id0).await.unwrap().is_none());
+        assert!(store.get_by_id("never-seen", &id0).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn fork_full_history_copies_all_checkpoints() {
+        let store = InMemoryCheckpointer::new();
+        let mut src = Vec::new();
+        for step in 0..3 {
+            let mut state = State::new();
+            state.insert("n", serde_json::json!(step));
+            let checkpoint = Checkpoint::new("src", step, state, vec!["next".into()]);
+            src.push(checkpoint.clone());
+            store.put(checkpoint).await.unwrap();
+        }
+
+        let copied = store.fork_thread("src", "dst", None).await.unwrap();
+        assert_eq!(copied, 3);
+
+        let dst = store.list("dst").await.unwrap();
+        assert_eq!(dst.len(), 3);
+        for (forked, original) in dst.iter().zip(src.iter()) {
+            // Everything is preserved except the thread id (ids may be reused
+            // across threads; uniqueness is per-thread).
+            assert_eq!(forked.id, original.id);
+            assert_eq!(forked.step, original.step);
+            assert_eq!(forked.state, original.state);
+            assert_eq!(forked.next_nodes, original.next_nodes);
+            assert_eq!(forked.created_at, original.created_at);
+            assert_eq!(forked.thread_id, "dst");
+        }
+        assert_eq!(store.get_latest("dst").await.unwrap().unwrap().step, 2);
+
+        // The source thread is untouched.
+        assert_eq!(store.list("src").await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn fork_at_mid_checkpoint_truncates_history() {
+        let store = InMemoryCheckpointer::new();
+        let mut ids = Vec::new();
+        for step in 0..4 {
+            let checkpoint = cp("src", step);
+            ids.push(checkpoint.id.clone());
+            store.put(checkpoint).await.unwrap();
+        }
+
+        // Fork at the step-1 checkpoint: only steps 0 and 1 are copied.
+        let copied = store
+            .fork_thread("src", "dst", Some(&ids[1]))
+            .await
+            .unwrap();
+        assert_eq!(copied, 2);
+
+        let dst = store.list("dst").await.unwrap();
+        assert_eq!(dst.len(), 2);
+        assert_eq!(dst[0].id, ids[0]);
+        assert_eq!(dst[1].id, ids[1]);
+        assert_eq!(dst[0].step, 0);
+        assert_eq!(dst[1].step, 1);
+        // Latest of the fork is the cut point, not the source's head.
+        assert_eq!(store.get_latest("dst").await.unwrap().unwrap().id, ids[1]);
+    }
+
+    #[tokio::test]
+    async fn fork_errors_on_empty_src_unknown_id_and_self_fork() {
+        let store = InMemoryCheckpointer::new();
+        let checkpoint = cp("src", 0);
+        let id0 = checkpoint.id.clone();
+        store.put(checkpoint).await.unwrap();
+
+        let err = store.fork_thread("empty", "dst", None).await.unwrap_err();
+        assert!(matches!(err, AgentGraphError::Checkpoint(_)));
+
+        let err = store
+            .fork_thread("src", "dst", Some("no-such-id"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentGraphError::Checkpoint(_)));
+
+        let err = store
+            .fork_thread("src", "src", Some(&id0))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentGraphError::Checkpoint(_)));
+
+        // Failed forks leave no partial state behind on the destination.
+        assert!(store.list("dst").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn json_file_fork_across_threads_persists_correctly() {
+        let tmp = TestDir::new();
+        let store = JsonFileCheckpointer::new(tmp.0.clone());
+
+        let mut ids = Vec::new();
+        for step in 0..3 {
+            let mut state = State::new();
+            state.insert("n", serde_json::json!(step));
+            let checkpoint = Checkpoint::new("src", step, state, vec!["next".into()]);
+            ids.push(checkpoint.id.clone());
+            store.put(checkpoint).await.unwrap();
+        }
+
+        let copied = store
+            .fork_thread("src", "dst", Some(&ids[1]))
+            .await
+            .unwrap();
+        assert_eq!(copied, 2);
+
+        // Files land under the destination thread's own directory (reused
+        // ids live in a different path, so no collision).
+        assert!(tmp.0.join("dst").join(format!("{}.json", ids[0])).exists());
+        assert!(tmp.0.join("dst").join(format!("{}.json", ids[1])).exists());
+        assert!(!tmp.0.join("dst").join(format!("{}.json", ids[2])).exists());
+
+        // The forked files carry the destination thread id in their payload.
+        let latest = store.get_latest("dst").await.unwrap().unwrap();
+        assert_eq!(latest.id, ids[1]);
+        assert_eq!(latest.thread_id, "dst");
+        assert_eq!(latest.step, 1);
+
+        // Durable across instances (process restart): the fork survives.
+        let reopened = JsonFileCheckpointer::new(tmp.0.clone());
+        let dst = reopened.list("dst").await.unwrap();
+        assert_eq!(dst.len(), 2);
+        assert_eq!(dst[0].id, ids[0]);
+        assert_eq!(dst[1].id, ids[1]);
+        assert!(dst.iter().all(|c| c.thread_id == "dst"));
+
+        // The source thread is untouched.
+        assert_eq!(reopened.list("src").await.unwrap().len(), 3);
+        assert_eq!(
+            reopened.get_latest("src").await.unwrap().unwrap().id,
+            ids[2]
+        );
     }
 }

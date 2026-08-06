@@ -1,0 +1,1033 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agentgraph Studio</title>
+<style>
+  :root {
+    --bg:        #171512;
+    --bg-panel:  #211e19;
+    --bg-raised: #2a2620;
+    --bg-inset:  #131110;
+    --border:    #38322a;
+    --border-hi: #4d4536;
+    --text:      #ddd6c8;
+    --text-dim:  #978d7b;
+    --text-faint:#6b6252;
+    --accent:    #c9a227;
+    --accent-dim:#8a7322;
+    --ok:        #7fa671;
+    --warn:      #c9a227;
+    --interrupt: #b9724f;
+    --err:       #b3574f;
+    --pending:   #8a8375;
+    --mono: "SF Mono", "Cascadia Code", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.45;
+  }
+  /* ---------- layout ---------- */
+  #app { display: flex; flex-direction: column; height: 100vh; }
+  header {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 10px 16px;
+    background: var(--bg-panel);
+    border-bottom: 1px solid var(--border);
+  }
+  header .brand { font-weight: 700; letter-spacing: .4px; }
+  header .brand span { color: var(--accent); }
+  header input[type=text], header input[type=password] {
+    background: var(--bg-inset); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 10px; font-family: var(--mono); font-size: 12.5px;
+  }
+  header input.url { width: 250px; }
+  header input.key { width: 170px; }
+  #conn-status { font-size: 12.5px; color: var(--text-dim); }
+  #conn-status b { color: var(--text); font-weight: 600; }
+
+  #body { display: flex; flex: 1; min-height: 0; }
+  aside {
+    width: 300px; flex: 0 0 300px;
+    background: var(--bg-panel);
+    border-right: 1px solid var(--border);
+    overflow-y: auto; padding: 12px;
+  }
+  main { flex: 1; min-width: 0; overflow-y: auto; padding: 14px 18px 60px; }
+
+  /* ---------- generic widgets ---------- */
+  button {
+    background: var(--bg-raised); color: var(--text);
+    border: 1px solid var(--border-hi); border-radius: 6px;
+    padding: 6px 12px; font-size: 12.5px; cursor: pointer;
+    font-family: var(--sans);
+  }
+  button:hover { border-color: var(--accent-dim); color: #fff; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: #3a3325; border-color: var(--accent-dim); color: #efdfae; }
+  button.primary:hover { border-color: var(--accent); }
+  button.small { padding: 3px 8px; font-size: 11.5px; }
+  h2.section {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 1.2px;
+    color: var(--text-dim); margin: 20px 0 8px;
+  }
+  aside h2.section:first-child { margin-top: 0; }
+  .card {
+    background: var(--bg-panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px 14px; margin-bottom: 14px;
+  }
+  pre, code { font-family: var(--mono); font-size: 12.5px; }
+  pre.json {
+    background: var(--bg-inset); border: 1px solid var(--border);
+    border-radius: 6px; padding: 10px 12px; margin: 6px 0;
+    overflow-x: auto; white-space: pre; color: #cfc7b6;
+  }
+  .muted { color: var(--text-dim); }
+  .tiny { font-size: 11.5px; }
+  a { color: var(--accent); }
+
+  /* ---------- badges ---------- */
+  .badge {
+    display: inline-block; padding: 1px 9px; border-radius: 999px;
+    font-size: 11px; font-weight: 600; letter-spacing: .4px;
+    border: 1px solid transparent; vertical-align: middle;
+  }
+  .badge.pending     { color: #d6cebe; background: #35312a; border-color: #4a4437; }
+  .badge.running     { color: #efdfae; background: #3a3325; border-color: var(--accent-dim); animation: pulse 1.2s ease-in-out infinite; }
+  .badge.success     { color: #cfe3c6; background: #26301f; border-color: #3d5136; }
+  .badge.interrupted { color: #eccbb5; background: #352318; border-color: #5e402c; }
+  .badge.error       { color: #eac5c0; background: #341f1c; border-color: #5a322c; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .55; } }
+
+  /* ---------- sidebar ---------- */
+  .graph-item {
+    border: 1px solid var(--border); border-radius: 7px;
+    padding: 8px 10px; margin-bottom: 8px; background: var(--bg-raised);
+  }
+  .graph-item .gname { font-family: var(--mono); font-weight: 600; font-size: 13px; }
+  .graph-item .channels { color: var(--text-dim); font-size: 11.5px; margin: 3px 0 7px; font-family: var(--mono); }
+  .thread-item {
+    border: 1px solid var(--border); border-radius: 7px;
+    padding: 7px 10px; margin-bottom: 6px; cursor: pointer;
+    background: var(--bg-raised);
+  }
+  .thread-item:hover { border-color: var(--border-hi); }
+  .thread-item.selected { border-color: var(--accent-dim); background: #2e2a20; }
+  .thread-item .tid { font-family: var(--mono); font-size: 11.5px; word-break: break-all; }
+  .thread-item .tmeta { display: flex; justify-content: space-between; align-items: center; margin-top: 3px; }
+  .thread-item .tgraph { color: var(--accent); font-family: var(--mono); font-size: 11px; }
+  .thread-item .forget { color: var(--text-faint); font-size: 11px; background: none; border: none; padding: 0 2px; cursor: pointer; }
+  .thread-item .forget:hover { color: var(--err); }
+  .attach-row { display: flex; gap: 6px; margin-top: 6px; }
+  .attach-row input {
+    flex: 1; min-width: 0; background: var(--bg-inset); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 5px 8px; font-family: var(--mono); font-size: 11.5px;
+  }
+
+  /* ---------- main thread panel ---------- */
+  #thread-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
+  #thread-head .tid { font-family: var(--mono); font-size: 15px; font-weight: 600; }
+  .run-controls textarea, .resume-box textarea {
+    width: 100%; min-height: 88px; resize: vertical;
+    background: var(--bg-inset); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 10px; font-family: var(--mono); font-size: 12.5px;
+  }
+  .run-controls .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+  .run-controls label.chk { font-size: 12px; color: var(--text-dim); display: inline-flex; gap: 4px; align-items: center; }
+  .run-controls select {
+    background: var(--bg-inset); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 6px; font-size: 12px;
+  }
+
+  /* ---------- event feed ---------- */
+  #feed { max-height: 380px; overflow-y: auto; }
+  .evt { border-left: 3px solid var(--border-hi); padding: 6px 10px; margin: 6px 0; background: var(--bg-inset); border-radius: 0 6px 6px 0; }
+  .evt .evt-head { display: flex; gap: 10px; align-items: baseline; margin-bottom: 3px; }
+  .evt .evt-kind { font-family: var(--mono); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .8px; }
+  .evt .evt-id { color: var(--text-faint); font-family: var(--mono); font-size: 10.5px; }
+  .evt pre { margin: 0; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+  .evt.metadata { border-left-color: var(--pending); }  .evt.metadata .evt-kind { color: var(--pending); }
+  .evt.updates  { border-left-color: var(--accent); }   .evt.updates  .evt-kind { color: var(--accent); }
+  .evt.values   { border-left-color: var(--ok); }       .evt.values   .evt-kind { color: var(--ok); }
+  .evt.messages { border-left-color: #a89573; }         .evt.messages .evt-kind { color: #a89573; }
+  .evt.error    { border-left-color: var(--err); }      .evt.error    .evt-kind { color: var(--err); }
+  .evt.end      { border-left-color: var(--interrupt); } .evt.end     .evt-kind { color: var(--interrupt); }
+
+  /* ---------- state viewer ---------- */
+  .channel-block { margin-bottom: 10px; }
+  .channel-block .cname {
+    font-family: var(--mono); font-size: 11px; color: var(--accent);
+    text-transform: uppercase; letter-spacing: 1px; margin-bottom: 2px;
+  }
+
+  /* ---------- history timeline ---------- */
+  .hist-item {
+    position: relative; border: 1px solid var(--border); border-radius: 7px;
+    padding: 8px 12px 8px 14px; margin: 0 0 8px 14px; background: var(--bg-raised); cursor: pointer;
+  }
+  .hist-item::before {
+    content: ""; position: absolute; left: -9px; top: 14px; width: 9px; height: 9px;
+    border-radius: 50%; background: var(--bg); border: 2px solid var(--border-hi);
+  }
+  .hist-item.selected { border-color: var(--accent-dim); background: #2e2a20; }
+  .hist-item.selected::before { border-color: var(--accent); background: var(--accent-dim); }
+  .hist-item .hrow { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+  .hist-item .hstep { font-family: var(--mono); font-weight: 700; color: var(--accent); font-size: 12.5px; }
+  .hist-item .htime { color: var(--text-dim); font-size: 11.5px; }
+  .hist-item .hid { font-family: var(--mono); font-size: 10.5px; color: var(--text-faint); word-break: break-all; }
+  .hist-item .hnext { font-family: var(--mono); font-size: 11px; color: var(--text-dim); }
+
+  .empty { color: var(--text-faint); font-style: italic; padding: 24px 0; text-align: center; }
+  .note {
+    border: 1px solid var(--border-hi); border-left: 3px solid var(--accent-dim);
+    background: var(--bg-raised); border-radius: 6px; padding: 8px 12px;
+    font-size: 12.5px; color: var(--text-dim); margin: 10px 0;
+  }
+  #toast {
+    position: fixed; bottom: 18px; right: 18px; max-width: 420px;
+    background: var(--bg-raised); border: 1px solid var(--border-hi);
+    border-radius: 8px; padding: 10px 14px; font-size: 12.5px;
+    display: none; z-index: 50; box-shadow: 0 6px 24px rgba(0,0,0,.5);
+  }
+  #toast.err { border-color: var(--err); color: #eac5c0; }
+  #toast.ok { border-color: var(--ok); color: #cfe3c6; }
+  #toast.warn { border-color: var(--amber, #c9a227); color: #e8dcb8; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="brand">agentgraph <span>Studio</span></div>
+    <input class="url" id="inp-url" type="text" spellcheck="false" placeholder="http://127.0.0.1:8100">
+    <input class="key" id="inp-key" type="password" spellcheck="false" placeholder="API key (optional)">
+    <button class="primary" id="btn-connect">Connect</button>
+    <span id="conn-status">not connected</span>
+  </header>
+
+  <div id="body">
+    <aside>
+      <h2 class="section">Graphs</h2>
+      <div id="graph-list"><div class="empty">Connect to a server.</div></div>
+
+      <h2 class="section">Threads (local)</h2>
+      <div class="note tiny">
+        The server has no list-threads endpoint (v0.2) — threads you create or attach are remembered in this
+        browser only, keyed by server URL.
+      </div>
+      <div id="thread-list"></div>
+      <div class="attach-row">
+        <input id="inp-attach" type="text" spellcheck="false" placeholder="attach thread by id…">
+        <button class="small" id="btn-attach">Attach</button>
+      </div>
+    </aside>
+
+    <main id="main">
+      <div class="empty" id="main-empty">Select or create a thread to begin.</div>
+      <div id="thread-view" style="display:none">
+
+        <div id="thread-head">
+          <span class="tid" id="th-id"></span>
+          <span class="badge" id="th-graph"></span>
+          <span class="muted tiny" id="th-created"></span>
+          <span id="th-runstatus"></span>
+        </div>
+
+        <div class="card run-controls">
+          <h2 class="section" style="margin-top:0">Run</h2>
+          <textarea id="inp-payload" spellcheck="false"></textarea>
+          <div class="row">
+            <button class="primary" id="btn-run">Run (background)</button>
+            <button class="primary" id="btn-run-wait">Run &amp; wait</button>
+            <button class="primary" id="btn-run-stream">Stream run</button>
+            <span class="muted tiny">stream_mode:</span>
+            <label class="chk"><input type="checkbox" id="sm-values" checked> values</label>
+            <label class="chk"><input type="checkbox" id="sm-updates" checked> updates</label>
+            <label class="chk"><input type="checkbox" id="sm-messages"> messages</label>
+            <span class="muted tiny">multitask:</span>
+            <select id="sel-multitask">
+              <option value="">enqueue (default)</option>
+              <option value="reject">reject</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="card" id="interrupt-card" style="display:none">
+          <h2 class="section" style="margin-top:0; color:var(--interrupt)">Interrupted — human in the loop</h2>
+          <div class="muted tiny">Interrupt payload from the run:</div>
+          <pre class="json" id="interrupt-payload"></pre>
+          <div class="resume-box">
+            <div class="muted tiny" style="margin-bottom:4px">
+              Resume value (JSON if it parses, otherwise sent as a string):
+            </div>
+            <textarea id="inp-resume" spellcheck="false" placeholder='{"approved": true}'></textarea>
+            <div class="row" style="display:flex; gap:8px; margin-top:8px">
+              <button class="primary" id="btn-resume-wait">Resume (wait)</button>
+              <button class="primary" id="btn-resume-stream">Resume (stream)</button>
+              <button class="small" id="btn-resume-dismiss">dismiss</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2 class="section" style="margin-top:0">Event feed</h2>
+          <div id="feed"><div class="empty">No events yet — start a streamed run.</div></div>
+        </div>
+
+        <div class="card">
+          <h2 class="section" style="margin-top:0">Run result</h2>
+          <div id="run-result"><div class="empty">No run result yet.</div></div>
+        </div>
+
+        <div class="card">
+          <h2 class="section" style="margin-top:0">
+            Current state
+            <button class="small" id="btn-refresh-state" style="float:right">refresh</button>
+          </h2>
+          <div id="state-view"><div class="empty">Loading…</div></div>
+        </div>
+
+        <div class="card">
+          <h2 class="section" style="margin-top:0">
+            Checkpoint history
+            <button class="small" id="btn-refresh-history" style="float:right">refresh</button>
+          </h2>
+          <div class="row" style="display:flex; gap:8px; margin-bottom:10px">
+            <button class="small" id="btn-fork" disabled>Fork here → new thread</button>
+            <button class="small" id="btn-replay" disabled>Replay &amp; run from here</button>
+            <span class="muted tiny" id="hist-sel-label">select a checkpoint</span>
+          </div>
+          <div class="note tiny">
+            Both actions use the real time-travel API: <b>Fork</b> calls
+            <code>POST /threads/{id}/fork</code> with the selected
+            <code>checkpoint_id</code> (history is copied up to that checkpoint into a new thread);
+            <b>Replay &amp; run</b> starts a background run whose payload carries
+            <code>"checkpoint": {"checkpoint_id": …}</code>, so the executor replays from that checkpoint.
+            On an older server that 404s either call, the Studio falls back to its client-side
+            composition (state write + plain run) and says so in the toast.
+          </div>
+          <div id="history-list"><div class="empty">Loading…</div></div>
+        </div>
+
+      </div>
+    </main>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+"use strict";
+/* ============================================================
+ * agentgraph Studio — zero-build debug UI for agentgraph-server.
+ * Single file, no framework. State that survives reloads lives in
+ * localStorage under the `ags:` prefix.
+ * ========================================================== */
+
+const LS = {
+  conn:    "ags:conn",
+  threads: "ags:threads",   // { [baseUrl]: [threadRecord] }
+  sel:     "ags:selected",  // { [baseUrl]: threadId }
+};
+
+const $ = (id) => document.getElementById(id);
+
+const store = {
+  conn: null,          // { baseUrl, apiKey }
+  info: null,          // GET /info response
+  threads: [],         // local thread records for current baseUrl
+  selected: null,      // selected thread_id
+  history: [],         // last fetched history items
+  selectedCp: null,    // selected checkpoint (history item)
+  pollTimer: null,     // background-run poll timer
+  streamAbort: null,   // AbortController for an active SSE fetch
+};
+
+/* ---------------- persistence ---------------- */
+
+function loadConn() {
+  try { store.conn = JSON.parse(localStorage.getItem(LS.conn)) || null; }
+  catch { store.conn = null; }
+}
+function saveConn() { localStorage.setItem(LS.conn, JSON.stringify(store.conn)); }
+
+function loadThreads() {
+  let all = {};
+  try { all = JSON.parse(localStorage.getItem(LS.threads)) || {}; } catch { all = {}; }
+  store.threads = (store.conn && all[store.conn.baseUrl]) || [];
+  let sel = {};
+  try { sel = JSON.parse(localStorage.getItem(LS.sel)) || {}; } catch { sel = {}; }
+  store.selected = (store.conn && sel[store.conn.baseUrl]) || null;
+}
+function saveThreads() {
+  let all = {};
+  try { all = JSON.parse(localStorage.getItem(LS.threads)) || {}; } catch { all = {}; }
+  all[store.conn.baseUrl] = store.threads;
+  localStorage.setItem(LS.threads, JSON.stringify(all));
+  let sel = {};
+  try { sel = JSON.parse(localStorage.getItem(LS.sel)) || {}; } catch { sel = {}; }
+  sel[store.conn.baseUrl] = store.selected || "";
+  localStorage.setItem(LS.sel, JSON.stringify(sel));
+}
+
+/* ---------------- HTTP ---------------- */
+
+class ApiError extends Error {
+  constructor(status, body) {
+    const msg = (body && body.message) || `HTTP ${status}`;
+    super(msg);
+    this.status = status;
+    this.body = body;
+  }
+}
+
+async function api(method, path, body) {
+  const headers = {};
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  if (store.conn && store.conn.apiKey) headers["X-Api-Key"] = store.conn.apiKey;
+  let res;
+  try {
+    res = await fetch(store.conn.baseUrl + path, {
+      method, headers, body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+  } catch (e) {
+    throw new ApiError(0, { error: "network", message:
+      `${e.message} — network/CORS failure. agentgraph-server v0.3+ sends permissive CORS ` +
+      `headers, so this usually means the server is unreachable or older; see docs/studio.md (“CORS”).` });
+  }
+  const text = await res.text();
+  let json = null;
+  try { json = text ? JSON.parse(text) : null; } catch { json = { raw: text }; }
+  if (!res.ok) throw new ApiError(res.status, json);
+  return json;
+}
+
+/* ---------------- small helpers ---------------- */
+
+function toast(msg, kind) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.className = kind || "";
+  t.style.display = "block";
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => { t.style.display = "none"; }, 5000);
+}
+
+function pretty(v) { return JSON.stringify(v, null, 2); }
+function shortId(id) { return id && id.length > 13 ? id.slice(0, 8) + "…" + id.slice(-4) : id; }
+
+function badge(status) {
+  const s = String(status || "pending");
+  const cls = ["pending","running","success","interrupted","error"].includes(s) ? s : "pending";
+  return `<span class="badge ${cls}">${escapeHtml(s)}</span>`;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function currentThread() {
+  return store.threads.find((t) => t.thread_id === store.selected) || null;
+}
+
+/* ---------------- connect ---------------- */
+
+async function connect() {
+  const baseUrl = $("inp-url").value.trim().replace(/\/+$/, "");
+  const apiKey = $("inp-key").value;
+  if (!baseUrl) { toast("Enter a server base URL.", "err"); return; }
+  store.conn = { baseUrl, apiKey };
+  $("conn-status").textContent = "connecting…";
+  try {
+    store.info = await api("GET", "/info");
+  } catch (e) {
+    $("conn-status").textContent = "connection failed";
+    toast(e.message, "err");
+    return;
+  }
+  saveConn();
+  loadThreads();
+  $("conn-status").innerHTML =
+    `connected — <b>${escapeHtml(store.info.service)}</b> v${escapeHtml(store.info.version)} · ` +
+    `${store.info.graphs.length} graph(s) · checkpointer: ${escapeHtml(store.info.checkpointer)}`;
+  renderGraphs();
+  renderThreads();
+  renderMain();
+}
+
+/* ---------------- sidebar: graphs & threads ---------------- */
+
+function renderGraphs() {
+  const el = $("graph-list");
+  if (!store.info || !store.info.graphs.length) {
+    el.innerHTML = `<div class="empty">No graphs registered.</div>`;
+    return;
+  }
+  el.innerHTML = "";
+  for (const g of store.info.graphs) {
+    const div = document.createElement("div");
+    div.className = "graph-item";
+    div.innerHTML =
+      `<div class="gname">${escapeHtml(g.name)}</div>` +
+      `<div class="channels">channels: ${(g.channels || []).map(escapeHtml).join(", ") || "—"}</div>`;
+    const btn = document.createElement("button");
+    btn.className = "small";
+    btn.textContent = "+ New thread";
+    btn.onclick = () => createThread(g.name);
+    div.appendChild(btn);
+    el.appendChild(div);
+  }
+}
+
+async function createThread(graph, threadId) {
+  try {
+    const rec = await api("POST", "/threads",
+      threadId ? { graph, thread_id: threadId } : { graph });
+    store.threads.unshift(rec);
+    store.selected = rec.thread_id;
+    saveThreads();
+    renderThreads();
+    renderMain();
+    toast(`thread ${shortId(rec.thread_id)} created`, "ok");
+    return rec;
+  } catch (e) {
+    toast(e.message, "err");
+    return null;
+  }
+}
+
+async function attachThread() {
+  const id = $("inp-attach").value.trim();
+  if (!id) return;
+  if (store.threads.some((t) => t.thread_id === id)) {
+    store.selected = id; saveThreads(); renderThreads(); renderMain(); return;
+  }
+  // No GET /threads/{id} exists; probe via /state. A 404 means the in-memory
+  // thread registry doesn't know it (e.g. after a server restart).
+  try {
+    await api("GET", `/threads/${encodeURIComponent(id)}/state`);
+    store.threads.unshift({ thread_id: id, graph: "?", metadata: null, created_at: null });
+    store.selected = id;
+  } catch (e) {
+    if (e.status === 404) {
+      const graphs = (store.info && store.info.graphs.map((g) => g.name)) || [];
+      const graph = graphs.length === 1 ? graphs[0]
+        : prompt("Thread unknown to the server (registry is in-memory).\n" +
+                 "Re-attach by re-creating it with the same id.\nGraph name:", graphs[0] || "");
+      if (!graph) return;
+      const rec = await createThread(graph, id);
+      if (!rec) return;
+    } else {
+      toast(e.message, "err");
+      return;
+    }
+  }
+  $("inp-attach").value = "";
+  saveThreads();
+  renderThreads();
+  renderMain();
+}
+
+function forgetThread(id, ev) {
+  ev.stopPropagation();
+  store.threads = store.threads.filter((t) => t.thread_id !== id);
+  if (store.selected === id) store.selected = null;
+  saveThreads();
+  renderThreads();
+  renderMain();
+}
+
+function renderThreads() {
+  const el = $("thread-list");
+  if (!store.threads.length) {
+    el.innerHTML = `<div class="empty">No local threads yet.</div>`;
+    return;
+  }
+  el.innerHTML = "";
+  for (const t of store.threads) {
+    const div = document.createElement("div");
+    div.className = "thread-item" + (t.thread_id === store.selected ? " selected" : "");
+    div.innerHTML =
+      `<div class="tid">${escapeHtml(t.thread_id)}</div>` +
+      `<div class="tmeta"><span class="tgraph">${escapeHtml(t.graph)}</span>` +
+      `<button class="forget" title="remove from local list (server thread is untouched)">✕ forget</button></div>`;
+    div.querySelector(".forget").onclick = (ev) => forgetThread(t.thread_id, ev);
+    div.onclick = () => {
+      store.selected = t.thread_id;
+      saveThreads();
+      renderThreads();
+      renderMain();
+    };
+    el.appendChild(div);
+  }
+}
+
+/* ---------------- main panel ---------------- */
+
+function renderMain() {
+  const t = currentThread();
+  $("main-empty").style.display = t ? "none" : "block";
+  $("thread-view").style.display = t ? "block" : "none";
+  if (!t) return;
+
+  stopPoll();
+  abortStream();
+  store.history = [];
+  store.selectedCp = null;
+  hideInterrupt();
+  $("th-id").textContent = t.thread_id;
+  $("th-graph").textContent = t.graph;
+  $("th-graph").className = "badge pending";
+  $("th-created").textContent = t.created_at ? `created ${t.created_at}` : "";
+  setRunStatus(null);
+  $("feed").innerHTML = `<div class="empty">No events yet — start a streamed run.</div>`;
+  $("run-result").innerHTML = `<div class="empty">No run result yet.</div>`;
+  $("inp-payload").value = defaultPayload(t.graph);
+  refreshState();
+  refreshHistory();
+}
+
+function defaultPayload(graph) {
+  if (graph === "react_agent" || graph === "?") {
+    return pretty({ input: { messages: [{ role: "user", content: "say pong" }] } });
+  }
+  return "{}";
+}
+
+function setRunStatus(status, extra) {
+  $("th-runstatus").innerHTML =
+    (status ? badge(status) : "") + (extra ? ` <span class="muted tiny">${escapeHtml(extra)}</span>` : "");
+}
+
+function readPayload() {
+  const raw = $("inp-payload").value.trim();
+  if (!raw) return {};
+  try { return JSON.parse(raw); }
+  catch (e) { toast(`payload is not valid JSON: ${e.message}`, "err"); return null; }
+}
+
+function selectedStreamModes() {
+  const modes = [];
+  if ($("sm-values").checked) modes.push("values");
+  if ($("sm-updates").checked) modes.push("updates");
+  if ($("sm-messages").checked) modes.push("messages");
+  return modes;
+}
+
+function withRunOpts(payload) {
+  const mt = $("sel-multitask").value;
+  if (mt) payload.multitask_strategy = mt;
+  return payload;
+}
+
+/* ---------------- run: background + poll ---------------- */
+
+async function runBackground() {
+  const t = currentThread(); if (!t) return;
+  const payload = readPayload(); if (payload === null) return;
+  try {
+    const res = await api("POST", `/threads/${t.thread_id}/runs`, withRunOpts(payload));
+    toast(`run ${shortId(res.run_id)} started`, "ok");
+    setRunStatus(res.status, `run ${shortId(res.run_id)}`);
+    pollRun(res.run_id);
+  } catch (e) { toast(e.message, "err"); }
+}
+
+function pollRun(runId) {
+  stopPoll();
+  store.pollTimer = setInterval(async () => {
+    try {
+      const info = await api("GET", `/runs/${runId}`);
+      setRunStatus(info.status, `run ${shortId(runId)} · attempt ${info.attempt}`);
+      if (!["pending", "running"].includes(info.status)) {
+        stopPoll();
+        showRunResult(info);
+        refreshState();
+        refreshHistory();
+      }
+    } catch (e) {
+      stopPoll();
+      setRunStatus(null);
+      toast(`poll failed: ${e.message}`, "err");
+    }
+  }, 800);
+}
+
+function stopPoll() {
+  if (store.pollTimer) { clearInterval(store.pollTimer); store.pollTimer = null; }
+}
+
+/* ---------------- run: wait ---------------- */
+
+async function runWait(payloadOverride) {
+  const t = currentThread(); if (!t) return;
+  const payload = payloadOverride !== undefined ? payloadOverride : readPayload();
+  if (payload === null) return;
+  setRunStatus("running", "runs/wait");
+  try {
+    const res = await api("POST", `/threads/${t.thread_id}/runs/wait`, withRunOpts({ ...payload }));
+    setRunStatus(res.status, `run ${shortId(res.run_id)}`);
+    showRunResult(res);
+    refreshState();
+    refreshHistory();
+  } catch (e) {
+    setRunStatus(null);
+    toast(e.message, "err");
+  }
+}
+
+/* ---------------- run: SSE stream via fetch + ReadableStream ----------------
+ * EventSource cannot POST, so the SSE stream is parsed manually from the
+ * fetch response body. Frames: id / event / data lines, blank-line delimited.
+ * ------------------------------------------------------------------------- */
+
+async function runStream(payloadOverride) {
+  const t = currentThread(); if (!t) return;
+  const payload = payloadOverride !== undefined ? { ...payloadOverride } : readPayload();
+  if (payload === null) return;
+  payload.stream_mode = selectedStreamModes();
+  withRunOpts(payload);
+
+  abortStream();
+  const ctrl = new AbortController();
+  store.streamAbort = ctrl;
+  clearFeed();
+  feedEvent("metadata", { note: `POST /threads/${t.thread_id}/runs/stream`, stream_mode: payload.stream_mode }, "-");
+  setRunStatus("running", "streaming");
+
+  const headers = { "Content-Type": "application/json", Accept: "text/event-stream" };
+  if (store.conn.apiKey) headers["X-Api-Key"] = store.conn.apiKey;
+
+  let res;
+  try {
+    res = await fetch(store.conn.baseUrl + `/threads/${t.thread_id}/runs/stream`, {
+      method: "POST", headers, body: JSON.stringify(payload), signal: ctrl.signal,
+    });
+  } catch (e) {
+    if (e.name !== "AbortError") {
+      feedEvent("error", { error: "network", message: e.message }, "-");
+      setRunStatus(null);
+    }
+    return;
+  }
+  if (!res.ok || !res.body) {
+    let body = null;
+    try { body = await res.json(); } catch { /* ignore */ }
+    feedEvent("error", body || { error: "http", message: `HTTP ${res.status}` }, "-");
+    setRunStatus(null);
+    return;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let endData = null;
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) !== -1) {
+        const raw = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        const frame = parseSseFrame(raw);
+        if (!frame) continue;
+        feedEvent(frame.event, frame.data, frame.id);
+        if (frame.event === "end") endData = frame.data;
+      }
+    }
+  } catch (e) {
+    if (e.name !== "AbortError") feedEvent("error", { error: "stream", message: e.message }, "-");
+  }
+
+  if (endData) {
+    setRunStatus(endData.status, "stream ended");
+    if (endData.status === "interrupted") showInterrupt(endData.interrupt);
+  } else {
+    setRunStatus(null);
+  }
+  refreshState();
+  refreshHistory();
+}
+
+function abortStream() {
+  if (store.streamAbort) { store.streamAbort.abort(); store.streamAbort = null; }
+}
+
+function parseSseFrame(raw) {
+  let event = "message", id = "";
+  const dataLines = [];
+  for (const line of raw.split("\n")) {
+    if (!line || line.startsWith(":")) continue;          // keep-alive comments
+    const colon = line.indexOf(":");
+    const field = colon === -1 ? line : line.slice(0, colon);
+    let val = colon === -1 ? "" : line.slice(colon + 1);
+    if (val.startsWith(" ")) val = val.slice(1);
+    if (field === "event") event = val;
+    else if (field === "data") dataLines.push(val);
+    else if (field === "id") id = val;
+  }
+  if (!dataLines.length) return null;
+  let data = dataLines.join("\n");
+  try { data = JSON.parse(data); } catch { /* leave as string */ }
+  return { event, data, id };
+}
+
+function clearFeed() { $("feed").innerHTML = ""; }
+
+function feedEvent(kind, data, id) {
+  const feed = $("feed");
+  const empty = feed.querySelector(".empty");
+  if (empty) empty.remove();
+  const cls = ["metadata","updates","values","messages","error","end"].includes(kind) ? kind : "metadata";
+  const div = document.createElement("div");
+  div.className = `evt ${cls}`;
+  div.innerHTML =
+    `<div class="evt-head"><span class="evt-kind">${escapeHtml(kind)}</span>` +
+    `<span class="evt-id">${escapeHtml(id || "")}</span></div>` +
+    `<pre>${escapeHtml(typeof data === "string" ? data : pretty(data))}</pre>`;
+  feed.appendChild(div);
+  feed.scrollTop = feed.scrollHeight;
+}
+
+/* ---------------- run result & interrupt ---------------- */
+
+function showRunResult(res) {
+  const el = $("run-result");
+  el.innerHTML = `${badge(res.status)}<pre class="json">${escapeHtml(pretty(res))}</pre>`;
+  if (res.status === "interrupted") showInterrupt(res.interrupt);
+}
+
+function showInterrupt(value) {
+  $("interrupt-card").style.display = "block";
+  $("interrupt-payload").textContent = pretty(value);
+  $("interrupt-card").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+function hideInterrupt() {
+  $("interrupt-card").style.display = "none";
+  $("inp-resume").value = "";
+}
+
+function resumeValue() {
+  const raw = $("inp-resume").value.trim();
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return raw; }   // plain string fallback
+}
+
+function resume(wait) {
+  const v = resumeValue();
+  const payload = { command: { resume: v } };
+  hideInterrupt();
+  if (wait) runWait(payload); else runStream(payload);
+}
+
+/* ---------------- state viewer ---------------- */
+
+async function refreshState() {
+  const t = currentThread(); if (!t) return;
+  const el = $("state-view");
+  try {
+    const st = await api("GET", `/threads/${t.thread_id}/state`);
+    let html = "";
+    const values = st.values || {};
+    const keys = Object.keys(values);
+    if (!keys.length) {
+      html += `<div class="empty">Empty state — no checkpoints yet.</div>`;
+    } else {
+      for (const k of keys) {
+        html += `<div class="channel-block"><div class="cname">${escapeHtml(k)}</div>` +
+                `<pre class="json">${escapeHtml(pretty(values[k]))}</pre></div>`;
+      }
+    }
+    html += `<div class="muted tiny" style="margin-top:8px">next: <code>${escapeHtml(pretty(st.next || []))}</code>`;
+    if (st.checkpoint) {
+      html += ` · step <b>${st.checkpoint.step}</b> · checkpoint <code>${escapeHtml(shortId(st.checkpoint.checkpoint_id))}</code>` +
+              ` · ${escapeHtml(st.checkpoint.created_at)}`;
+    } else {
+      html += ` · checkpoint: none`;
+    }
+    html += `</div>`;
+    el.innerHTML = html;
+  } catch (e) {
+    el.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+/* ---------------- history, fork, replay ---------------- */
+
+async function refreshHistory() {
+  const t = currentThread(); if (!t) return;
+  const el = $("history-list");
+  try {
+    const items = await api("POST", `/threads/${t.thread_id}/history`, { limit: 50 });
+    store.history = items;
+    store.selectedCp = null;
+    updateHistSelection();
+    if (!items.length) {
+      el.innerHTML = `<div class="empty">No checkpoints yet.</div>`;
+      return;
+    }
+    el.innerHTML = "";
+    items.forEach((item, i) => {
+      const cp = item.checkpoint || {};
+      const div = document.createElement("div");
+      div.className = "hist-item";
+      div.innerHTML =
+        `<div class="hrow"><span class="hstep">step ${cp.step ?? "?"}</span>` +
+        `<span class="htime">${escapeHtml(cp.created_at || "")}</span>` +
+        `<span class="hnext">next: ${escapeHtml(pretty(item.next || []))}</span></div>` +
+        `<div class="hid">${escapeHtml(cp.checkpoint_id || "")}</div>`;
+      div.onclick = () => {
+        store.selectedCp = item;
+        el.querySelectorAll(".hist-item").forEach((n) => n.classList.remove("selected"));
+        div.classList.add("selected");
+        updateHistSelection();
+      };
+      if (i === 0) div.title = "newest";
+      el.appendChild(div);
+    });
+  } catch (e) {
+    el.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function updateHistSelection() {
+  const cp = store.selectedCp;
+  $("btn-fork").disabled = !cp;
+  $("btn-replay").disabled = !cp;
+  $("hist-sel-label").textContent = cp && cp.checkpoint
+    ? `selected: step ${cp.checkpoint.step} · ${shortId(cp.checkpoint.checkpoint_id)}`
+    : "select a checkpoint";
+}
+
+/* Fork: real endpoint — POST /threads/{id}/fork copies the checkpoint history
+ * (up to the selected checkpoint) into a new thread on the same graph.
+ * A 404 with a non-JSON error body means an older server without the route:
+ * fall back to the client-side composition (new thread + state write). */
+async function forkAtSelected() {
+  const t = currentThread(); const item = store.selectedCp;
+  if (!t || !item || !item.checkpoint) return;
+  const base = `${t.thread_id}-fork-${item.checkpoint.step}`;
+  try {
+    const res = await api("POST", `/threads/${t.thread_id}/fork`,
+      { new_thread_id: base, checkpoint_id: item.checkpoint.checkpoint_id });
+    const rec = {
+      thread_id: res.thread_id, graph: t.graph,
+      metadata: { forked_from: t.thread_id, fork_checkpoint_id: item.checkpoint.checkpoint_id },
+      created_at: new Date().toISOString(),
+    };
+    store.threads.unshift(rec);
+    store.selected = res.thread_id;
+    saveThreads();
+    renderThreads();
+    renderMain();
+    toast(`forked into ${shortId(res.thread_id)} at step ${item.checkpoint.step}` +
+      ` (${res.checkpoints_copied} checkpoint(s) copied)`, "ok");
+    return;
+  } catch (e) {
+    const oldServer = e.status === 404 && !(e.body && e.body.error);
+    if (!oldServer) { toast(e.message, "err"); return; }
+    toast("server has no /fork route (older version) — using client-side fallback", "warn");
+  }
+  /* Fallback for pre-time-travel servers: new thread + write checkpoint state. */
+  let newId = base, n = 1, rec = null;
+  for (;;) {
+    try {
+      rec = await api("POST", "/threads", { graph: t.graph, thread_id: newId });
+      break;
+    } catch (e) {
+      if (e.status === 409 && n < 20) { newId = `${base}-${++n}`; continue; }
+      toast(e.message, "err"); return;
+    }
+  }
+  try {
+    await api("POST", `/threads/${newId}/state`,
+      { values: item.values || {}, next_nodes: item.next || [] });
+  } catch (e) { toast(`fork thread created but state write failed: ${e.message}`, "err"); }
+  store.threads.unshift(rec);
+  store.selected = newId;
+  saveThreads();
+  renderThreads();
+  renderMain();
+  toast(`forked into ${shortId(newId)} at step ${item.checkpoint.step} (fallback)`, "ok");
+}
+
+/* Replay & run: run payloads accept "checkpoint": {"checkpoint_id": …} — the
+ * executor replays the thread from that checkpoint instead of the latest.
+ * A 404 with a non-JSON error body means an older server (the field is
+ * silently ignored there); fall back to the re-anchor composition. A JSON
+ * 404 means the checkpoint id is genuinely unknown — surface it. */
+async function replayFromSelected() {
+  const t = currentThread(); const item = store.selectedCp;
+  if (!t || !item || !item.checkpoint) return;
+  try {
+    const res = await api("POST", `/threads/${t.thread_id}/runs`,
+      withRunOpts({ checkpoint: { checkpoint_id: item.checkpoint.checkpoint_id } }));
+    toast(`replaying from step ${item.checkpoint.step} — run ${shortId(res.run_id)} started`, "ok");
+    setRunStatus(res.status, `run ${shortId(res.run_id)}`);
+    pollRun(res.run_id);
+    return;
+  } catch (e) {
+    const oldServer = e.status === 404 && !(e.body && e.body.error);
+    if (!oldServer) { toast(e.message, "err"); return; }
+    toast("server rejected the replay route (older version?) — using client-side fallback", "warn");
+  }
+  /* Fallback for pre-time-travel servers: re-anchor state, then plain run. */
+  try {
+    await api("POST", `/threads/${t.thread_id}/state`,
+      { values: item.values || {}, next_nodes: item.next || [] });
+  } catch (e) { toast(e.message, "err"); return; }
+  toast(`re-anchored to step ${item.checkpoint.step}; starting run`, "ok");
+  try {
+    const res = await api("POST", `/threads/${t.thread_id}/runs`, withRunOpts({}));
+    setRunStatus(res.status, `run ${shortId(res.run_id)}`);
+    pollRun(res.run_id);
+  } catch (e) { toast(e.message, "err"); }
+}
+
+/* ---------------- wiring ---------------- */
+
+function init() {
+  loadConn();
+  $("inp-url").value = (store.conn && store.conn.baseUrl) || "http://127.0.0.1:8100";
+  $("inp-key").value = (store.conn && store.conn.apiKey) || "";
+
+  $("btn-connect").onclick = connect;
+  $("btn-attach").onclick = attachThread;
+  $("inp-attach").addEventListener("keydown", (e) => { if (e.key === "Enter") attachThread(); });
+  $("btn-run").onclick = runBackground;
+  $("btn-run-wait").onclick = () => runWait();
+  $("btn-run-stream").onclick = () => runStream();
+  $("btn-resume-wait").onclick = () => resume(true);
+  $("btn-resume-stream").onclick = () => resume(false);
+  $("btn-resume-dismiss").onclick = hideInterrupt;
+  $("btn-refresh-state").onclick = refreshState;
+  $("btn-refresh-history").onclick = refreshHistory;
+  $("btn-fork").onclick = forkAtSelected;
+  $("btn-replay").onclick = replayFromSelected;
+
+  if (store.conn) {
+    loadThreads();
+    renderThreads();
+    // Reconnect silently; failures just leave the previous local state visible.
+    connect();
+  }
+}
+
+init();
+</script>
+</body>
+</html>

@@ -4,7 +4,7 @@
 
 `agentgraph` models agent workflows as **cyclic graphs over shared state**. Every state key is a versioned *channel* with per-key reducer semantics; nodes are async functions returning partial updates; execution follows a Pregel/BSP super-step model with first-class checkpoints, interrupts, streaming events, and dynamic fan-out. Dual-licensed under MIT OR Apache-2.0.
 
-> **Status: v0.3.0.** The public API surface — modules, types, and trait signatures in `src/` — is stable to build against. The state/reducer engine, graph builder + compile-time validation, Pregel/BSP executor super-step loop, in-memory, JSON-file, and Postgres checkpointers, `ChatModel` abstraction with token streaming, OpenAI-compatible client, parallel `ToolExecutor`, the prebuilt ReAct agent (`react::create_react_agent`), the MCP client, remote nodes (`RemoteNode`), and executor `tracing` instrumentation are implemented and tested, with four runnable examples under [`examples/`](examples/). An axum HTTP/SSE server lives in the sibling [`agentgraph-server`](../agentgraph-server) crate. See the [roadmap](#roadmap) for what's next.
+> **Status: v0.4.0.** The public API surface — modules, types, and trait signatures in `src/` — is stable to build against. The state/reducer engine, graph builder + compile-time validation, Pregel/BSP executor super-step loop, in-memory, JSON-file, and Postgres checkpointers, checkpoint time travel (`get_by_id` / `fork_thread` / `RunConfig::with_checkpoint_id`), sandboxed `WasmNode` execution (`wasm` feature), `ChatModel` abstraction with token streaming, OpenAI-compatible client, parallel `ToolExecutor`, the prebuilt ReAct agent (`react::create_react_agent`), the MCP client, remote nodes (`RemoteNode`), and executor `tracing` instrumentation are implemented and tested, with four runnable examples under [`examples/`](examples/). An axum HTTP/SSE server lives in the sibling [`agentgraph-server`](../agentgraph-server) crate, and OpenTelemetry export in [`agentgraph-otel`](../agentgraph-otel). See the [roadmap](#roadmap) for what's next.
 
 ## Why Rust?
 
@@ -30,12 +30,14 @@ The trade-off is deliberate: you give up Python's runtime monkey-patching and ge
 - **`Command` routing** — nodes can override static edges with `NodeOutput::route(Command::goto(...))`, unifying state transition and control flow the way LangGraph's `Command` does.
 - **MCP client** *(v0.3)* — the `mcp` module lets an `agentgraph` `Tool` call any MCP server's tools over stdio transport. MCP tool servers register into `ToolRegistry` / `ToolExecutor` exactly like native tools, so the prebuilt ReAct agent drives them with no graph changes.
 - **Remote nodes** *(v0.3)* — the `remote` module's `RemoteNode` POSTs node execution to worker services over HTTP; the companion `agentgraph-worker` crate is the SDK that serves your handlers. HITL interrupts cross the wire — a remote node can suspend the run and resume with a human payload just like a local node.
+- **Time travel** *(v0.4)* — every checkpoint is a handle: `Checkpointer::get_by_id` fetches any checkpoint of a thread, `Checkpointer::fork_thread` copies a thread's history (full, or up to a checkpoint) into a new thread, and `RunConfig::with_checkpoint_id` replays a run from that checkpoint's state and next-node set instead of the latest. Fork first, replay on the fork.
+- **WASM nodes** *(v0.4, feature `wasm`)* — `WasmNode` runs sandboxed WebAssembly modules as graph nodes via Wasmtime: untrusted or community code executes with capability isolation behind the same `Node` trait as local and remote nodes — no separate worker fleet, no process boundary to manage.
 
 ## Quickstart
 
 ```toml
 [dependencies]
-agentgraph = "0.3"
+agentgraph = "0.4"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
@@ -206,6 +208,9 @@ Design rules worth knowing:
 | Prebuilt ReAct agent | ✅ `create_react_agent` | ✅ `react::create_react_agent(model, tools)` assembles the standard `agent → tools → agent` loop |
 | MCP tool interop | ✅ MCP adapters | ✅ `mcp` client module — call MCP servers' tools from `Tool` impls (v0.3) |
 | Remote / distributed nodes | ✅ (LangGraph Platform workers) | ✅ `RemoteNode` + `agentgraph-worker` SDK, interrupts cross the wire (v0.3) |
+| Time travel (fork / replay) | ✅ `update_state` + checkpoint history | ✅ `Checkpointer::get_by_id` / `fork_thread` + `RunConfig::with_checkpoint_id` (v0.4) |
+| Sandboxed WASM nodes | ❌ | ✅ `WasmNode` via Wasmtime, behind the `wasm` feature (v0.4) |
+| OpenTelemetry export | ✅ (LangSmith / OTel instrumentation) | ✅ `agentgraph-otel` crate: one-call subscriber setup + OTLP export (v0.4) |
 | Ecosystem & integrations | ✅ huge | ❌ young — provider traits are designed to wrap Rig / async-openai / genai |
 | Runtime cost | interpreter + GC | single static binary |
 
@@ -218,7 +223,7 @@ Design rules worth knowing:
 | Checkpointing / resume | ❌ | 🟡 session persistence (Postgres); no versioned checkpoint model | ❌ | ✅ versioned, thread-scoped; time-travel listing |
 | HITL interrupts | ❌ | 🟡 `WaitForInput` pause | ❌ | ✅ interrupt → checkpoint → resume protocol |
 | `Send`-style fan-out | ❌ | ❌ | ❌ | ✅ |
-| Maturity | ~8k stars, production users | ~350 stars, single maintainer | ~570 stars, v1.0 (2026) | v0.3.0 |
+| Maturity | ~8k stars, production users | ~350 stars, single maintainer | ~570 stars, v1.0 (2026) | v0.4.0 |
 
 **Positioning:** `agentgraph` is the orchestration *core*, not another provider client. Its `ChatModel` trait is deliberately minimal so you can bring Rig, `async-openai`, or `genai` as the provider layer — the same pairing `graph-flow` demonstrates. The wedge no Rust crate ships today is the LangGraph quartet — state graph + durable checkpointing + HITL interrupts + resumable execution — as first-class, production-grade primitives.
 
@@ -246,7 +251,9 @@ See [`examples/README.md`](examples/README.md) for a guided tour of all four.
 - [x] **MCP client** — call MCP tool servers (e.g. memory servers) from `Tool` impls over stdio ✅ shipped in v0.3.0
 - [x] **Remote nodes + `agentgraph-worker`** — `RemoteNode` executes nodes on remote worker services; HITL interrupts cross the wire ✅ shipped in v0.3.0
 - [x] **Executor tracing** — `tracing` spans through the super-step loop ✅ shipped in v0.3.0
-- [ ] **OpenTelemetry** — OTLP export per super-step/node/LLM call, GenAI semantic conventions
+- [x] **Time travel** — `Checkpointer::get_by_id` / `fork_thread` + `RunConfig::with_checkpoint_id`; exposed over HTTP by `agentgraph-server` v0.3 (`POST /threads/{id}/fork`, checkpoint replay on run endpoints) ✅ shipped in v0.4.0
+- [x] **WASM nodes** — sandboxed `WasmNode` execution via Wasmtime behind the `wasm` cargo feature ✅ shipped in v0.4.0
+- [x] **OpenTelemetry** — OTLP export per super-step/node/LLM call via the [`agentgraph-otel`](../agentgraph-otel) crate ✅ shipped in v0.4.0 (`agentgraph-otel` v0.1.0)
 - [ ] **WASM target** — run graphs in the browser or edge runtimes (sans native checkpointers)
 - [ ] **Provider adapters** — thin `ChatModel` impls over Rig, `async-openai`, `genai`
 - [x] ~~**PyO3 / napi-rs bindings**~~ — **rejected**: the HTTP/SSE server is the polyglot interop layer; see [docs/roadmap.md](../docs/roadmap.md)
@@ -255,7 +262,7 @@ The platform-wide roadmap — shipped phases, this cycle's workstreams, Phase C/
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Good first issues: provider adapters (Rig, `async-openai`, `genai`) and OpenTelemetry spans.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Good first issues: provider adapters (Rig, `async-openai`, `genai`) and GenAI semantic-convention span attributes in `agentgraph-otel`.
 
 ## License
 

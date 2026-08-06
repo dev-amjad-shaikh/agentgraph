@@ -2,7 +2,7 @@
 
 **The network face of [`agentgraph`](../agentgraph)** — serve your agent graphs over HTTP + SSE from a single ~20 MB static binary. No interpreter, no Postgres, no Redis. Dual-licensed under MIT OR Apache-2.0.
 
-> **Status: v0.2, under active development.** The crate ships as a *library*: you call `agentgraph_server::serve()` from your own `main.rs`. The endpoint set, streaming semantics, and config surface follow the architecture document in [`docs/agentgraph-server-design.md`](../docs/agentgraph-server-design.md). The core `agentgraph` crate is untouched — it has no HTTP, no axum, no server dependencies, and never learns that a server exists.
+> **Status: v0.3, under active development.** The crate ships as a *library*: you call `agentgraph_server::serve()` from your own `main.rs`. The endpoint set, streaming semantics, and config surface follow the architecture document in [`docs/agentgraph-server-design.md`](../docs/agentgraph-server-design.md). The core `agentgraph` crate is untouched — it has no HTTP, no axum, no server dependencies, and never learns that a server exists.
 
 ## Why one binary instead of three containers
 
@@ -12,7 +12,7 @@ A self-hosted LangGraph Platform standalone deployment needs **three moving part
 |---|---|---|
 | User-code loading | `langgraph.json` + pip install at image build | `Cargo.toml` + `main.rs`, static link |
 | Deployment unit | API image + Postgres + Redis (compose) | one static binary (~20 MB) |
-| Checkpoint store | Postgres | embedded `JsonFileCheckpointer` (wired from `ServerConfig::store_path`; core's `postgres` feature is server-roadmap) |
+| Checkpoint store | Postgres | embedded `JsonFileCheckpointer` (wired from `ServerConfig::store_path`), or core's `PostgresCheckpointer` via `ServerConfig::with_postgres` (feature `postgres`) |
 | Stream fan-out | Redis pub/sub | in-process `tokio::sync::broadcast` per run |
 | Background-run queue | Postgres task queue + workers | in-process per-thread run queue |
 | Stream resume | `stream_resumable` contract | replay from the per-run in-memory event log, deduped by `Last-Event-ID` |
@@ -26,8 +26,8 @@ LangGraph's `langgraph.json` exists because Python can import user modules at ru
 
 ```toml
 [dependencies]
-agentgraph = "0.3"
-agentgraph-server = "0.2"
+agentgraph = "0.4"
+agentgraph-server = "0.3"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 tracing-subscriber = "0.3"
@@ -84,13 +84,14 @@ A `GraphRegistry` entry is a name plus the two things the executor needs — a `
 
 ## HTTP API
 
-An Agent-Protocol-compatible subset — wire-compatible with the core run/thread shapes LangGraph Platform uses, without the commercial surface. This table is the v0.2 endpoint inventory; everything listed here is implemented and covered by integration tests.
+An Agent-Protocol-compatible subset — wire-compatible with the core run/thread shapes LangGraph Platform uses, without the commercial surface. This table is the v0.3 endpoint inventory; everything listed here is implemented and covered by integration tests.
 
 | Endpoint | Description |
 |---|---|
 | `GET /ok` | Liveness probe → `{"ok": true}` |
 | `GET /info` | Service version, checkpointer kind, store path, registered graphs + their channels |
 | `POST /threads` | Create a thread bound to a registered graph: `{graph, metadata?, thread_id?}` → `201` |
+| `POST /threads/{id}/fork` | [Time travel](#time-travel-fork--checkpoint-replay): copy the thread's checkpoint history into a new thread: `{new_thread_id?, checkpoint_id?}` → `201 {thread_id, checkpoints_copied}` |
 | `GET /threads/{id}/state` | Latest checkpoint: `{values, next, checkpoint}` |
 | `POST /threads/{id}/state` | Write a new checkpoint (the `update_state` analog; optional `as_node`, `next_nodes`) → `201` |
 | `POST /threads/{id}/history` | List checkpoints, newest first, with `limit` / `before` |
@@ -107,7 +108,7 @@ An Agent-Protocol-compatible subset — wire-compatible with the core run/thread
 | `GET /store/{ns}/{key}` / `DELETE /store/{ns}/{key}` | Fetch / delete one item (`404` when absent) |
 | `GET /store/{ns}` | List a namespace's items, sorted by key (empty array for an unwritten namespace) |
 
-Not in v0.2 (roadmap, see below): thread listing/deletion endpoints, `/metrics`, `/graphs`, the gRPC worker protocol, `WasmNode`, and the Postgres checkpointer wiring. Thread records live in memory — checkpoints are durable on disk, but the thread registry itself is rebuilt empty on restart (re-create a thread with the same `thread_id` to re-attach to its on-disk checkpoints). Assistants, crons, and store items **are** durable: they persist as JSON files under `store_path` and reload on startup.
+Not in v0.3 (roadmap, see below): thread listing/deletion endpoints, `/metrics`, `/graphs`, and the gRPC worker protocol. Thread records live in memory — checkpoints are durable on disk (or in Postgres), but the thread registry itself is rebuilt empty on restart (re-create a thread with the same `thread_id` to re-attach to its persisted checkpoints). Assistants, crons, and store items **are** durable: they persist as JSON files under `store_path` (or in the `server_*` tables with [Postgres persistence](#postgres-persistence-feature-postgres)) and reload on startup.
 
 **Run-create payload** (subset of LangGraph's shape):
 
@@ -116,6 +117,7 @@ Not in v0.2 (roadmap, see below): thread listing/deletion endpoints, `/metrics`,
   "input": { "messages": [ { "role": "user", "content": "What is 17 + 25?" } ] },
   "command": { "resume": { "approved": true } },
   "config": { "recursion_limit": 25 },
+  "checkpoint": { "checkpoint_id": "optional-checkpoint-uuid" },
   "metadata": {},
   "stream_mode": ["values", "updates"],
   "multitask_strategy": "reject",
@@ -125,11 +127,47 @@ Not in v0.2 (roadmap, see below): thread listing/deletion endpoints, `/metrics`,
 
 - `assistant_id` runs through a [named assistant](#assistants-crons-and-the-kv-store): the assistant must be bound to the same graph as the thread (`400` on mismatch, `404` when unknown), and its `config.recursion_limit` applies as a default when the payload doesn't set one.
 - `command.resume` is the human-in-the-loop channel: it maps directly to `RunConfig::with_resume(value)`. The executor restores the thread's latest checkpoint, re-runs the interrupted node with `NodeContext::resume_value()` returning the payload, and the run continues. An interrupted run is reported as `{"status": "interrupted", "interrupt": <value>, "checkpoint_id": …, "state": …}`.
+- `checkpoint.checkpoint_id` is the time-travel channel: it maps to `RunConfig::with_checkpoint_id(id)` — the run replays from **that** checkpoint of the thread (its state and next-node set) instead of the latest. `404` when the thread has no checkpoint with that id. Prefer replaying on a [fork](#time-travel-fork--checkpoint-replay) rather than the original thread, so the new history grows on a branch instead of appending to the live timeline. Combines with `command.resume`: `checkpoint_id` selects *where* the run restarts, `resume` supplies the resume value for the first super-step.
 - `config.recursion_limit` maps to `RunConfig::with_max_steps(n)`.
 - `stream_mode` selects which frame families the SSE endpoint emits; default `["values", "updates"]`. `metadata`, `error`, and `end` frames are always emitted. Add `"messages"` for LLM token deltas.
 - `multitask_strategy` — one active run per thread: `enqueue` (default) queues onto the per-thread run queue (depth-capped by `ServerConfig::max_concurrent_runs_per_thread`), `reject` returns `409 Conflict`. LangGraph's `rollback` strategy is instead an explicit operation: `DELETE /threads/{id}/runs/{run_id}` on a finished run.
 
 **Auth.** A single static API key checked against the `X-Api-Key` header (the LangSmith managed-deployment convention), set via `ServerConfig::with_api_key("…")`. With no key configured (the default), the server runs in dev mode with auth disabled.
+
+**CORS.** `router()` layers `tower_http::cors::CorsLayer::permissive()` as the outermost middleware: every response carries `access-control-allow-origin: *`, and OPTIONS preflights are answered before the auth middleware runs. That makes browser clients — like the zero-build [Studio](../studio/) — work out of the box from any origin, including `file://`. **Production deployments should restrict this**: call `router()` and layer your own restrictive `CorsLayer` policy on top in your binary (allowed origins, methods, and headers narrowed to your frontend), or terminate CORS at a reverse proxy.
+
+## Time travel: fork & checkpoint replay
+
+Every super-step boundary is a checkpoint, and every checkpoint is a handle. Two endpoints turn that into LangGraph-style time travel:
+
+**Fork a thread's history** — `POST /threads/{id}/fork` copies the source thread's checkpoints (preserving their ids, steps, states, and next-node sets; only the `thread_id` changes) into a new thread bound to the same graph, via core's `Checkpointer::fork_thread`:
+
+```bash
+# Full-history fork
+curl -X POST localhost:8080/threads/$TID/fork \
+  -H 'Content-Type: application/json' -d '{}'
+# -> 201 {"thread_id": "9c1e…", "checkpoints_copied": 2}
+
+# Mid-history fork: copy only up to (and including) a checkpoint,
+# so the fork branches off at that point in the timeline
+curl -X POST localhost:8080/threads/$TID/fork \
+  -H 'Content-Type: application/json' \
+  -d '{"new_thread_id": "branch-a", "checkpoint_id": "'$CP_ID'"}'
+# -> 201 {"thread_id": "branch-a", "checkpoints_copied": 1}
+```
+
+Errors: `404` when the source thread (or the `checkpoint_id`) is unknown, `400` when the source thread has no checkpoints to copy, `409` when `new_thread_id` is already taken.
+
+**Replay a run from a checkpoint** — all three run endpoints accept `"checkpoint": {"checkpoint_id": "…"}`, which maps to `RunConfig::with_checkpoint_id(id)`: the run restores *that* checkpoint's state and next-node set instead of the latest and continues from there (`404` when the checkpoint is unknown):
+
+```bash
+# Re-run the tail of the graph from an earlier boundary, on the fork
+curl -X POST localhost:8080/threads/branch-a/runs/wait \
+  -H 'Content-Type: application/json' \
+  -d '{"checkpoint": {"checkpoint_id": "'$CP_ID'"}}'
+```
+
+The safe pattern is **fork first, replay on the fork**: replaying on the original thread appends new history on top of the old timeline (supported, but rarely what you want), while a fork gives the alternate path its own thread id and its own history. Checkpoint ids come from `POST /threads/{id}/history`, `GET /threads/{id}/state`, or an interrupted run's `checkpoint_id` field.
 
 ## Assistants, crons, and the KV store
 
@@ -162,6 +200,39 @@ Every SSE frame carries `id: {checkpoint_id}:{step}:{seq}`, where `seq` is a per
 
 **Proxy guidance.** Behind nginx or another reverse proxy, disable response buffering for SSE routes (`X-Accel-Buffering: no`) and flush per event, or your clients will see nothing until the buffer fills.
 
+## Postgres persistence (feature `postgres`)
+
+The default deployment needs no infrastructure — checkpoints, assistants, crons, and KV items are JSON files under `store_path`. When you outgrow a single process's file system (several replicas, shared state, operational tooling), build with the `postgres` feature and point the server at a database:
+
+```toml
+[dependencies]
+agentgraph-server = { version = "0.3", features = ["postgres"] }
+```
+
+```rust
+let config = ServerConfig::new("0.0.0.0:8080".parse()?, "./data/checkpoints")
+    .with_postgres("postgres://user:pass@localhost/agentgraph");
+// or twelve-factor style: .with_postgres(std::env::var("DATABASE_URL")?)
+```
+
+`with_postgres(url)` switches **both** persistence layers in one call:
+
+| Layer | Default | With `with_postgres` |
+|---|---|---|
+| Run checkpoints | `JsonFileCheckpointer` under `store_path` | core's `PostgresCheckpointer` → table `agentgraph_checkpoints` |
+| Assistants | `{store_path}/assistants/*.json` | table `server_assistants` (record as JSONB `payload`) |
+| Crons | `{store_path}/crons/*.json` | table `server_crons` (record as JSONB `payload`) |
+| KV store | `{store_path}/store/{ns}/{key}.json` | table `server_kv` (`namespace` + `"key"` primary key, JSONB `value`, `created_at`/`updated_at`) |
+
+All four schemas are **auto-migrated** (`CREATE TABLE IF NOT EXISTS …`) on connect; connections are established lazily on first use, so `router()` stays synchronous and the server starts even if the database is briefly unreachable (first-touch failures surface as `500`s until Postgres is back). The HTTP surface is identical either way — `GET /info` reports `"checkpointer": "postgres"` when enabled. Nothing else changes: fork, replay, crons, and the KV store run the same code paths against the `ServerStore` / `Checkpointer` traits.
+
+The live-Postgres integration tests are gated and skipped by default; run them against a scratch database with:
+
+```bash
+DATABASE_URL=postgres://user:pass@localhost/agentgraph_test \
+  cargo test --features postgres --test postgres_store -- --ignored
+```
+
 ## Configuration
 
 Configuration is code, via `ServerConfig` (constructed with `ServerConfig::new(bind_addr, store_path)` plus builder methods, or `ServerConfig::default()`). If you want twelve-factor env-based config in your binary, read the environment in your own `main.rs` and build the `ServerConfig` from it — the crate deliberately does not read process env itself.
@@ -169,7 +240,8 @@ Configuration is code, via `ServerConfig` (constructed with `ServerConfig::new(b
 | Field / builder | Default | Purpose |
 |---|---|---|
 | `bind_addr` | `0.0.0.0:8080` | Listen address (used by `serve`) |
-| `store_path` | `./data/checkpoints` | `JsonFileCheckpointer` root (`{store_path}/{thread_id}/{checkpoint_id}.json`) |
+| `store_path` | `./data/checkpoints` | `JsonFileCheckpointer` root (`{store_path}/{thread_id}/{checkpoint_id}.json`) and JSON-file platform persistence |
+| `with_postgres(…)` | `None` = JSON files | Postgres URL for **both** checkpoints and the platform store (feature `postgres`; see [Postgres persistence](#postgres-persistence-feature-postgres)) |
 | `with_api_key(…)` | `None` = dev mode, no auth | Static key required via the `X-Api-Key` header |
 | `with_max_concurrent_runs_per_thread(…)` | `1` | Per-thread enqueue queue depth cap (there is always at most one *active* run per thread) |
 | `with_event_log_capacity(…)` | `1000` | Per-run SSE replay buffer (frames) |
@@ -205,7 +277,7 @@ With the server running locally in dev mode (no API key configured):
 curl localhost:8080/ok
 # {"ok":true}
 curl localhost:8080/info
-# {"service":"agentgraph-server","version":"0.2.0","checkpointer":"json_file",
+# {"service":"agentgraph-server","version":"0.3.0","checkpointer":"json_file",
 #  "store_path":"./data/checkpoints",
 #  "graphs":[{"name":"react_agent","channels":["messages"]}]}
 
@@ -240,6 +312,18 @@ curl -X POST localhost:8080/threads/$TID/history \
 # Roll back a finished run's checkpoints
 curl -X DELETE localhost:8080/threads/$TID/runs/$RUN_ID
 
+# Time travel: fork the thread at an earlier checkpoint, replay the fork
+CP_ID=$(curl -X POST localhost:8080/threads/$TID/history \
+  -H 'Content-Type: application/json' -d '{"limit": 10}' \
+  | jq -r '.[-1].checkpoint.checkpoint_id')
+curl -X POST localhost:8080/threads/$TID/fork \
+  -H 'Content-Type: application/json' \
+  -d '{"checkpoint_id": "'$CP_ID'"}'
+# -> 201 {"thread_id": "9c1e…", "checkpoints_copied": 1}
+curl -X POST localhost:8080/threads/9c1e…/runs/wait \
+  -H 'Content-Type: application/json' \
+  -d '{"checkpoint": {"checkpoint_id": "'$CP_ID'"}}'
+
 # Poll a background run's status (terminal runs carry output/error)
 curl localhost:8080/runs/$RUN_ID
 
@@ -273,8 +357,10 @@ With auth configured, add `-H "X-Api-Key: $KEY"` to every call. For a full walkt
 
 - [x] **Phase A — the server crate (v0.1).** `GraphRegistry`, the thread/run/SSE endpoint set, per-thread run queue with `multitask_strategy` (`enqueue` / `reject`) plus explicit rollback via `DELETE /threads/{id}/runs/{run_id}`, SSE with mode filters (`updates` / `values` / `messages`) + per-run event log + `Last-Event-ID` dedup, static API-key middleware, `JsonFileCheckpointer` wiring from `ServerConfig::store_path`. *Shipped.*
 - [x] **Phase C (partial) — platform surface (v0.2).** `GET /runs/{run_id}` status polling, **assistants** (named graph + config aliases, JSON-persisted, `assistant_id` on run-create), **crons** (interval or 5-field cron schedules, durable records, background tokio scheduler firing runs on fresh threads, `on_run_completed: keep|delete`), and the cross-thread **KV store** (`/store/{namespace}/{key}`, JSON-file-backed). *Shipped.*
+- [x] **Phase C (continued) — time travel + Postgres persistence (v0.3).** `POST /threads/{id}/fork` (full- or mid-history forks via core's `Checkpointer::fork_thread`), checkpoint replay on all run endpoints (`"checkpoint": {"checkpoint_id": …}` → `RunConfig::with_checkpoint_id`), and the `postgres` feature: `ServerConfig::with_postgres(url)` switches the run checkpointer to `PostgresCheckpointer` and the assistants/crons/KV surface to auto-migrated `server_assistants` / `server_crons` / `server_kv` tables behind a `ServerStore` trait. *Shipped.*
+- [x] **Phase C (continued) — permissive CORS (v0.3).** `router()` layers `tower_http::cors::CorsLayer::permissive()`, so browser clients (the [Studio](../studio/)) call the API cross-origin; preflights are answered before auth. Restrict for production — see [CORS](#http-api). *Shipped.*
 - [ ] **Phase B — gRPC worker protocol (`agentgraph-proto`).** `RemoteNode`: a gRPC client behind the same `Node` trait, delegating node execution to stateless out-of-process workers that long-poll named node-queues. The server keeps checkpoints, super-step scheduling, interrupts, and stream fan-out. Agent nodes are dominated by LLM latency (hundreds of ms to minutes), so a 1–5 ms gRPC hop is <1% overhead — and since `State` is already a JSON map, the wire boundary is lossless. Crash isolation, polyglot workers (a Python worker can host the LangChain ecosystem while Rust owns orchestration), and independent scaling of tool-heavy nodes follow.
-- [ ] **Phase C (remainder).** Durable thread registry, thread listing/deletion endpoints, `/metrics`, `/graphs`, `WasmNode` (sandboxed wasmtime components behind the same trait — the only locality safe for untrusted/community nodes), and wiring the core crate's `postgres` checkpointer feature into `ServerConfig`.
+- [ ] **Phase C (remainder).** Durable thread registry, thread listing/deletion endpoints, `/metrics`, and `/graphs`. (`WasmNode` shipped in core `agentgraph` v0.4 behind the `wasm` feature — register a Wasm-backed graph and this crate serves it unchanged.)
 
 Deliberately skipped: A2A/MCP server endpoints and WebSocket "protocol v2" (SSE + HTTP sidecar is sufficient), and `feedback_keys` (LangSmith-tracing coupling we don't have).
 

@@ -1,11 +1,17 @@
 [package]
 name = "agentgraph-server"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "axum HTTP/SSE server for agentgraph: an Agent-Protocol subset with threads, background runs, checkpoints, and resumable streaming."
 keywords = ["agent", "graph", "llm", "server", "langgraph"]
 categories = ["asynchronous", "network-programming"]
+
+[features]
+# Postgres-backed persistence: `ServerConfig::with_postgres(url)` switches
+# both the run checkpointer (core's `PostgresCheckpointer`) and the server
+# store (assistants / crons / KV) to Postgres.
+postgres = ["dep:sqlx", "agentgraph/postgres"]
 
 [dependencies]
 agentgraph = { path = "../agentgraph" }
@@ -17,10 +23,19 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 cron = "0.12"
 futures = "0.3"
+async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Permissive CORS in `router()` so browser clients (e.g. the Studio) can call
+# the API cross-origin. Production deployments should restrict this — see README.
+tower-http = { version = "0.6", features = ["cors"] }
+sqlx = { version = "0.8", default-features = false, features = [
+    "postgres",
+    "runtime-tokio-rustls",
+    "json",
+    "chrono",
+], optional = true }
 
 [dev-dependencies]
-async-trait = "0.1"
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["full", "test-util"] }

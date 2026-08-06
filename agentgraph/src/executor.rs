@@ -112,6 +112,23 @@ pub struct RunConfig {
     /// [`crate::node::NodeContext::resume_value`] returning this value.
     pub resume: Option<Value>,
 
+    /// Replay/time-travel handle: the id of a specific checkpoint of
+    /// `thread_id` to resume from. When set, the executor loads **that**
+    /// checkpoint (not the latest) and continues the run from its state and
+    /// next-node set. Requires a checkpointer on the executor.
+    ///
+    /// Combines with `resume`: `checkpoint_id` selects **where** the run
+    /// restarts, `resume` (when also set) is delivered as the resume value to
+    /// the first super-step, exactly as in interrupt/resume.
+    ///
+    /// Safe pattern: replaying on the *same* thread appends new history on
+    /// top of the old timeline, so prefer forking first —
+    /// [`crate::checkpoint::Checkpointer::fork_thread`] the thread into a new
+    /// thread id, then run the fork with `checkpoint_id` set. Direct replay
+    /// on the original thread is supported for cases where appended history
+    /// is acceptable.
+    pub checkpoint_id: Option<String>,
+
     /// Optional event sink for streaming: the executor emits [`GraphEvent`]s
     /// as the run progresses (node start/end, state updates, checkpoints,
     /// super-step boundaries). Consumers implement LangGraph's stream modes
@@ -126,6 +143,7 @@ impl RunConfig {
             thread_id: thread_id.into(),
             max_steps: DEFAULT_MAX_STEPS,
             resume: None,
+            checkpoint_id: None,
             event_tx: None,
         }
     }
@@ -139,6 +157,14 @@ impl RunConfig {
     /// Builder-style: set the resume value.
     pub fn with_resume(mut self, value: Value) -> Self {
         self.resume = Some(value);
+        self
+    }
+
+    /// Builder-style: replay from a specific checkpoint of `thread_id`
+    /// (time travel). See the [`RunConfig::checkpoint_id`] field docs for
+    /// semantics and the fork-first safe pattern.
+    pub fn with_checkpoint_id(mut self, checkpoint_id: impl Into<String>) -> Self {
+        self.checkpoint_id = Some(checkpoint_id.into());
         self
     }
 
@@ -281,7 +307,12 @@ impl Executor {
     ///   updates at each barrier.
     /// - `initial_state`: the starting state. When `config.resume` is set and
     ///   a checkpoint exists for `config.thread_id`, the checkpointed state
-    ///   and next-node set take precedence over this argument.
+    ///   and next-node set take precedence over this argument. When
+    ///   `config.checkpoint_id` is set, that specific checkpoint (rather than
+    ///   the latest) is restored — replay/time travel; forking into a fresh
+    ///   thread first via
+    ///   [`crate::checkpoint::Checkpointer::fork_thread`] is the safe pattern,
+    ///   since replaying on the same thread appends new history.
     /// - `config`: run configuration (thread id, step limit, resume value,
     ///   streaming sink).
     ///
@@ -346,6 +377,7 @@ impl Executor {
             thread_id = %config.thread_id,
             max_steps = config.max_steps,
             resume = config.resume.is_some(),
+            replay = config.checkpoint_id.is_some(),
         );
         self.run_inner(graph, spec, initial_state, config)
             .instrument(run_span)
@@ -369,27 +401,45 @@ impl Executor {
         // over `initial_state`; the resume value is delivered to the first
         // super-step (whose active set is exactly the interrupted node set)
         // via `NodeContext::resume_value()`.
+        //
+        // Time travel: when `config.checkpoint_id` is set, THAT checkpoint is
+        // restored instead of the latest — this is replay from an arbitrary
+        // history point. The two knobs compose: `checkpoint_id` selects WHERE
+        // the run restarts, `resume` (when also set) supplies the resume value
+        // for the first super-step.
         let mut state = initial_state;
         let mut active: Vec<ActiveTask>;
         let mut step: usize = 0;
         let mut pending_resume: Option<Value> = None;
 
-        if config.resume.is_some() {
+        if config.checkpoint_id.is_some() || config.resume.is_some() {
             let checkpointer = self.checkpointer.as_ref().ok_or_else(|| {
                 AgentGraphError::Checkpoint(
-                    "RunConfig.resume is set but no checkpointer is configured on the executor"
+                    "RunConfig.checkpoint_id/resume is set but no checkpointer is configured \
+                     on the executor"
                         .into(),
                 )
             })?;
-            let checkpoint = checkpointer
-                .get_latest(&config.thread_id)
-                .await?
-                .ok_or_else(|| {
-                    AgentGraphError::Checkpoint(format!(
-                        "cannot resume thread `{}`: no checkpoint found",
-                        config.thread_id
-                    ))
-                })?;
+            let checkpoint = match &config.checkpoint_id {
+                Some(id) => checkpointer
+                    .get_by_id(&config.thread_id, id)
+                    .await?
+                    .ok_or_else(|| {
+                        AgentGraphError::Checkpoint(format!(
+                            "cannot replay thread `{}`: checkpoint `{id}` not found",
+                            config.thread_id
+                        ))
+                    })?,
+                None => checkpointer
+                    .get_latest(&config.thread_id)
+                    .await?
+                    .ok_or_else(|| {
+                        AgentGraphError::Checkpoint(format!(
+                            "cannot resume thread `{}`: no checkpoint found",
+                            config.thread_id
+                        ))
+                    })?,
+            };
             state = checkpoint.state;
             step = checkpoint.step;
             active = checkpoint
@@ -1184,5 +1234,164 @@ mod tests {
                 .any(|e| e.contains("steps") && e.contains("duration_ms")),
             "expected a run-completion info event with steps and duration_ms, got: {captured:?}"
         );
+    }
+
+    /// A 3-node linear graph (`a -> b -> c`) appending each node name to the
+    /// `log` channel.
+    fn linear_three_node_graph() -> (Graph, StateSpec) {
+        let spec = StateSpec::new().channel("log", Reducer::Append);
+        let mut builder = GraphBuilder::new();
+        for name in ["a", "b", "c"] {
+            builder.add_node(name, move |_ctx: NodeContext| async move {
+                Ok(NodeOutput::update("log", json!(name)))
+            });
+        }
+        builder.set_entry_point("a");
+        builder.add_edge("a", "b");
+        builder.add_edge("b", "c");
+        (builder.compile().unwrap(), spec)
+    }
+
+    #[tokio::test]
+    async fn run_with_checkpoint_id_replays_from_earlier_state() {
+        let (graph, spec) = linear_three_node_graph();
+        let checkpointer = Arc::new(InMemoryCheckpointer::new());
+        let executor = Executor::with_checkpointer(checkpointer.clone());
+
+        // Full run on the source thread: checkpoints at steps 0, 1, 2.
+        let outcome = executor
+            .run(&graph, &spec, State::new(), RunConfig::new("t-src"))
+            .await
+            .unwrap();
+        match outcome {
+            ExecutionOutcome::Done(state) => {
+                assert_eq!(state.get("log"), Some(&json!(["a", "b", "c"])));
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+
+        let history = checkpointer.list("t-src").await.unwrap();
+        assert_eq!(history.len(), 3);
+        // The step-1 checkpoint: `a` and `b` have run, `c` is scheduled next.
+        let step1 = history[1].clone();
+        assert_eq!(step1.step, 1);
+        assert_eq!(step1.state.get("log"), Some(&json!(["a", "b"])));
+        assert_eq!(step1.next_nodes, vec!["c".to_string()]);
+
+        // Safe pattern: fork the thread at the step-1 checkpoint, then replay
+        // the fork from that checkpoint (not the fork's latest — here the cut
+        // point IS the latest, but `checkpoint_id` is what selects it).
+        let copied = checkpointer
+            .fork_thread("t-src", "t-fork", Some(&step1.id))
+            .await
+            .unwrap();
+        assert_eq!(copied, 2);
+
+        let outcome = executor
+            .run(
+                &graph,
+                &spec,
+                State::new(),
+                RunConfig::new("t-fork").with_checkpoint_id(step1.id.clone()),
+            )
+            .await
+            .unwrap();
+
+        match outcome {
+            ExecutionOutcome::Done(state) => {
+                // Execution continued from the step-1 state: only `c` ran,
+                // `b` was not re-executed.
+                assert_eq!(state.get("log"), Some(&json!(["a", "b", "c"])));
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+
+        // The replay appended its own boundary checkpoint to the fork only.
+        assert_eq!(checkpointer.list("t-src").await.unwrap().len(), 3);
+        assert_eq!(checkpointer.list("t-fork").await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn run_with_checkpoint_id_plus_resume_combined() {
+        let spec = StateSpec::new().channel("answer", Reducer::Overwrite);
+
+        let mut builder = GraphBuilder::new();
+        builder.add_node("gate", |ctx: NodeContext| async move {
+            match ctx.resume_value() {
+                Some(v) => Ok(NodeOutput::update("answer", v.clone())),
+                None => Err(ctx.interrupt(json!({"question": "approve?"}))),
+            }
+        });
+        builder.set_entry_point("gate");
+        let graph = builder.compile().unwrap();
+
+        let checkpointer = Arc::new(InMemoryCheckpointer::new());
+        let executor = Executor::with_checkpointer(checkpointer);
+
+        // Suspend at the gate and capture the suspension checkpoint id.
+        let outcome = executor
+            .run(&graph, &spec, State::new(), RunConfig::new("t-hitl"))
+            .await
+            .unwrap();
+        let checkpoint_id = match outcome {
+            ExecutionOutcome::Interrupted { checkpoint_id, .. } => checkpoint_id,
+            other => panic!("expected Interrupted, got {other:?}"),
+        };
+
+        // checkpoint_id selects WHERE (the suspension checkpoint), resume
+        // supplies the value delivered to the re-running gate node.
+        let outcome = executor
+            .run(
+                &graph,
+                &spec,
+                State::new(),
+                RunConfig::new("t-hitl")
+                    .with_checkpoint_id(checkpoint_id)
+                    .with_resume(json!(true)),
+            )
+            .await
+            .unwrap();
+
+        match outcome {
+            ExecutionOutcome::Done(state) => {
+                assert_eq!(state.get("answer"), Some(&json!(true)));
+            }
+            other => panic!("expected Done after replay+resume, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_with_checkpoint_id_errors_without_checkpointer_or_unknown_id() {
+        let (graph, spec) = linear_three_node_graph();
+
+        // No checkpointer configured: replay is impossible.
+        let err = Executor::new()
+            .run(
+                &graph,
+                &spec,
+                State::new(),
+                RunConfig::new("t-x").with_checkpoint_id("some-id"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentGraphError::Checkpoint(_)));
+
+        // Checkpointer present but the id does not exist on the thread.
+        let checkpointer = Arc::new(InMemoryCheckpointer::new());
+        let executor = Executor::with_checkpointer(checkpointer.clone());
+        executor
+            .run(&graph, &spec, State::new(), RunConfig::new("t-x"))
+            .await
+            .unwrap();
+        let err = executor
+            .run(
+                &graph,
+                &spec,
+                State::new(),
+                RunConfig::new("t-x").with_checkpoint_id("no-such-checkpoint"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentGraphError::Checkpoint(_)));
     }
 }

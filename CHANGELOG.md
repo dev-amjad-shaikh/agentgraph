@@ -1,6 +1,21 @@
 # Changelog
 
-All notable changes to the agentgraph platform. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); crates are versioned independently (`agentgraph`, `agentgraph-server`, `agentgraph-worker`).
+All notable changes to the agentgraph platform. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); crates are versioned independently (`agentgraph`, `agentgraph-server`, `agentgraph-otel`, `agentgraph-worker`).
+
+## [0.4.0] — 2026-08-05
+
+### Added
+
+- **WASM nodes** *(agentgraph, feature `wasm`)* — `WasmNode` (`wasm_node` module) runs sandboxed WebAssembly modules as graph nodes via Wasmtime: untrusted-code isolation behind the same `Node` trait, no separate worker fleet. 6 WAT-driven tests.
+- **Time travel** *(agentgraph + agentgraph-server)* — core: `Checkpointer::get_by_id` / `Checkpointer::fork_thread` and `RunConfig::with_checkpoint_id` (replay a run from any checkpoint instead of the latest). Server: `POST /threads/{id}/fork` (`{new_thread_id?, checkpoint_id?}` → `201 {thread_id, checkpoints_copied}`; `404`/`400`/`409` error cases) and `"checkpoint": {"checkpoint_id": …}` on all three run endpoints (`404` for unknown checkpoint ids).
+- **Postgres server store** *(agentgraph-server, feature `postgres`)* — `ServerConfig::with_postgres(url)` switches both persistence layers in one call: run checkpoints to core's `PostgresCheckpointer` and the assistants/crons/KV surface to the auto-migrated `server_assistants` / `server_crons` / `server_kv` tables behind a `ServerStore` trait. Covered by 4 live-database integration tests (gated, `--ignored`).
+- **`agentgraph-otel`** *(new crate, v0.1.0)* — the OpenTelemetry export layer: one-call tracing subscriber setup with optional OTLP span export (HTTP/protobuf, `opentelemetry` 0.32), building on v0.3's executor `tracing` instrumentation.
+- **Studio** *(studio/)* — a zero-build, single-file debug UI for `agentgraph-server`: connect bar, graph/thread panels, state + checkpoint-history viewers, background/wait/SSE runs, interrupt-resume helper, and fork / checkpoint-replay driven by the real time-travel endpoints (with client-side fallback notes for older servers). See [docs/studio.md](docs/studio.md).
+- **Permissive CORS** *(agentgraph-server)* — `router()` now layers `tower_http::cors::CorsLayer::permissive()`, so browser clients like the Studio can call the API cross-origin; OPTIONS preflights are answered before the API-key middleware. Production deployments should replace it with a restrictive layer (see the server README).
+
+### Fixed
+
+- **Concurrent Postgres migration race** *(agentgraph + agentgraph-server)* — first-use auto-migrations (`CREATE TABLE IF NOT EXISTS …`) now run inside a transaction holding a transaction-scoped advisory lock, so several processes/tests booting against one fresh database serialize instead of failing with `duplicate key value violates unique constraint "pg_type_typname_nsp_index"`.
 
 ## [0.3.0] — 2026-08-05
 

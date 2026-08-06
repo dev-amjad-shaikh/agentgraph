@@ -64,6 +64,8 @@ pub mod react;
 pub mod remote;
 pub mod state;
 pub mod tool;
+#[cfg(feature = "wasm")]
+pub mod wasm_node;
 
 /// Convenience re-exports of the main public API.
 pub mod prelude {

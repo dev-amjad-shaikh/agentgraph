@@ -9,7 +9,7 @@ Where the platform has been, what's landing this cycle, and what's next. Crates 
 | Core kernel | State channels + reducers, Pregel/BSP executor, checkpoints, HITL interrupts, `Send` fan-out, `ChatModel`/`ToolExecutor`, prebuilt ReAct agent | `agentgraph` v0.1.0 | ✅ Shipped | 2026-07-31 |
 | Durability & streaming + server Phase A | Postgres checkpointer, token streaming (`messages` mode), live example; axum server: threads, runs, SSE, auth | `agentgraph` v0.2.0, `agentgraph-server` v0.1.0 | ✅ Shipped | 2026-08-05 |
 | **v0.3 — interop & distribution** | MCP client, remote nodes + worker SDK, server API completion, executor tracing | `agentgraph` v0.3.0, `agentgraph-server` v0.2.0, `agentgraph-worker` v0.1.0 | ✅ Shipped | 2026-08-05 |
-| Phase C — production hardening | WASM nodes, Postgres-backed server store, OpenTelemetry export, time-travel API, Studio-style graph viz | TBD | 🔭 Candidates | — |
+| **v0.4 — production hardening** | WASM nodes, time-travel core + server API, Postgres server store, OpenTelemetry export, Studio UI, permissive CORS | `agentgraph` v0.4.0, `agentgraph-server` v0.3.0, `agentgraph-otel` v0.1.0 | ✅ Shipped | 2026-08-05 |
 | Phase D — platform ambitions | Hosted multi-tenant service, WASM target, edge runtimes | TBD | 🌌 Ambitions | — |
 
 ## Shipped
@@ -31,17 +31,17 @@ Four workstreams landed concurrently this cycle:
 - **Server API completion** (`agentgraph-server` v0.2) — fills out the Agent-Protocol surface from the [design doc](agentgraph-server-design.md): `GET /runs/{id}`, assistants, crons, and the KV store — 20 integration tests green.
 - **Executor tracing** — `tracing` instrumentation through the super-step loop (spans per super-step, node, checkpoint), the foundation for the OpenTelemetry export candidate below.
 
-## Phase C — production hardening (candidates)
+### Phase: v0.4 — production hardening — `agentgraph` v0.4.0, `agentgraph-server` v0.3.0, `agentgraph-otel` v0.1.0 (2026-08-05)
 
-Scoped, individually shippable; ordering not committed:
+Five workstreams landed concurrently this cycle:
 
-- **WASM nodes** — run sandboxed user functions as graph nodes (Wasmtime), untrusted-code isolation without a separate worker fleet.
-- **Postgres-backed server store** — move the server's thread/run/event state from in-memory to Postgres, enabling multi-replica `agentgraph-server` deployments.
-- **OpenTelemetry export** — OTLP spans per super-step / node / LLM call following the GenAI semantic conventions, building on v0.3's tracing instrumentation.
-- **Time-travel API** — expose checkpoint forking and replay (the checkpointers already list versions) over HTTP.
-- **Studio-style graph viz** — a LangGraph-Studio-like web UI: graph topology rendering, run inspection, state diffing against the SSE stream.
+- **WASM nodes** (`agentgraph/src/wasm_node.rs`, feature `wasm`) — `WasmNode` runs sandboxed WebAssembly modules as graph nodes via Wasmtime: untrusted-code isolation behind the same `Node` trait, without a separate worker fleet.
+- **Time travel** — core gained `Checkpointer::get_by_id` / `Checkpointer::fork_thread` and `RunConfig::with_checkpoint_id`; the server exposes them as `POST /threads/{id}/fork` (full- or mid-history forks) and `"checkpoint": {"checkpoint_id": …}` replay on all three run endpoints. Fork first, replay on the fork.
+- **Postgres server store** (`agentgraph-server`, feature `postgres`) — `ServerConfig::with_postgres(url)` moves run checkpoints *and* the assistants/crons/KV surface into Postgres (`server_*` tables, auto-migrated on first use; migrations serialize on a transaction-scoped advisory lock, so concurrent cold boots are safe).
+- **OpenTelemetry export** (new `agentgraph-otel` crate) — one-call tracing subscriber setup with optional OTLP span export, completing the v0.3 executor instrumentation story.
+- **Studio** (`studio/`, zero-build single-file UI) — connect bar, graph/thread panels, state + checkpoint-history viewers, all three run modes, interrupt/resume, and fork/replay against the real time-travel endpoints. The server now layers permissive CORS in `router()`, so the Studio can call it cross-origin (restrict it in production). See [docs/studio.md](studio.md).
 
-### Explicitly rejected
+## Explicitly rejected
 
 - **napi-rs / PyO3 bindings** — REJECTED: they'd freeze a trait surface that's still moving and split maintenance across three ecosystems; the HTTP/SSE server is the polyglot interop layer instead.
 - **`cdylib` / C ABI** — REJECTED: a C ABI over async tokio graphs leaks runtime-ownership and panic-safety problems across the boundary for near-zero demand; embed the Rust crate directly or talk HTTP.

@@ -18,12 +18,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use crate::assistants::{self, AssistantRecord};
+use crate::assistants::AssistantRecord;
 use crate::crons::{self, CronRecord, OnRunCompleted};
 use crate::error::ApiError;
 use crate::runs::{
     self, MultitaskStrategy, RunConfigPayload, RunDeps, RunManager, RunPayload, RunStatus,
 };
+use crate::server_store::{JsonFileStore, ServerStore};
 use crate::sse;
 use crate::{store, GraphRegistry, ServerConfig};
 
@@ -44,16 +45,39 @@ pub(crate) struct AppState {
     pub checkpointer: Arc<dyn Checkpointer>,
     pub threads: Mutex<HashMap<String, ThreadRecord>>,
     pub run_deps: RunDeps,
-    pub assistants: Mutex<HashMap<String, AssistantRecord>>,
-    pub crons: Mutex<HashMap<String, CronRecord>>,
-    /// Serializes KV-store writes so `created_at` preservation can't race.
-    pub store_lock: Mutex<()>,
+    /// Assistants / crons / KV persistence (JSON files or Postgres).
+    pub server_store: Arc<dyn ServerStore>,
+}
+
+/// Build the checkpointer + server-store backends for `config`. The default
+/// is JSON files under `store_path`; `ServerConfig::with_postgres(url)`
+/// (feature `postgres`) switches both to Postgres. Postgres connections are
+/// established lazily on first use, keeping this builder synchronous.
+fn build_backends(config: &ServerConfig) -> (Arc<dyn Checkpointer>, Arc<dyn ServerStore>) {
+    #[cfg(feature = "postgres")]
+    if let Some(url) = &config.database_url {
+        return (
+            Arc::new(crate::server_store::LazyPostgresCheckpointer::new(
+                url.clone(),
+            )),
+            Arc::new(crate::server_store::PostgresStore::new(url.clone())),
+        );
+    }
+    #[cfg(not(feature = "postgres"))]
+    assert!(
+        config.database_url.is_none(),
+        "`ServerConfig::database_url` requires the `postgres` feature \
+         (rebuild agentgraph-server with `--features postgres`)"
+    );
+    (
+        Arc::new(JsonFileCheckpointer::new(config.store_path.clone())),
+        Arc::new(JsonFileStore::load(&config.store_path)),
+    )
 }
 
 /// Build the full router (used by [`crate::router`]).
 pub(crate) fn router(registry: GraphRegistry, config: ServerConfig) -> Router {
-    let checkpointer: Arc<dyn Checkpointer> =
-        Arc::new(JsonFileCheckpointer::new(config.store_path.clone()));
+    let (checkpointer, server_store) = build_backends(&config);
     let run_deps = RunDeps {
         registry: registry.clone(),
         checkpointer: Arc::clone(&checkpointer),
@@ -63,13 +87,11 @@ pub(crate) fn router(registry: GraphRegistry, config: ServerConfig) -> Router {
     };
     let state = Arc::new(AppState {
         registry,
-        assistants: Mutex::new(assistants::load(&config.store_path)),
-        crons: Mutex::new(crons::load(&config.store_path)),
         config,
         checkpointer,
         threads: Mutex::new(HashMap::new()),
         run_deps,
-        store_lock: Mutex::new(()),
+        server_store,
     });
     crons::spawn_scheduler(Arc::clone(&state));
 
@@ -77,6 +99,7 @@ pub(crate) fn router(registry: GraphRegistry, config: ServerConfig) -> Router {
         .route("/ok", get(ok))
         .route("/info", get(info))
         .route("/threads", post(create_thread))
+        .route("/threads/{thread_id}/fork", post(fork_thread))
         .route(
             "/threads/{thread_id}/state",
             get(get_state).post(update_state),
@@ -105,6 +128,11 @@ pub(crate) fn router(registry: GraphRegistry, config: ServerConfig) -> Router {
             Arc::clone(&state),
             crate::auth::require_api_key,
         ))
+        // Outermost layer: permissive CORS so browser clients (e.g. the
+        // Studio) can call the API from any origin, and OPTIONS preflights
+        // are answered before the API-key middleware runs. Production
+        // deployments should replace this with a restrictive `CorsLayer`.
+        .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state)
 }
 
@@ -155,10 +183,16 @@ async fn info(AxumState(state): AxumState<Arc<AppState>>) -> Json<Value> {
             })
         })
         .collect();
+    let persistence = if state.config.database_url.is_some() {
+        "postgres"
+    } else {
+        "json_file"
+    };
     Json(json!({
         "service": "agentgraph-server",
         "version": env!("CARGO_PKG_VERSION"),
-        "checkpointer": "json_file",
+        "checkpointer": persistence,
+        "server_store": persistence,
         "store_path": state.config.store_path,
         "graphs": graphs,
     }))
@@ -208,6 +242,83 @@ async fn create_thread(
     };
     threads.insert(thread_id, record.clone());
     Ok((StatusCode::CREATED, Json(record)))
+}
+
+// --------------------------------------------------------------------- //
+// Thread fork (time travel)
+// --------------------------------------------------------------------- //
+
+#[derive(Debug, Deserialize)]
+struct ForkThreadPayload {
+    /// Client-chosen id for the fork (a UUID v4 is generated when omitted).
+    #[serde(default)]
+    new_thread_id: Option<String>,
+    /// Fork from this checkpoint: only checkpoints up to and including it
+    /// are copied. Omit to copy the full history.
+    #[serde(default)]
+    checkpoint_id: Option<String>,
+}
+
+/// `POST /threads/{id}/fork` — copy the thread's checkpoint history (full,
+/// or up to `checkpoint_id`) into a new thread bound to the same graph, via
+/// [`Checkpointer::fork_thread`]. The fork is the safe time-travel target:
+/// replay it with `"checkpoint": {"checkpoint_id": …}` on run-create.
+async fn fork_thread(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(thread_id): Path<String>,
+    Json(payload): Json<ForkThreadPayload>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let record = require_thread(&state, &thread_id).await?;
+    let new_thread_id = payload
+        .new_thread_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    {
+        let threads = state.threads.lock().await;
+        if threads.contains_key(&new_thread_id) {
+            return Err(ApiError::conflict(format!(
+                "thread `{new_thread_id}` already exists"
+            )));
+        }
+    }
+
+    let copied = state
+        .checkpointer
+        .fork_thread(&thread_id, &new_thread_id, payload.checkpoint_id.as_deref())
+        .await
+        .map_err(|e| {
+            let message = e.to_string();
+            if message.contains("unknown checkpoint id") {
+                ApiError::not_found(message)
+            } else {
+                // No checkpoints to fork, or src == dst id collision.
+                ApiError::bad_request(message)
+            }
+        })?;
+
+    let fork = ThreadRecord {
+        thread_id: new_thread_id.clone(),
+        graph: record.graph,
+        metadata: json!({
+            "forked_from": thread_id,
+            "fork_checkpoint_id": payload.checkpoint_id,
+        }),
+        created_at: Utc::now(),
+    };
+    state
+        .threads
+        .lock()
+        .await
+        .insert(new_thread_id.clone(), fork);
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "thread_id": new_thread_id,
+            "checkpoints_copied": copied,
+        })),
+    ))
 }
 
 // --------------------------------------------------------------------- //
@@ -350,9 +461,11 @@ async fn schedule_for_thread(
         }
     }
     if let Some(assistant_id) = &payload.assistant_id {
-        let assistants = state.assistants.lock().await;
-        let assistant = assistants
-            .get(assistant_id)
+        let assistant = state
+            .server_store
+            .get_assistant(assistant_id)
+            .await
+            .map_err(internal_err)?
             .ok_or_else(|| ApiError::not_found(format!("assistant `{assistant_id}` not found")))?;
         if assistant.graph != record.graph {
             return Err(ApiError::bad_request(format!(
@@ -374,6 +487,21 @@ async fn schedule_for_thread(
                     .get_or_insert_with(RunConfigPayload::default)
                     .recursion_limit = Some(limit as usize);
             }
+        }
+    }
+    if let Some(checkpoint) = &payload.checkpoint {
+        // Time travel: the checkpoint must exist on this thread, or the
+        // replay would fail deep inside the executor — answer 404 up front.
+        let found = state
+            .checkpointer
+            .get_by_id(thread_id, &checkpoint.checkpoint_id)
+            .await
+            .map_err(internal_err)?;
+        if found.is_none() {
+            return Err(ApiError::not_found(format!(
+                "thread `{thread_id}` has no checkpoint `{}`",
+                checkpoint.checkpoint_id
+            )));
         }
     }
     let strategy = MultitaskStrategy::parse(payload.multitask_strategy.as_deref())
@@ -583,30 +711,33 @@ async fn create_assistant(
         metadata: payload.metadata.unwrap_or(Value::Null),
         created_at: Utc::now(),
     };
-    {
-        let mut assistants = state.assistants.lock().await;
-        if assistants.contains_key(&assistant_id) {
-            return Err(ApiError::conflict(format!(
-                "assistant `{assistant_id}` already exists"
-            )));
-        }
-        assistants.insert(assistant_id, record.clone());
-    }
-    assistants::persist(&state.config.store_path, &record)
+    let created = state
+        .server_store
+        .create_assistant(&record)
         .await
         .map_err(internal_err)?;
+    if !created {
+        return Err(ApiError::conflict(format!(
+            "assistant `{assistant_id}` already exists"
+        )));
+    }
     Ok((StatusCode::CREATED, Json(record)))
 }
 
-async fn list_assistants(AxumState(state): AxumState<Arc<AppState>>) -> Json<Value> {
-    let mut records: Vec<AssistantRecord> =
-        state.assistants.lock().await.values().cloned().collect();
+async fn list_assistants(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<Json<Value>, ApiError> {
+    let mut records = state
+        .server_store
+        .list_assistants()
+        .await
+        .map_err(internal_err)?;
     records.sort_by(|a, b| {
         a.created_at
             .cmp(&b.created_at)
             .then_with(|| a.assistant_id.cmp(&b.assistant_id))
     });
-    Json(json!(records))
+    Ok(Json(json!(records)))
 }
 
 async fn get_assistant(
@@ -614,11 +745,10 @@ async fn get_assistant(
     Path(assistant_id): Path<String>,
 ) -> Result<Json<AssistantRecord>, ApiError> {
     state
-        .assistants
-        .lock()
+        .server_store
+        .get_assistant(&assistant_id)
         .await
-        .get(&assistant_id)
-        .cloned()
+        .map_err(internal_err)?
         .map(Json)
         .ok_or_else(|| ApiError::not_found(format!("assistant `{assistant_id}` not found")))
 }
@@ -689,36 +819,43 @@ async fn create_cron(
         last_run_at: None,
         runs_fired: 0,
     };
-    {
-        let mut crons_map = state.crons.lock().await;
-        if crons_map.contains_key(&cron_id) {
-            return Err(ApiError::conflict(format!(
-                "cron `{cron_id}` already exists"
-            )));
-        }
-        crons_map.insert(cron_id, record.clone());
-    }
-    crons::persist(&state.config.store_path, &record)
+    let created = state
+        .server_store
+        .create_cron(&record)
         .await
         .map_err(internal_err)?;
+    if !created {
+        return Err(ApiError::conflict(format!(
+            "cron `{cron_id}` already exists"
+        )));
+    }
     Ok((StatusCode::CREATED, Json(record)))
 }
 
-async fn list_crons(AxumState(state): AxumState<Arc<AppState>>) -> Json<Value> {
-    let mut records: Vec<CronRecord> = state.crons.lock().await.values().cloned().collect();
+async fn list_crons(AxumState(state): AxumState<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+    let mut records = state
+        .server_store
+        .list_crons()
+        .await
+        .map_err(internal_err)?;
     records.sort_by(|a, b| {
         a.created_at
             .cmp(&b.created_at)
             .then_with(|| a.cron_id.cmp(&b.cron_id))
     });
-    Json(json!(records))
+    Ok(Json(json!(records)))
 }
 
 async fn delete_cron(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(cron_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    if crons::remove(&state, &cron_id).await {
+    if state
+        .server_store
+        .delete_cron(&cron_id)
+        .await
+        .map_err(internal_err)?
+    {
         Ok(Json(json!({ "cron_id": cron_id, "deleted": true })))
     } else {
         Err(ApiError::not_found(format!("cron `{cron_id}` not found")))
@@ -736,8 +873,9 @@ async fn put_store_item(
 ) -> Result<(StatusCode, Json<store::StoreItem>), ApiError> {
     store::validate_segment("namespace", &namespace)?;
     store::validate_segment("key", &key)?;
-    let _guard = state.store_lock.lock().await;
-    let (item, created) = store::put(&state.config.store_path, &namespace, &key, value)
+    let (item, created) = state
+        .server_store
+        .kv_put(&namespace, &key, value)
         .await
         .map_err(internal_err)?;
     let status = if created {
@@ -754,7 +892,9 @@ async fn get_store_item(
 ) -> Result<Json<store::StoreItem>, ApiError> {
     store::validate_segment("namespace", &namespace)?;
     store::validate_segment("key", &key)?;
-    store::get(&state.config.store_path, &namespace, &key)
+    state
+        .server_store
+        .kv_get(&namespace, &key)
         .await
         .map_err(internal_err)?
         .map(Json)
@@ -767,8 +907,9 @@ async fn delete_store_item(
 ) -> Result<Json<Value>, ApiError> {
     store::validate_segment("namespace", &namespace)?;
     store::validate_segment("key", &key)?;
-    let _guard = state.store_lock.lock().await;
-    if store::delete(&state.config.store_path, &namespace, &key)
+    if state
+        .server_store
+        .kv_delete(&namespace, &key)
         .await
         .map_err(internal_err)?
     {
@@ -787,7 +928,9 @@ async fn list_store_namespace(
     Path(namespace): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     store::validate_segment("namespace", &namespace)?;
-    let items = store::list(&state.config.store_path, &namespace)
+    let items = state
+        .server_store
+        .kv_list(&namespace)
         .await
         .map_err(internal_err)?;
     Ok(Json(json!(items)))

@@ -1,6 +1,6 @@
 [package]
 name = "agentgraph"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "A LangGraph-style agentic core engine in Rust: typed channels with reducers, Pregel/BSP super-step execution, checkpoints, interrupts, and streaming."
@@ -23,9 +23,11 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "json", "chrono"], optional = true }
+wasmtime = { version = "47", optional = true }
 
 [features]
 postgres = ["dep:sqlx"]
+wasm = ["dep:wasmtime"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

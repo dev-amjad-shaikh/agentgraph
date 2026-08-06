@@ -1,0 +1,24 @@
+[package]
+name = "agentgraph-otel"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "OpenTelemetry export layer for the agentgraph engine: one-call tracing subscriber setup with optional OTLP span export."
+keywords = ["opentelemetry", "tracing", "observability", "agent", "otlp"]
+categories = ["asynchronous", "network-programming"]
+
+[dependencies]
+agentgraph = { path = "../agentgraph" }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "registry"] }
+tracing-opentelemetry = "0.33"
+opentelemetry = "0.32"
+opentelemetry_sdk = "0.32"
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+
+[dev-dependencies]
+async-trait = "0.1"
+serde_json = "1"
+tokio = { version = "1", features = ["full", "test-util"] }

@@ -73,6 +73,10 @@ FROM agentgraph_checkpoints
 WHERE thread_id = $1
 ORDER BY step ASC";
 
+/// Transaction-scoped advisory lock key used by
+/// [`PostgresCheckpointer::migrate`] to serialize concurrent migrations.
+const MIGRATION_LOCK_KEY: i64 = 0x6167_7067_5f6d_6967; // "agpg_mig"
+
 /// Map a `sqlx` error to [`AgentGraphError::Checkpoint`], giving duplicate
 /// checkpoint ids (SQLSTATE 23505, unique_violation) a clearer message.
 fn map_sqlx_error(op: &str, err: sqlx::Error) -> AgentGraphError {
@@ -198,10 +202,26 @@ impl PostgresCheckpointer {
         Self { pool }
     }
 
-    /// Run the idempotent schema migration. Safe to call repeatedly.
+    /// Run the idempotent schema migration. Safe to call repeatedly, and
+    /// safe under concurrency: a transaction-scoped advisory lock serializes
+    /// concurrent migrators, avoiding the `CREATE TABLE IF NOT EXISTS`
+    /// check-then-create race (duplicate key on `pg_type_typname_nsp_index`).
     pub async fn migrate(&self) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| map_sqlx_error("migrate", e))?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(MIGRATION_LOCK_KEY)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| map_sqlx_error("migrate", e))?;
         sqlx::query(CREATE_TABLE_SQL)
-            .execute(&self.pool)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| map_sqlx_error("migrate", e))?;
+        tx.commit()
             .await
             .map_err(|e| map_sqlx_error("migrate", e))?;
         Ok(())

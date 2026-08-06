@@ -47,6 +47,15 @@ pub struct RunConfigPayload {
     pub recursion_limit: Option<usize>,
 }
 
+/// The `checkpoint` field of a run payload: `{ "checkpoint_id": "…" }`
+/// replays the thread from that checkpoint (time travel) instead of the
+/// latest, via [`RunConfig::with_checkpoint_id`].
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CheckpointPayload {
+    /// Id of a checkpoint of this thread (see `POST /threads/{id}/history`).
+    pub checkpoint_id: String,
+}
+
 /// The payload accepted by `POST /threads/{id}/runs{,/wait,/stream}`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RunPayload {
@@ -62,6 +71,13 @@ pub struct RunPayload {
     /// `{ "recursion_limit": n }`.
     #[serde(default)]
     pub config: Option<RunConfigPayload>,
+
+    /// `{ "checkpoint_id": "…" }` — time travel: replay the run from that
+    /// checkpoint of this thread instead of the latest (`404` when the
+    /// checkpoint is unknown). Prefer forking first
+    /// (`POST /threads/{id}/fork`) and replaying on the fork.
+    #[serde(default)]
+    pub checkpoint: Option<CheckpointPayload>,
 
     /// Free-form run metadata (stored, not interpreted).
     #[serde(default)]
@@ -544,6 +560,9 @@ async fn execute(deps: RunDeps, run_id: String) {
         if let Some(resume) = &command.resume {
             config = config.with_resume(resume.clone());
         }
+    }
+    if let Some(checkpoint) = &snap.payload.checkpoint {
+        config = config.with_checkpoint_id(checkpoint.checkpoint_id.clone());
     }
     if let Some(run_cfg) = &snap.payload.config {
         if let Some(limit) = run_cfg.recursion_limit {

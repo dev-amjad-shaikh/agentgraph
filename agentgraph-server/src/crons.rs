@@ -154,17 +154,6 @@ pub(crate) async fn persist(store_root: &Path, record: &CronRecord) -> std::io::
     tokio::fs::write(dir.join(format!("{}.json", record.cron_id)), raw).await
 }
 
-/// Remove a cron from the in-memory map and delete its file. Returns
-/// `true` when the cron existed.
-pub(crate) async fn remove(state: &AppState, cron_id: &str) -> bool {
-    let removed = state.crons.lock().await.remove(cron_id).is_some();
-    if removed {
-        let path = dir(&state.config.store_path).join(format!("{cron_id}.json"));
-        let _ = tokio::fs::remove_file(path).await;
-    }
-    removed
-}
-
 /// Spawn the background scheduler task. Lives for the app's lifetime; the
 /// returned task is deliberately detached.
 pub(crate) fn spawn_scheduler(state: Arc<AppState>) {
@@ -175,7 +164,13 @@ pub(crate) fn spawn_scheduler(state: Arc<AppState>) {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            let crons: Vec<CronRecord> = state.crons.lock().await.values().cloned().collect();
+            let crons = match state.server_store.list_crons().await {
+                Ok(crons) => crons,
+                Err(error) => {
+                    tracing::warn!(%error, "cron scheduler: listing crons failed");
+                    continue;
+                }
+            };
             let now = Utc::now();
             for cron in crons {
                 if !next_due.contains_key(&cron.cron_id) {
@@ -234,15 +229,18 @@ async fn fire(state: Arc<AppState>, cron: CronRecord) {
     )
     .await;
 
-    // Bookkeeping + persistence (best effort on the file write).
-    {
-        let mut crons = state.crons.lock().await;
-        if let Some(record) = crons.get_mut(&cron.cron_id) {
+    // Bookkeeping + persistence (best effort on the write).
+    match state.server_store.get_cron(&cron.cron_id).await {
+        Ok(Some(mut record)) => {
             record.last_run_at = Some(fired_at);
             record.runs_fired += 1;
-            if let Err(error) = persist(&state.config.store_path, record).await {
+            if let Err(error) = state.server_store.upsert_cron(&record).await {
                 tracing::warn!(cron_id = %cron.cron_id, %error, "cron persistence failed");
             }
+        }
+        Ok(None) => {} // deleted between listing and firing
+        Err(error) => {
+            tracing::warn!(cron_id = %cron.cron_id, %error, "cron bookkeeping read failed")
         }
     }
 
@@ -251,8 +249,14 @@ async fn fire(state: Arc<AppState>, cron: CronRecord) {
             if cron.on_run_completed == OnRunCompleted::Delete {
                 let mut terminal = scheduled.terminal;
                 let _ = terminal.wait_for(|v| v.is_some()).await;
-                remove(&state, &cron.cron_id).await;
-                tracing::info!(cron_id = %cron.cron_id, "one-shot cron deleted after run");
+                match state.server_store.delete_cron(&cron.cron_id).await {
+                    Ok(_) => {
+                        tracing::info!(cron_id = %cron.cron_id, "one-shot cron deleted after run")
+                    }
+                    Err(error) => {
+                        tracing::warn!(cron_id = %cron.cron_id, %error, "one-shot cron delete failed")
+                    }
+                }
             }
         }
         Err(error) => {

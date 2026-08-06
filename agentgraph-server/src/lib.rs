@@ -22,13 +22,14 @@
 //! # }
 //! ```
 //!
-//! ## Endpoint inventory (v0.2)
+//! ## Endpoint inventory (v0.3)
 //!
 //! | Endpoint | Purpose |
 //! |---|---|
 //! | `GET /ok` | liveness |
 //! | `GET /info` | service version + registered graphs and their channels |
 //! | `POST /threads` | create a thread bound to a registered graph |
+//! | `POST /threads/{id}/fork` | time travel: copy the thread's checkpoint history (full or up to `checkpoint_id`) into a new thread |
 //! | `GET /threads/{id}/state` | latest checkpoint as `{values, next, checkpoint}` |
 //! | `POST /threads/{id}/state` | write a new checkpoint (`update_state` analog) |
 //! | `POST /threads/{id}/history` | checkpoint list, newest first, `limit`/`before` |
@@ -47,8 +48,9 @@
 //!
 //! Runs support `command.resume` (HITL), `config.recursion_limit`, the
 //! `reject` / `enqueue` multitask strategies (one active run per thread),
-//! and `assistant_id` (resolved to its bound graph, with the assistant's
-//! `config.recursion_limit` as a default).
+//! `assistant_id` (resolved to its bound graph, with the assistant's
+//! `config.recursion_limit` as a default), and `checkpoint.checkpoint_id`
+//! (time-travel replay from that checkpoint instead of the latest).
 
 mod assistants;
 mod auth;
@@ -56,6 +58,7 @@ mod crons;
 mod error;
 mod routes;
 mod runs;
+mod server_store;
 mod sse;
 mod store;
 
@@ -141,15 +144,29 @@ impl GraphRegistry {
 ///
 /// Checkpointing is rooted at `store_path` via
 /// [`agentgraph::checkpoint::JsonFileCheckpointer`]; auth is a single static
-/// API key checked against the `X-Api-Key` header when set.
+/// API key checked against the `X-Api-Key` header when set. With the
+/// `postgres` feature, [`ServerConfig::with_postgres`] switches **both** the
+/// run checkpointer (core's `PostgresCheckpointer`) and the server store
+/// (assistants / crons / KV) to Postgres.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// Address to bind when using [`serve`] (default `0.0.0.0:8080`).
     pub bind_addr: SocketAddr,
 
     /// Root directory for checkpoint files
-    /// (`{store_path}/{thread_id}/{checkpoint_id}.json`).
+    /// (`{store_path}/{thread_id}/{checkpoint_id}.json`). Also roots the
+    /// JSON-file assistants/crons/KV persistence. Unused for checkpointing
+    /// when `database_url` is set (still used as the `store_path` reported
+    /// by `GET /info`).
     pub store_path: PathBuf,
+
+    /// Postgres connection URL. When set (requires the `postgres` feature —
+    /// see [`ServerConfig::with_postgres`]), checkpoints live in core's
+    /// `agentgraph_checkpoints` table and the platform surface in the
+    /// `server_assistants` / `server_crons` / `server_kv` tables, all
+    /// auto-migrated on connect. Connections are established lazily on
+    /// first use.
+    pub database_url: Option<String>,
 
     /// Per-thread in-flight run cap used as the **enqueue queue depth**
     /// (default 1). There is always at most one *active* run per thread.
@@ -169,6 +186,7 @@ impl Default for ServerConfig {
         Self {
             bind_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
             store_path: PathBuf::from("./data/checkpoints"),
+            database_url: None,
             max_concurrent_runs_per_thread: 1,
             api_key: None,
             event_log_capacity: 1000,
@@ -190,6 +208,17 @@ impl ServerConfig {
     /// Builder-style: require an API key on every request.
     pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
+        self
+    }
+
+    /// Builder-style: persist everything in Postgres at `url` (e.g.
+    /// `postgres://user:pass@localhost/agentgraph`). Switches the run
+    /// checkpointer to [`agentgraph::checkpoint_postgres::PostgresCheckpointer`]
+    /// **and** the assistants/crons/KV server store to the `server_*`
+    /// tables. Schemas auto-migrate on (lazy) connect.
+    #[cfg(feature = "postgres")]
+    pub fn with_postgres(mut self, url: impl Into<String>) -> Self {
+        self.database_url = Some(url.into());
         self
     }
 
