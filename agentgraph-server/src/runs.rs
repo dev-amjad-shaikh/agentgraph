@@ -10,8 +10,14 @@
 //! to an in-memory per-thread FIFO queue (depth-capped by
 //! `ServerConfig::max_concurrent_runs_per_thread`) that drains automatically
 //! as runs finish.
+//!
+//! Retention: terminal runs are kept for `GET /runs/{id}` polling up to
+//! [`MAX_RETAINED_RUNS`] per process; the oldest terminal runs are evicted
+//! beyond that (active and queued runs are never evicted). Run history is
+//! in-memory by design — durability lives in the checkpoint log.
 
 use std::collections::{HashMap, VecDeque};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -19,6 +25,7 @@ use agentgraph::checkpoint::Checkpointer;
 use agentgraph::error::AgentGraphError;
 use agentgraph::executor::{ExecutionOutcome, Executor, GraphEvent, RunConfig};
 use agentgraph::state::State;
+use futures::FutureExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
@@ -181,6 +188,17 @@ pub(crate) struct FrameSink {
     capacity: usize,
 }
 
+/// Lock a std mutex, recovering from poisoning. Every guard obtained
+/// through this helper wraps a simple clone/push/assign critical section,
+/// so a panicked holder cannot leave the value structurally inconsistent —
+/// and unwinding a whole run (or wedging its thread slot) over a poisoned
+/// frame log is the worse outcome.
+pub(crate) fn lock_recover<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl FrameSink {
     fn new(capacity: usize, bcast: broadcast::Sender<SseFrame>) -> Self {
         Self {
@@ -197,11 +215,7 @@ impl FrameSink {
     pub(crate) fn push(&self, event: &str, step: usize, data: Value) {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
         self.last_step.store(step as u64, Ordering::Relaxed);
-        let checkpoint = self
-            .last_checkpoint
-            .lock()
-            .expect("frame sink lock poisoned")
-            .clone();
+        let checkpoint = lock_recover(&self.last_checkpoint).clone();
         let frame = SseFrame {
             id: format!("{checkpoint}:{step}:{seq}"),
             event: event.to_string(),
@@ -209,7 +223,7 @@ impl FrameSink {
             seq,
         };
         {
-            let mut log = self.log.lock().expect("frame sink lock poisoned");
+            let mut log = lock_recover(&self.log);
             if log.len() >= self.capacity {
                 log.pop_front();
             }
@@ -221,10 +235,7 @@ impl FrameSink {
 
     /// Point subsequent frame ids at a freshly persisted checkpoint.
     pub(crate) fn note_checkpoint(&self, checkpoint_id: &str) {
-        *self
-            .last_checkpoint
-            .lock()
-            .expect("frame sink lock poisoned") = checkpoint_id.to_string();
+        *lock_recover(&self.last_checkpoint) = checkpoint_id.to_string();
     }
 
     /// The super-step of the most recently pushed frame.
@@ -248,7 +259,7 @@ pub(crate) struct RunSnapshot {
     pub checkpoint_ids: Arc<StdMutex<Vec<String>>>,
 }
 
-/// Public-ish view of a run (used by the rollback and status endpoints).
+/// Read-only view of a run (used by the rollback and status endpoints).
 pub(crate) struct RunInfo {
     /// Internal (tenant-scoped) thread id — handlers check tenant ownership
     /// against it before revealing anything about the run.
@@ -263,22 +274,23 @@ pub(crate) struct RunInfo {
     pub checkpoint_ids: Arc<StdMutex<Vec<String>>>,
 }
 
-/// Handle for one scheduled run, owned by the [`RunManager`].
+/// Handle for one scheduled run, owned by the [`RunManager`]. Crate-private
+/// surface: external users interact with runs over HTTP, not this type.
 pub struct RunHandle {
     /// Run id (UUID v4).
-    pub run_id: String,
+    pub(crate) run_id: String,
     /// Internal (tenant-scoped) thread id this run executes against.
-    pub thread_id: String,
+    pub(crate) thread_id: String,
     /// External thread id reported on the wire.
-    pub wire_thread_id: String,
+    pub(crate) wire_thread_id: String,
     /// Registered graph name.
-    pub graph: String,
+    pub(crate) graph: String,
     /// 1-based attempt counter for the thread.
-    pub attempt: usize,
+    pub(crate) attempt: usize,
     /// Lifecycle status.
-    pub status: RunStatus,
+    pub(crate) status: RunStatus,
     /// Original run payload.
-    pub payload: RunPayload,
+    pub(crate) payload: RunPayload,
     sink: FrameSink,
     terminal: watch::Sender<Option<Value>>,
     checkpoint_ids: Arc<StdMutex<Vec<String>>>,
@@ -292,13 +304,7 @@ impl RunHandle {
 
     /// A point-in-time copy of the event log (for replay).
     pub(crate) fn log_snapshot(&self) -> Vec<SseFrame> {
-        self.sink
-            .log
-            .lock()
-            .expect("frame sink lock poisoned")
-            .iter()
-            .cloned()
-            .collect()
+        lock_recover(&self.sink.log).iter().cloned().collect()
     }
 }
 
@@ -316,11 +322,18 @@ struct RunManagerInner {
     active_by_thread: HashMap<String, String>,
     queues: HashMap<String, VecDeque<String>>,
     attempts: HashMap<String, usize>,
+    /// Insertion order of run ids, feeding terminal-run eviction.
+    order: VecDeque<String>,
 }
 
+/// Cap on retained runs (see the module docs' retention note). Without a
+/// cap, `runs` would grow by one record — payload clone, terminal JSON, and
+/// up to `event_log_capacity` SSE frames — per run for the process
+/// lifetime: a steady memory leak on any busy cron schedule.
+const MAX_RETAINED_RUNS: usize = 1024;
+
 /// Registry of all runs, plus per-thread scheduling state. Cheap to clone
-/// (shared inner); deliberately `Mutex<HashMap<run_id, RunHandle>>`-based —
-/// no external locking crates.
+/// (shared inner).
 #[derive(Default, Clone)]
 pub struct RunManager {
     inner: Arc<Mutex<RunManagerInner>>,
@@ -348,6 +361,7 @@ impl RunManager {
             *counter
         };
         handle.attempt = attempt;
+        inner.order.push_back(handle.run_id.clone());
 
         match strategy {
             MultitaskStrategy::Reject if busy => Err(ApiError::conflict(format!(
@@ -405,6 +419,30 @@ impl RunManager {
         })
     }
 
+    /// Replay log + live subscription + internal thread id for the
+    /// SSE attach endpoint (`GET /runs/{id}/stream`).
+    pub(crate) async fn stream_parts(
+        &self,
+        run_id: &str,
+    ) -> Option<(Vec<SseFrame>, broadcast::Receiver<SseFrame>, String)> {
+        let inner = self.inner.lock().await;
+        inner
+            .runs
+            .get(run_id)
+            .map(|h| (h.log_snapshot(), h.subscribe(), h.thread_id.clone()))
+    }
+
+    /// `true` while the thread has an active run or a non-empty queue —
+    /// rollback refuses to delete checkpoints out from under them.
+    pub(crate) async fn thread_busy(&self, thread_id: &str) -> bool {
+        let inner = self.inner.lock().await;
+        inner.active_by_thread.contains_key(thread_id)
+            || inner
+                .queues
+                .get(thread_id)
+                .is_some_and(|queue| !queue.is_empty())
+    }
+
     /// Record the terminal status + JSON, wake waiters, release the thread
     /// slot, and return the next queued run id for the thread (if any), now
     /// marked active.
@@ -441,6 +479,30 @@ impl RunManager {
             }
             inner.active_by_thread.insert(thread_id, next_id.clone());
         }
+
+        // Evict the oldest terminal runs beyond the retention cap; active
+        // and queued runs keep their slots in `order`.
+        let mut excess = inner.runs.len().saturating_sub(MAX_RETAINED_RUNS);
+        let mut skipped = Vec::new();
+        while excess > 0 {
+            let Some(candidate) = inner.order.pop_front() else {
+                break;
+            };
+            let evictable = inner.runs.get(&candidate).is_some_and(|h| {
+                matches!(
+                    h.status,
+                    RunStatus::Success | RunStatus::Interrupted | RunStatus::Error
+                )
+            });
+            if evictable {
+                inner.runs.remove(&candidate);
+                excess -= 1;
+            } else {
+                skipped.push(candidate);
+            }
+        }
+        inner.order.extend(skipped);
+
         next
     }
 }
@@ -679,10 +741,7 @@ async fn forward_events(
                 checkpoint_id,
                 step,
             } => {
-                checkpoint_ids
-                    .lock()
-                    .expect("checkpoint ids lock poisoned")
-                    .push(checkpoint_id.clone());
+                lock_recover(&checkpoint_ids).push(checkpoint_id.clone());
                 sink.note_checkpoint(&checkpoint_id);
                 if modes.iter().any(|m| m == "values") {
                     match read_back_state(&*checkpointer, &thread_id, &checkpoint_id).await {
@@ -705,26 +764,67 @@ async fn forward_events(
 }
 
 /// `values` frames carry the full state persisted at a super-step boundary,
-/// read back from the checkpoint log (design doc §4).
+/// read back from the checkpoint log (design doc §4). A point lookup, not a
+/// full `list()` scan — that would be O(history) per super-step, O(n²) per
+/// run.
 async fn read_back_state(
     checkpointer: &dyn Checkpointer,
     thread_id: &str,
     checkpoint_id: &str,
 ) -> agentgraph::error::Result<Option<Value>> {
-    let all = checkpointer.list(thread_id).await?;
-    Ok(all
-        .into_iter()
-        .find(|cp| cp.id == checkpoint_id)
+    Ok(checkpointer
+        .get_by_id(thread_id, checkpoint_id)
+        .await?
         .map(|cp| cp.state.to_value()))
 }
 
-/// Spawn `execute` for a run. The future is boxed behind a trait object to
-/// break the `execute → terminate → spawn(execute)` type cycle, which would
-/// otherwise make `Send` inference recursive and fail.
+/// Spawn `execute` for a run, guarding the thread's scheduling slot: if the
+/// task panics (executor bug — the poison-prone lock sites recover via
+/// [`lock_recover`]), the run is force-finished as `error` so
+/// `active_by_thread` releases the slot and queued runs drain instead of
+/// wedging behind a ghost.
+///
+/// The future is boxed behind a trait object to break the
+/// `execute → terminate → spawn(execute)` type cycle, which would otherwise
+/// make `Send` inference recursive and fail.
 fn spawn_execute(deps: RunDeps, run_id: String) {
-    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
-        Box::pin(async move { execute(deps, run_id).await });
-    tokio::spawn(fut);
+    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> = Box::pin({
+        let deps = deps.clone();
+        let run_id = run_id.clone();
+        async move { execute(deps, run_id).await }
+    });
+    tokio::spawn(async move {
+        if AssertUnwindSafe(fut).catch_unwind().await.is_ok() {
+            return;
+        }
+        tracing::error!(%run_id, "run task panicked; force-finishing as error");
+        let Some(snap) = deps.manager.snapshot(&run_id).await else {
+            return;
+        };
+        // If the panic happened after `terminate` completed, the slot is
+        // already released — finishing again would double-promote the queue.
+        if matches!(
+            deps.manager.info(&run_id).await.map(|i| i.status),
+            Some(RunStatus::Success | RunStatus::Interrupted | RunStatus::Error)
+        ) {
+            return;
+        }
+        let step = snap.sink.current_step();
+        snap.sink.push(
+            "error",
+            step,
+            json!({"error": "internal_panic", "message": "run task panicked"}),
+        );
+        snap.sink.push("end", step, json!({"status": "error"}));
+        let terminal = json!({
+            "run_id": run_id,
+            "thread_id": snap.wire_thread_id,
+            "status": "error",
+            "error": "internal_panic",
+            "message": "run task panicked",
+        });
+        terminate(&deps, &run_id, RunStatus::Error, terminal).await;
+    });
 }
 
 /// Record the terminal state and spawn the next queued run, if any.

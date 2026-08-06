@@ -98,9 +98,19 @@ impl Tool for Calculator {
         })
     }
     async fn call(&self, args: Value) -> Result<Value> {
-        let op = args.get("op").and_then(Value::as_str).unwrap_or("add");
-        let a = args.get("a").and_then(Value::as_f64).unwrap_or(0.0);
-        let b = args.get("b").and_then(Value::as_f64).unwrap_or(0.0);
+        // Missing or wrongly-typed arguments are tool *errors*, not zeros:
+        // defaulting to `0 op 0` would report a confident wrong answer to the
+        // model as a successful call, and `ToolExecutor` already turns tool
+        // errors into `ERROR:` messages the model can react to.
+        let op = args.get("op").and_then(Value::as_str).ok_or_else(|| {
+            AgentGraphError::Tool(format!("missing or non-string `op`; raw args: {args}"))
+        })?;
+        let a = args.get("a").and_then(Value::as_f64).ok_or_else(|| {
+            AgentGraphError::Tool(format!("missing or non-numeric `a`; raw args: {args}"))
+        })?;
+        let b = args.get("b").and_then(Value::as_f64).ok_or_else(|| {
+            AgentGraphError::Tool(format!("missing or non-numeric `b`; raw args: {args}"))
+        })?;
         let result = match op {
             "add" => a + b,
             "subtract" => a - b,
@@ -205,6 +215,9 @@ async fn main() -> Result<()> {
                 GraphEvent::NodeStart { node, step } => println!("  ├─ {node} start (step {step})"),
                 GraphEvent::NodeEnd { node, step } => println!("  ├─ {node} end   (step {step})"),
                 GraphEvent::Token { node, delta } => {
+                    // Never fires in this example: `create_react_agent` is
+                    // non-streaming. See `create_react_agent_streaming`
+                    // (used by live_agent) for Token events.
                     print!("  ├─ {node} token: {delta}");
                 }
                 GraphEvent::StateUpdate { step, updates } => {

@@ -1,8 +1,10 @@
 # agentgraph-server
 
-**The network face of [`agentgraph`](../agentgraph)** — serve your agent graphs over HTTP + SSE from a single ~20 MB static binary. No interpreter, no Postgres, no Redis. Dual-licensed under MIT OR Apache-2.0.
+**The network face of [`agentgraph`](../agentgraph)** — serve your agent graphs over HTTP + SSE from a single static binary. No interpreter, no Postgres, no Redis. Dual-licensed under MIT OR Apache-2.0.
 
 > **Status: v0.4, under active development.** The crate ships as a *library*: you call `agentgraph_server::serve()` from your own `main.rs`. The endpoint set, streaming semantics, and config surface follow the architecture document in [`docs/agentgraph-server-design.md`](../docs/agentgraph-server-design.md). The core `agentgraph` crate is untouched — it has no HTTP, no axum, no server dependencies, and never learns that a server exists.
+
+> **Minor breaking changes in this release.** (1) `RunManager` is no longer re-exported from the crate root — run bookkeeping is crate-private; interact with runs over HTTP (`GET /runs/{id}`, `GET /runs/{id}/stream`). (2) `POST /threads/{id}/history` with an unknown `before` cursor now answers `400` instead of silently returning the full history (a silent reset sent paginating clients into infinite loops).
 
 ## Why one binary instead of three containers
 
@@ -11,18 +13,18 @@ A self-hosted LangGraph Platform standalone deployment needs **three moving part
 | Concern | LangGraph Platform | agentgraph-server |
 |---|---|---|
 | User-code loading | `langgraph.json` + pip install at image build | `Cargo.toml` + `main.rs`, static link |
-| Deployment unit | API image + Postgres + Redis (compose) | one static binary (~20 MB) |
+| Deployment unit | API image + Postgres + Redis (compose) | one static binary |
 | Checkpoint store | Postgres | embedded `JsonFileCheckpointer` (wired from `ServerConfig::store_path`), or core's `PostgresCheckpointer` via `ServerConfig::with_postgres` (feature `postgres`) |
 | Stream fan-out | Redis pub/sub | in-process `tokio::sync::broadcast` per run |
 | Background-run queue | Postgres task queue + workers | in-process per-thread run queue |
 | Stream resume | `stream_resumable` contract | replay from the per-run in-memory event log, deduped by `Last-Event-ID` |
 | Multi-process scale-out | supported | Phase B gRPC worker protocol (see [roadmap](#roadmap)) |
 
-The trade is explicit: this is a **single-process** server. That covers the overwhelming majority of self-hosted agent deployments, and the `Node` trait keeps the multi-process door open — remote gRPC workers and WASM nodes are planned implementations of the same trait, not architectural changes.
+The trade is explicit: this is a **single-process** server. That covers the overwhelming majority of self-hosted agent deployments, and the `Node` trait keeps the multi-process door open: remote gRPC workers and WASM nodes are planned implementations of the same trait, not architectural changes.
 
 ## Setup: Cargo.toml is the new langgraph.json
 
-LangGraph's `langgraph.json` exists because Python can import user modules at runtime. Rust cannot — so in Rust, the declaration of "which graphs this server hosts" *is* your `main.rs`, and the dependency list *is* `Cargo.toml`. The server is a crate you call, not a binary you load graphs into.
+LangGraph's `langgraph.json` exists because Python can import user modules at runtime. Rust cannot, so in Rust, the declaration of "which graphs this server hosts" *is* your `main.rs`, and the dependency list *is* `Cargo.toml`. The server is a crate you call, not a binary you load graphs into.
 
 ```toml
 [dependencies]
@@ -94,12 +96,13 @@ An Agent-Protocol-compatible subset — wire-compatible with the core run/thread
 | `POST /threads/{id}/fork` | [Time travel](#time-travel-fork--checkpoint-replay): copy the thread's checkpoint history into a new thread: `{new_thread_id?, checkpoint_id?}` → `201 {thread_id, checkpoints_copied}` |
 | `GET /threads/{id}/state` | Latest checkpoint: `{values, next, checkpoint}` |
 | `POST /threads/{id}/state` | Write a new checkpoint (the `update_state` analog; optional `as_node`, `next_nodes`) → `201` |
-| `POST /threads/{id}/history` | List checkpoints, newest first, with `limit` / `before` |
+| `POST /threads/{id}/history` | List checkpoints, newest first, with `limit` / `before` (`400` for an unknown `before` cursor) |
 | `POST /threads/{id}/runs` | Start a **background** run → `202` + `{run_id, thread_id, status}` |
-| `POST /threads/{id}/runs/wait` | Run to completion; returns the terminal JSON (`{status, output \|\| interrupt, …}`) |
-| `POST /threads/{id}/runs/stream` | Run with [SSE streaming](#streaming-sse) |
-| `DELETE /threads/{id}/runs/{run_id}` | Rollback: delete a **finished** run's checkpoints, re-anchoring the thread to the pre-run checkpoint (`409` while the run is active) |
-| `GET /runs/{run_id}` | Poll a run: `{run_id, thread_id, graph, attempt, status}`; once terminal the body also carries the run's `output` / `error` / `interrupt` fields |
+| `POST /threads/{id}/runs/wait` | Run to completion; returns the terminal JSON (`{status, output \|\| interrupt, …}`); server-side wait ceiling of 3600 s → `504` on timeout (the run keeps executing — poll `GET /runs/{id}`) |
+| `POST /threads/{id}/runs/stream` | Run with [SSE streaming](#streaming-sse); a fresh run starts a new frame sequence, so `Last-Event-ID` is **ignored** here |
+| `GET /runs/{id}/stream` | Attach to an existing run's SSE stream: replay the event log — **honoring `Last-Event-ID`** — then follow live frames until `end`; `404` for unknown or cross-tenant runs |
+| `DELETE /threads/{id}/runs/{run_id}` | Rollback: delete a **finished** run's checkpoints, re-anchoring the thread to the pre-run checkpoint (`409` while the run is active, while the thread is busy, when the run's checkpoints are no longer the history tail, or on the Postgres backend) |
+| `GET /runs/{run_id}` | Poll a run: `{run_id, thread_id, graph, attempt, status}`; once terminal the body also carries the run's `output` / `error` / `interrupt` fields (up to 1024 terminal runs retained per process, oldest evicted beyond that) |
 | `POST /assistants` | Create a named graph alias: `{name, graph, config?, metadata?, assistant_id?}` → `201` (persisted under `{store_path}/assistants/`) |
 | `GET /assistants` / `GET /assistants/{id}` | List / fetch assistants |
 | `POST /crons` | Schedule recurring runs: `{graph, interval_secs ‖ cron_expr, input?, metadata?, on_run_completed?}` → `201` (persisted under `{store_path}/crons/`) |
@@ -108,7 +111,7 @@ An Agent-Protocol-compatible subset — wire-compatible with the core run/thread
 | `GET /store/{ns}/{key}` / `DELETE /store/{ns}/{key}` | Fetch / delete one item (`404` when absent) |
 | `GET /store/{ns}` | List a namespace's items, sorted by key (empty array for an unwritten namespace) |
 
-Not in v0.4 (roadmap, see below): thread listing/deletion endpoints, `/metrics`, `/graphs`, and the gRPC worker protocol. Thread records live in memory — checkpoints are durable on disk (or in Postgres), but the thread registry itself is rebuilt empty on restart (re-create a thread with the same `thread_id` to re-attach to its persisted checkpoints). Assistants, crons, and store items **are** durable: they persist as JSON files under `store_path` (or in the `server_*` tables with [Postgres persistence](#postgres-persistence-feature-postgres)) and reload on startup.
+Not in v0.4 (roadmap, see below): thread listing/deletion endpoints, `/metrics`, `/graphs`, and the gRPC worker protocol. Thread records **are** durable: each thread persists as one JSON file under `{store_path}/threads/` (or in the `server_threads` table with [Postgres persistence](#postgres-persistence-feature-postgres)) and reloads on startup — persistence is what makes the checkpoint durability story reachable through the API, since a restart that forgot the thread records would 404 every pre-restart thread while its checkpoints sat orphaned on disk. Assistants, crons, and store items are likewise durable (JSON files under `store_path`, or the `server_*` tables) and reload on startup.
 
 **Run-create payload** (subset of LangGraph's shape):
 
@@ -131,6 +134,8 @@ Not in v0.4 (roadmap, see below): thread listing/deletion endpoints, `/metrics`,
 - `config.recursion_limit` maps to `RunConfig::with_max_steps(n)`.
 - `stream_mode` selects which frame families the SSE endpoint emits; default `["values", "updates"]`. `metadata`, `error`, and `end` frames are always emitted. Add `"messages"` for LLM token deltas.
 - `multitask_strategy` — one active run per thread: `enqueue` (default) queues onto the per-thread run queue (depth-capped by `ServerConfig::max_concurrent_runs_per_thread`), `reject` returns `409 Conflict`. LangGraph's `rollback` strategy is instead an explicit operation: `DELETE /threads/{id}/runs/{run_id}` on a finished run.
+
+**Client-chosen ids.** `thread_id` / `new_thread_id` / `assistant_id` / `cron_id` (including `assistant_id` in run bodies) must be non-empty, ≤ 256 chars, free of path separators (`/`, `\`), not all dots, and not one of the reserved layout names — `assistants`, `crons`, `store`, `threads`, `latest` — which already name directories at the store root (or the `latest` pointer file inside each checkpoint dir); claiming one would write checkpoints into platform directories. Violations answer `400`. Tenant ids in `with_tenant_key` follow the same reserved-name rule with a 64-char cap, enforced at startup.
 
 **Auth.** A single static API key checked against the `X-Api-Key` header (the LangSmith managed-deployment convention), set via `ServerConfig::with_api_key("…")`. With no key configured (the default), the server runs in dev mode with auth disabled.
 
@@ -175,7 +180,7 @@ The v0.2 platform surface, all durable as JSON files under `store_path`:
 
 **Assistants** bind a name plus free-form `config` / `metadata` to a registered graph, so clients can create runs by `assistant_id` instead of repeating a graph name and config. Files live at `{store_path}/assistants/{assistant_id}.json` and reload on startup.
 
-**Crons** fire runs on a schedule. `POST /crons` takes exactly one schedule kind: `interval_secs` (fixed interval, ≥ 1 s) or `cron_expr` (5-field `min hour day-of-month month day-of-week`, UTC, minute resolution — parsed with the `cron` crate). A background scheduler (200 ms tick) fires each due cron by creating a **fresh thread** bound to the cron's graph and scheduling a background run with the cron's `input`. Records carry `runs_fired` / `last_run_at` bookkeeping and persist at `{store_path}/crons/{cron_id}.json`. `on_run_completed: "delete"` turns a cron into a one-shot: it removes itself once its first fired run reaches a terminal state.
+**Crons** fire runs on a schedule. `POST /crons` takes exactly one schedule kind: `interval_secs` (fixed interval, `1..=31_536_000` s — one year; out-of-range values answer `400`) or `cron_expr` (5-field `min hour day-of-month month day-of-week`, UTC, minute resolution — parsed with the `cron` crate). A background scheduler (200 ms tick) fires each due cron by creating a **fresh thread** bound to the cron's graph and scheduling a background run with the cron's `input`. Records carry `runs_fired` / `last_run_at` bookkeeping and persist at `{store_path}/crons/{cron_id}.json`. `on_run_completed: "delete"` turns a cron into a one-shot: it removes itself once its first fired run reaches a terminal state (an in-process tombstone keeps it from re-firing while that first run drains).
 
 **Store** is a cross-thread key-value memory: `PUT /store/{namespace}/{key}` writes any JSON value, namespaced items persist at `{store_path}/store/{namespace}/{key}.json`, and listing a namespace returns its items sorted by key. Namespace and key segments are restricted to `[A-Za-z0-9._-]` (1–128 chars) to keep the path mapping unambiguous.
 
@@ -185,7 +190,7 @@ The executor emits one typed event stream — `GraphEvent::{SuperStep, NodeStart
 
 | `stream_mode` | SSE frame | Source |
 |---|---|---|
-| `updates` | `event: updates` — `{"step": n, "updates": {node→update}}` per step | `GraphEvent::StateUpdate` |
+| `updates` | `event: updates` — `{"step": n, "updates": {channel → post-reducer value}}` per step (the full appended list for an `Append` channel, read back from the merged state) | `GraphEvent::StateUpdate` |
 | `values` | `event: values` — full state per step | the `Checkpoint.state` persisted at that step's boundary, read back from the checkpoint log |
 | `messages` | `event: messages` — `{"node": …, "delta": …}` per LLM token | `GraphEvent::Token` (requires the node to stream via `ChatModel::chat_stream`) |
 | `metadata` | first frame: `{run_id, thread_id, graph, attempt, metadata}` | synthesized by the server |
@@ -196,7 +201,12 @@ Fan-out is in-process: each run owns a `tokio::sync::broadcast` channel fed from
 
 ### Last-Event-ID resume
 
-Every SSE frame carries `id: {checkpoint_id}:{step}:{seq}`, where `seq` is a per-run monotonically increasing sequence number (1-based; frames emitted before the first checkpoint use `-` as the checkpoint component). A client that reconnects with the `Last-Event-ID` header skips every frame whose sequence number it has already seen — the server replays the run's event-log tail after that point before streaming live frames. The event log is a per-run, in-memory ring buffer (`ServerConfig::event_log_capacity`, default 1000 frames), so replay covers client reconnects within the server's lifetime; durable cross-restart stream resume is roadmap (checkpoints *are* the stream history, so the data to rebuild it is already on disk).
+Every SSE frame carries `id: {checkpoint_id}:{step}:{seq}`, where `seq` is a per-run monotonically increasing sequence number (1-based; frames emitted before the first checkpoint use `-` as the checkpoint component). The two streaming endpoints treat `Last-Event-ID` differently, on purpose:
+
+- `POST /threads/{id}/runs/stream` starts a **fresh run with a fresh frame sequence**, so the header is **ignored** there — applying a stale seq from a previous run would silently drop the new run's first frames.
+- `GET /runs/{id}/stream` **attaches** to an existing run and **honors** the header: the server replays the run's event-log frames after the last-seen sequence number, then follows live frames until the `end` frame. This is the reconnect path: start a background run (`POST /threads/{id}/runs`), attach, and re-attach with `Last-Event-ID` after a disconnect — you skip every frame you have already seen.
+
+The event log is a per-run, in-memory ring buffer (`ServerConfig::event_log_capacity`, default 1000 frames), so replay covers client reconnects within the server's lifetime; durable cross-restart stream resume is roadmap (checkpoints *are* the stream history, so the data to rebuild it is already on disk). Terminal runs (and their event logs) are retained for attach/polling up to 1024 runs per process; the oldest terminal runs are evicted beyond that, after which attach answers `404`.
 
 **Proxy guidance.** Behind nginx or another reverse proxy, disable response buffering for SSE routes (`X-Accel-Buffering: no`) and flush per event, or your clients will see nothing until the buffer fills.
 
@@ -220,11 +230,12 @@ let config = ServerConfig::new("0.0.0.0:8080".parse()?, "./data/checkpoints")
 | Layer | Default | With `with_postgres` |
 |---|---|---|
 | Run checkpoints | `JsonFileCheckpointer` under `store_path` | core's `PostgresCheckpointer` → table `agentgraph_checkpoints` |
+| Threads | `{store_path}/threads/{thread_id}.json` | table `server_threads` (record as JSONB `payload`) |
 | Assistants | `{store_path}/assistants/*.json` | table `server_assistants` (record as JSONB `payload`) |
 | Crons | `{store_path}/crons/*.json` | table `server_crons` (record as JSONB `payload`) |
 | KV store | `{store_path}/store/{ns}/{key}.json` | table `server_kv` (`namespace` + `"key"` primary key, JSONB `value`, `created_at`/`updated_at`) |
 
-All four schemas are **auto-migrated** (`CREATE TABLE IF NOT EXISTS …`) on connect; connections are established lazily on first use, so `router()` stays synchronous and the server starts even if the database is briefly unreachable (first-touch failures surface as `500`s until Postgres is back). The HTTP surface is identical either way — `GET /info` reports `"checkpointer": "postgres"` when enabled. Nothing else changes: fork, replay, crons, and the KV store run the same code paths against the `ServerStore` / `Checkpointer` traits.
+All five schemas (`agentgraph_checkpoints` plus the four `server_*` tables) are **auto-migrated** (`CREATE TABLE IF NOT EXISTS …`) on connect; connections are established lazily on first use, so `router()` stays synchronous and the server starts even if the database is briefly unreachable (first-touch failures surface as `500`s until Postgres is back). The HTTP surface is identical either way — `GET /info` reports `"checkpointer": "postgres"` when enabled — with one deliberate exception: rollback (`DELETE /threads/{id}/runs/{run_id}`) answers `409` on the Postgres backend rather than silently deleting nothing (the `Checkpointer` trait has no delete operation, so removal goes through the JSON-file layout directly). Everything else — fork, replay, crons, thread durability across restarts, and the KV store — runs the same code paths against the `ServerStore` / `Checkpointer` traits.
 
 The live-Postgres integration tests are gated and skipped by default; run them against a scratch database with:
 
@@ -250,7 +261,7 @@ let config = ServerConfig::new("0.0.0.0:8080".parse()?, "./data/checkpoints")
 
 | Resource | JSON-file layout | Postgres |
 |---|---|---|
-| Threads + checkpoints | `{store_path}/{tenant}/{thread_id}/…` | `agentgraph_checkpoints.thread_id = "{tenant}/{id}"` |
+| Threads + checkpoints | records: `{store_path}/threads/{tenant}/{id}.json`; checkpoints: `{store_path}/{tenant}/{thread_id}/…` | `server_threads.thread_id` resp. `agentgraph_checkpoints.thread_id` = `"{tenant}/{id}"` |
 | Assistants | `{store_path}/assistants/{tenant}/{id}.json` | `server_assistants.assistant_id = "{tenant}/{id}"` |
 | Crons | `{store_path}/crons/{tenant}/{id}.json` | `server_crons.cron_id = "{tenant}/{id}"` |
 | KV store | `{store_path}/store/{tenant}/{ns}/{key}.json` | `server_kv.namespace = "{tenant}/{ns}"` |
@@ -279,13 +290,22 @@ Configuration is code, via `ServerConfig` (constructed with `ServerConfig::new(b
 | `with_max_concurrent_runs_per_thread(…)` | `1` | Per-thread enqueue queue depth cap (there is always at most one *active* run per thread) |
 | `with_event_log_capacity(…)` | `1000` | Per-run SSE replay buffer (frames) |
 
+**Built-in limits** (constants, not config knobs):
+
+| Limit | Value | Behavior |
+|---|---|---|
+| Terminal-run retention | 1024 runs | Run status/stream history is in-memory by design; the oldest terminal runs are evicted beyond the cap (active and queued runs are never evicted), after which `GET /runs/{id}` and `GET /runs/{id}/stream` answer `404` |
+| Blocking-wait ceiling | 3600 s | `POST /threads/{id}/runs/wait` answers `504 Gateway Timeout` when the run hasn't terminated within the ceiling; the run itself keeps executing — poll `GET /runs/{id}` |
+| Cron interval ceiling | 31 536 000 s (1 year) | `interval_secs` above the ceiling answers `400` (unbounded values would overflow the scheduler's timestamp math) |
+
 ## Deployment
 
 Build one static binary:
 
 ```bash
 cargo build --release
-# -> target/release/my-agent   (~20 MB, statically linked)
+# -> target/release/my-agent   (statically linked; the bundled server_demo
+#    measures ~5 MB as a macOS release build — feature sets shift the size)
 ```
 
 Ship it in a scratch image — no interpreter, no pip layer, no system Python:
@@ -360,6 +380,11 @@ curl -X POST localhost:8080/threads/9c1e…/runs/wait \
 # Poll a background run's status (terminal runs carry output/error)
 curl localhost:8080/runs/$RUN_ID
 
+# Attach to a background run's SSE stream; reconnect with Last-Event-ID
+# to skip frames you have already seen
+curl -N localhost:8080/runs/$RUN_ID/stream
+curl -N localhost:8080/runs/$RUN_ID/stream -H "Last-Event-ID: $LAST_FRAME_ID"
+
 # Create an assistant and run by assistant_id
 curl -X POST localhost:8080/assistants \
   -H 'Content-Type: application/json' \
@@ -393,8 +418,9 @@ With auth configured, add `-H "X-Api-Key: $KEY"` to every call. For a full walkt
 - [x] **Phase C (continued) — time travel + Postgres persistence (v0.3).** `POST /threads/{id}/fork` (full- or mid-history forks via core's `Checkpointer::fork_thread`), checkpoint replay on all run endpoints (`"checkpoint": {"checkpoint_id": …}` → `RunConfig::with_checkpoint_id`), and the `postgres` feature: `ServerConfig::with_postgres(url)` switches the run checkpointer to `PostgresCheckpointer` and the assistants/crons/KV surface to auto-migrated `server_assistants` / `server_crons` / `server_kv` tables behind a `ServerStore` trait. *Shipped.*
 - [x] **Phase C (continued) — permissive CORS (v0.3).** `router()` layers `tower_http::cors::CorsLayer::permissive()`, so browser clients (the [Studio](../studio/)) call the API cross-origin; preflights are answered before auth. Restrict for production — see [CORS](#http-api). *Shipped.*
 - [x] **Phase C (continued) — multi-tenancy (v0.4).** API keys map to tenants (`with_tenant_key(tenant, key)`; legacy `with_api_key` = the `default` tenant); threads + checkpoints, runs, assistants, crons, and KV namespaces are fully isolated via internal `{tenant}/` id prefixing, with cross-tenant access answering 404 (never 403). Open mode and the default tenant keep the legacy flat storage layout. See [Multi-tenancy](#multi-tenancy-api-keys--tenants-with-full-isolation). *Shipped.*
+- [x] **Phase C (continued) — hardening (v0.4).** Durable thread records (`threads/` JSON files / `server_threads` table — pre-restart checkpoints stay reachable through the API), the SSE attach endpoint (`GET /runs/{id}/stream` with `Last-Event-ID` replay), rollback guards (`409` on the Postgres backend, on busy threads, and on mid-history suffix violations), the cron `interval_secs` clamp (≤ 1 year) + one-shot tombstones, reserved layout names rejected as client-chosen ids, the 1024-run retention cap, the 3600 s blocking-wait ceiling (`504`), and `400` for unknown history `before` cursors. *Shipped.*
 - [ ] **Phase B — gRPC worker protocol (`agentgraph-proto`).** `RemoteNode`: a gRPC client behind the same `Node` trait, delegating node execution to stateless out-of-process workers that long-poll named node-queues. The server keeps checkpoints, super-step scheduling, interrupts, and stream fan-out. Agent nodes are dominated by LLM latency (hundreds of ms to minutes), so a 1–5 ms gRPC hop is <1% overhead — and since `State` is already a JSON map, the wire boundary is lossless. Crash isolation, polyglot workers (a Python worker can host the LangChain ecosystem while Rust owns orchestration), and independent scaling of tool-heavy nodes follow.
-- [ ] **Phase C (remainder).** Durable thread registry, thread listing/deletion endpoints, `/metrics`, and `/graphs`. (`WasmNode` shipped in core `agentgraph` v0.4 behind the `wasm` feature — register a Wasm-backed graph and this crate serves it unchanged.)
+- [ ] **Phase C (remainder).** Thread listing/deletion endpoints, `/metrics`, and `/graphs`. (`WasmNode` shipped in core `agentgraph` v0.4 behind the `wasm` feature — register a Wasm-backed graph and this crate serves it unchanged.)
 
 Deliberately skipped: A2A/MCP server endpoints and WebSocket "protocol v2" (SSE + HTTP sidecar is sufficient), and `feedback_keys` (LangSmith-tracing coupling we don't have).
 

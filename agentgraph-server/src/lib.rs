@@ -31,12 +31,13 @@
 //! | `POST /threads` | create a thread bound to a registered graph |
 //! | `POST /threads/{id}/fork` | time travel: copy the thread's checkpoint history (full or up to `checkpoint_id`) into a new thread |
 //! | `GET /threads/{id}/state` | latest checkpoint as `{values, next, checkpoint}` |
-//! | `POST /threads/{id}/state` | write a new checkpoint (`update_state` analog) |
+//! | `POST /threads/{id}/state` | write a new checkpoint (`update_state` analog; `as_node` is accepted for LangGraph compatibility but not recorded) |
 //! | `POST /threads/{id}/history` | checkpoint list, newest first, `limit`/`before` |
 //! | `POST /threads/{id}/runs` | background run: `202 + run_id` |
 //! | `POST /threads/{id}/runs/wait` | blocking run: terminal result as JSON |
-//! | `POST /threads/{id}/runs/stream` | run with SSE streaming (`updates`/`values`/`messages`/`metadata`/`error`/`end`) |
-//! | `DELETE /threads/{id}/runs/{run_id}` | rollback: delete a finished run's checkpoints |
+//! | `POST /threads/{id}/runs/stream` | run with SSE streaming (`updates`/`values`/`messages`/`metadata`/`error`/`end`); a fresh run starts a new frame sequence, so `Last-Event-ID` is ignored here |
+//! | `GET /runs/{id}/stream` | attach to an existing run's SSE stream: replay honoring `Last-Event-ID`, then live frames |
+//! | `DELETE /threads/{id}/runs/{run_id}` | rollback: delete a finished run's checkpoints (JSON-file checkpointer only; `409` on Postgres) |
 //! | `GET /runs/{run_id}` | run status polling (plus `output`/`error`/`interrupt` once terminal) |
 //! | `POST /assistants` | create a named graph alias with config metadata |
 //! | `GET /assistants` / `GET /assistants/{id}` | list / fetch assistants |
@@ -61,6 +62,7 @@ mod runs;
 mod server_store;
 mod sse;
 mod store;
+mod threads;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -71,7 +73,15 @@ use agentgraph::state::StateSpec;
 use axum::Router;
 
 pub use error::ApiError;
-pub use runs::{RunManager, RunStatus};
+pub use runs::RunStatus;
+
+/// Names the JSON-file layout already owns at the store root
+/// (`assistants/`, `crons/`, `threads/`, `store/`, plus the `latest`
+/// pointer file inside each thread's checkpoint dir). Client-chosen ids and
+/// tenant ids claiming one of these would write checkpoints into platform
+/// directories (or platform records into checkpoint dirs), so both
+/// `validate_client_id` and [`ServerConfig::with_tenant_key`] reject them.
+pub(crate) const RESERVED_NAMES: &[&str] = &["assistants", "crons", "store", "threads", "latest"];
 
 /// One registered graph: the compiled topology plus the state schema the
 /// executor needs to drive it.
@@ -91,7 +101,6 @@ pub struct GraphRegistry {
 }
 
 impl GraphRegistry {
-    /// An empty registry.
     pub fn new() -> Self {
         Self::default()
     }
@@ -132,7 +141,6 @@ impl GraphRegistry {
         channels
     }
 
-    /// A cheap clone of the `(Graph, StateSpec)` pair for `name`.
     pub(crate) fn get(&self, name: &str) -> Option<(Graph, StateSpec)> {
         self.entries
             .get(name)
@@ -152,9 +160,9 @@ impl GraphRegistry {
 /// `default` tenant. Every tenant-scoped resource (threads + checkpoints,
 /// assistants, crons, KV namespaces) is isolated per tenant; cross-tenant
 /// access answers `404`. With the `postgres` feature,
-/// [`ServerConfig::with_postgres`] switches **both** the run checkpointer
+/// `ServerConfig::with_postgres` switches **both** the run checkpointer
 /// (core's `PostgresCheckpointer`) and the server store (assistants /
-/// crons / KV) to Postgres.
+/// crons / threads / KV) to Postgres.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// Address to bind when using [`serve`] (default `0.0.0.0:8080`).
@@ -162,17 +170,17 @@ pub struct ServerConfig {
 
     /// Root directory for checkpoint files
     /// (`{store_path}/{thread_id}/{checkpoint_id}.json`). Also roots the
-    /// JSON-file assistants/crons/KV persistence. Unused for checkpointing
-    /// when `database_url` is set (still used as the `store_path` reported
-    /// by `GET /info`).
+    /// JSON-file assistants/crons/threads/KV persistence. Unused for
+    /// checkpointing when `database_url` is set (still used as the
+    /// `store_path` reported by `GET /info`).
     pub store_path: PathBuf,
 
     /// Postgres connection URL. When set (requires the `postgres` feature —
-    /// see [`ServerConfig::with_postgres`]), checkpoints live in core's
+    /// see `ServerConfig::with_postgres`), checkpoints live in core's
     /// `agentgraph_checkpoints` table and the platform surface in the
-    /// `server_assistants` / `server_crons` / `server_kv` tables, all
-    /// auto-migrated on connect. Connections are established lazily on
-    /// first use.
+    /// `server_assistants` / `server_crons` / `server_threads` / `server_kv`
+    /// tables, all auto-migrated on connect. Connections are established
+    /// lazily on first use.
     pub database_url: Option<String>,
 
     /// Per-thread in-flight run cap used as the **enqueue queue depth**
@@ -230,8 +238,10 @@ impl ServerConfig {
     /// Builder-style: map an API key to a tenant (multi-tenant mode). Every
     /// request presenting `key` via `X-Api-Key` runs as `tenant`, fully
     /// isolated from all other tenants. Tenant ids must match
-    /// `[A-Za-z0-9._-]` (1–64 chars) — they become a path segment in the
-    /// JSON-file layout and a `{tenant}/` id prefix everywhere else.
+    /// `[A-Za-z0-9._-]` (1–64 chars) and must not be a reserved layout name
+    /// (`assistants`, `crons`, `store`, `threads`, `latest`) — they become a
+    /// path segment in the JSON-file layout and a `{tenant}/` id prefix
+    /// everywhere else.
     ///
     /// # Panics
     ///
@@ -244,10 +254,11 @@ impl ServerConfig {
             && tenant.len() <= 64
             && tenant
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+            && !RESERVED_NAMES.contains(&tenant.as_str());
         assert!(
             valid,
-            "invalid tenant id `{tenant}` (allowed: [A-Za-z0-9._-], 1..=64 chars)"
+            "invalid tenant id `{tenant}` (allowed: [A-Za-z0-9._-], 1..=64 chars, not a reserved name)"
         );
         assert!(
             !key.is_empty(),
@@ -279,21 +290,25 @@ impl ServerConfig {
     /// Builder-style: persist everything in Postgres at `url` (e.g.
     /// `postgres://user:pass@localhost/agentgraph`). Switches the run
     /// checkpointer to [`agentgraph::checkpoint_postgres::PostgresCheckpointer`]
-    /// **and** the assistants/crons/KV server store to the `server_*`
-    /// tables. Schemas auto-migrate on (lazy) connect.
+    /// **and** the assistants/crons/threads/KV server store to the
+    /// `server_*` tables. Schemas auto-migrate on (lazy) connect.
     #[cfg(feature = "postgres")]
     pub fn with_postgres(mut self, url: impl Into<String>) -> Self {
         self.database_url = Some(url.into());
         self
     }
 
-    /// Builder-style: set the per-thread enqueue queue depth cap.
+    /// Builder-style: set the per-thread enqueue queue depth cap. Values
+    /// below 1 are clamped to 1 (a zero-deep queue would reject every
+    /// `enqueue` run).
     pub fn with_max_concurrent_runs_per_thread(mut self, cap: usize) -> Self {
         self.max_concurrent_runs_per_thread = cap;
         self
     }
 
-    /// Builder-style: set the per-run SSE event-log capacity.
+    /// Builder-style: set the per-run SSE event-log capacity. Values below
+    /// 16 are clamped to 16 (replay needs room for at least the
+    /// metadata/updates/end frames of a minimal run).
     pub fn with_event_log_capacity(mut self, capacity: usize) -> Self {
         self.event_log_capacity = capacity;
         self
@@ -311,6 +326,16 @@ pub fn router(registry: GraphRegistry, config: ServerConfig) -> Router {
 /// server shuts down.
 pub async fn serve(registry: GraphRegistry, config: ServerConfig) -> std::io::Result<()> {
     let addr = config.bind_addr;
+    // Open (dev) mode on a non-loopback address exposes the full API — run
+    // creation, KV writes, checkpoint deletion — to the network. That's a
+    // legitimate dev choice, but it must never be a quiet one.
+    if !config.auth_enabled() && !addr.ip().is_loopback() {
+        tracing::warn!(
+            %addr,
+            "serving WITHOUT authentication on a non-loopback address; \
+             configure `with_api_key`/`with_tenant_key` or bind 127.0.0.1"
+        );
+    }
     let app = router(registry, config);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "agentgraph-server listening");

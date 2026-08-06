@@ -24,8 +24,8 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/agentgraph/agentgraph"
-Documentation = "https://github.com/agentgraph/agentgraph/tree/main/sdks/python"
+Homepage = "https://github.com/dev-amjad-shaikh/agentgraph"
+Documentation = "https://github.com/dev-amjad-shaikh/agentgraph/tree/main/sdks/python"
 
 [tool.hatch.build.targets.wheel]
 packages = ["agentgraph_client"]

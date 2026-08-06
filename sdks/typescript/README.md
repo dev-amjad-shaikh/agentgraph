@@ -19,7 +19,7 @@ const client = new AgentGraphClient('http://localhost:8100', {
 
 // What's registered?
 const info = await client.info();
-// { service: 'agentgraph-server', version: '0.3.0', graphs: [{ name: 'pipeline', channels: ['log'] }, …] }
+// { service: 'agentgraph-server', version: '0.4.0', graphs: [{ name: 'pipeline', channels: ['log'] }, …] }
 
 // Create a thread bound to a graph and run it to completion
 const { thread_id } = await client.createThread('react_agent');

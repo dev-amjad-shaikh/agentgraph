@@ -21,11 +21,20 @@
 //!   [`executor::GraphEvent`]s for streaming.
 //! - **Persistence** ([`checkpoint`]): thread-scoped, versioned snapshots via
 //!   the [`checkpoint::Checkpointer`] trait; ships with an in-memory saver
-//!   and a (WIP) pure-`serde_json` file saver.
+//!   and a durable pure-`serde_json` file saver, plus a `postgres`-feature
+//!   `PostgresCheckpointer` (see the `checkpoint_postgres` module).
 //! - **LLM & tools** ([`llm`], [`tool`]): a [`llm::ChatModel`] abstraction
 //!   with an OpenAI-compatible client, and a [`tool::ToolRegistry`] /
 //!   [`tool::ToolExecutor`] for parallel tool-call dispatch — everything
-//!   needed for the prebuilt ReAct pattern.
+//!   needed for the prebuilt ReAct pattern ([`react`]).
+//! - **MCP** ([`mcp`]): call any MCP server's tools from [`tool::Tool`]
+//!   impls over stdio transport; MCP tool servers register into the
+//!   registry/executor exactly like native tools.
+//! - **Remote nodes** ([`remote`]): a [`remote::RemoteNode`] executes node
+//!   work on a remote worker over HTTP behind the same [`node::Node`] trait;
+//!   HITL interrupts cross the wire.
+//! - **WASM nodes** (`wasm_node`, feature `wasm`): sandboxed WebAssembly
+//!   modules run as graph nodes via Wasmtime.
 //!
 //! ## Quick sketch
 //!
@@ -81,7 +90,7 @@ pub mod prelude {
         ChatMessage, ChatModel, ChatResponse, OpenAiCompatibleClient, Role, ToolCall, Usage,
     };
     pub use crate::node::{Command, Node, NodeConfig, NodeContext, NodeOutput};
-    pub use crate::react::create_react_agent;
+    pub use crate::react::{create_react_agent, create_react_agent_streaming};
     pub use crate::state::{Reducer, State, StateSpec};
     pub use crate::tool::{Tool, ToolExecutor, ToolRegistry};
 }

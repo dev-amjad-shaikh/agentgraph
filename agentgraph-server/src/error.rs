@@ -14,7 +14,6 @@ pub struct ApiError {
 }
 
 impl ApiError {
-    /// A fully specified error.
     pub fn new(status: StatusCode, kind: &str, message: String) -> Self {
         Self {
             status,

@@ -6,6 +6,7 @@ In this tutorial you will:
 2. Define a two-node graph — `draft → approve` — with a human-in-the-loop interrupt.
 3. Serve it over HTTP + SSE with `GraphRegistry` and `serve()`.
 4. Drive it with `curl`: create a thread, run to the interrupt, inspect state, stream the resume over SSE, and list checkpoint history.
+5. Branch the timeline: fork the thread at an earlier checkpoint and replay the run on the fork.
 
 **Prerequisites:** a Rust toolchain (`rustup`), `curl`, and ~10 minutes. No Docker, no database, no Redis — everything runs in one process. Commands below assume you create the project as a *sibling* of the `agentgraph` and `agentgraph-server` checkouts; adjust the `path =` values if your layout differs.
 
@@ -128,7 +129,7 @@ curl localhost:8080/ok
 # {"ok":true}
 
 curl localhost:8080/info
-# {"service":"agentgraph-server","version":"0.1.0","checkpointer":"json_file",
+# {"service":"agentgraph-server","version":"0.4.0","checkpointer":"json_file",
 #  "store_path":"./data/checkpoints",
 #  "graphs":[{"channels":["approval","draft"],"name":"publisher"}]}
 ```
@@ -177,7 +178,7 @@ Response (the run's terminal JSON):
 }
 ```
 
-The run suspended inside `approve`, and the executor persisted a checkpoint for the thread — this is durable, so you could restart the server right now and lose nothing (re-create the thread with the same `thread_id` after a restart: v0.1 keeps thread records in memory, checkpoints on disk). Verify:
+The run suspended inside `approve`, and the executor persisted a checkpoint for the thread — this is durable, so you could restart the server right now and lose nothing (re-create the thread with the same `thread_id` after a restart: thread records live in memory, checkpoints are durable on disk). Verify:
 
 ```bash
 curl -s localhost:8080/threads/$TID/state
@@ -251,11 +252,33 @@ curl -s -X DELETE localhost:8080/threads/$TID/runs/$RUN_ID
 #  "remaining_checkpoints": 1}
 ```
 
+## 8. Time travel: fork & replay (1 min)
+
+Rollback rewinds a thread; fork branches it. `POST /threads/{id}/fork` copies the thread's checkpoint history into a new thread on the same graph, and every run endpoint accepts `"checkpoint": {"checkpoint_id": …}` to replay from that checkpoint instead of the latest:
+
+```bash
+# Pick an earlier checkpoint from the §7 history listing
+CP_ID=<a checkpoint_id from the history above>
+
+# Fork the thread at that checkpoint (omit checkpoint_id for a full-history fork)
+curl -s -X POST localhost:8080/threads/$TID/fork \
+  -H 'Content-Type: application/json' \
+  -d '{"new_thread_id": "branch-a", "checkpoint_id": "'$CP_ID'"}'
+# 201 {"thread_id": "branch-a", "checkpoints_copied": 1}
+
+# Replay the run from the same checkpoint, on the fork
+curl -s -X POST localhost:8080/threads/branch-a/runs/wait \
+  -H 'Content-Type: application/json' \
+  -d '{"checkpoint": {"checkpoint_id": "'$CP_ID'"}}'
+```
+
+The safe pattern is fork first, replay on the fork: the branch gets its own thread id and its own history, while replaying on the original thread appends new checkpoints on top of the old timeline (supported, but rarely what you want). Errors: `404` for an unknown thread or checkpoint id, `400` when the source thread has no checkpoints to copy, `409` when `new_thread_id` is already taken.
+
 ---
 
 ## Where to go next
 
 - **Run in the background instead of blocking:** `POST /threads/{id}/runs` returns `202` + a `run_id` immediately; control same-thread concurrency with `"multitask_strategy": "enqueue" | "reject"`.
 - **Serve a real LLM agent:** register `create_react_agent(model, tools)` (see `agentgraph/examples/react_agent.rs`) the same way, with an `OpenAiCompatibleClient` as the model (e.g. `OpenAiCompatibleClient::from_env("https://api.openai.com/v1", "OPENAI_API_KEY", "gpt-4o-mini")`; `agentgraph/examples/live_agent.rs` shows the full live setup). Add `"messages"` to `stream_mode` to stream LLM token deltas when the node uses `ChatModel::chat_stream`.
-- **Deploy:** `cargo build --release` produces one ~20 MB static binary; see the `FROM scratch` Dockerfile and the `ServerConfig` reference in the [agentgraph-server README](../agentgraph-server/README.md#deployment).
+- **Deploy:** `cargo build --release` produces one static binary; see the `FROM scratch` Dockerfile and the `ServerConfig` reference in the [agentgraph-server README](../agentgraph-server/README.md#deployment).
 - **Design rationale:** endpoint mapping, SSE semantics, and the phased roadmap (gRPC workers, WASM nodes, crons, assistants) are in [docs/agentgraph-server-design.md](agentgraph-server-design.md).

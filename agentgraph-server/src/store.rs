@@ -53,7 +53,9 @@ fn item_path(store_root: &Path, namespace: &str, key: &str) -> PathBuf {
     namespace_dir(store_root, namespace).join(format!("{key}.json"))
 }
 
-/// Read one item (`None` when absent).
+/// Read one item (`None` when absent). A corrupt item file reads as absent
+/// — but loudly, matching `list`'s warn-and-skip behavior, since silent
+/// corruption would make a later `put` answer `201` and reset `created_at`.
 pub(crate) async fn get(
     store_root: &Path,
     namespace: &str,
@@ -65,7 +67,13 @@ pub(crate) async fn get(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    Ok(serde_json::from_slice(&raw).ok())
+    match serde_json::from_slice(&raw) {
+        Ok(item) => Ok(Some(item)),
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "skipping corrupt store item");
+            Ok(None)
+        }
+    }
 }
 
 /// Insert or replace one item. Returns the record plus `true` when the key

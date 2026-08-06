@@ -13,7 +13,7 @@ Production agent runtimes spend their lives juggling hundreds of concurrent LLM 
 - **No GC pauses, no GIL** — deterministic streaming latency and true parallelism for concurrent tool calls on a single tokio runtime.
 - **Compile-time correctness** — graph topology is validated by `compile()` before any node (or paid LLM call) runs; channel conflicts like double-writing a `LastValue` channel surface as typed errors, not mid-conversation tracebacks.
 - **Single-binary deployment** — one static artifact, no interpreter, no dependency hell; a small, auditable dependency tree (tokio, serde, reqwest+rustls, thiserror).
-- **Memory footprint** — Rust services routinely run an order of magnitude leaner than their Python counterparts, which matters when you colocate thousands of agent threads.
+- **Memory footprint** — no interpreter and no GC keep the resident set small, which matters when you colocate thousands of agent threads.
 
 The trade-off is deliberate: you give up Python's runtime monkey-patching and get durable, auditable execution semantics in return.
 
@@ -25,13 +25,13 @@ The trade-off is deliberate: you give up Python's runtime monkey-patching and ge
 - **Human-in-the-loop interrupts** — a node returns `Err(ctx.interrupt(payload))` to suspend the whole run; the executor checkpoints and surfaces the payload via `ExecutionOutcome::Interrupted`. Resume with the same `thread_id` and `RunConfig::with_resume(value)`; the interrupted node re-executes with `ctx.resume_value()` set.
 - **Dynamic fan-out (`Send`)** — conditional routers return `Route::Send(vec![Send::new(node, state), ...])` for runtime map-reduce: items are generated dynamically, each mapped through a node, results fan back in through multi-write reducers.
 - **Streaming events** — attach a `tokio::mpsc` sink via `RunConfig::with_event_tx` and receive typed `GraphEvent`s (`SuperStep`, `NodeStart`, `NodeEnd`, `StateUpdate`, `CheckpointSaved`, `Token`); LangGraph's `values`/`updates`/`messages` stream modes are filters over this one stream.
-- **Token streaming** — `ChatModel::chat_stream` delivers incremental `TokenChunk`s through a callback (the OpenAI-compatible client decodes real SSE deltas; the default impl falls back to one chunk for source compatibility). Forward them into the executor's event channel (`Executor::with_token_tx` / `RunConfig::token_tx`) to surface `GraphEvent::Token` — the LangGraph `messages` stream mode.
-- **LLM & tool layer** — a minimal `ChatModel` trait, an `OpenAiCompatibleClient` (works with OpenAI, vLLM, Ollama, LM Studio, Azure-compatible gateways), and a `ToolRegistry` / `ToolExecutor` that dispatches tool calls **in parallel**, preserves call order, and isolates per-tool failures — everything needed for the ReAct pattern.
+- **Token streaming** — `ChatModel::chat_stream` delivers incremental `TokenChunk`s through a callback (the OpenAI-compatible client decodes real SSE deltas; the default impl falls back to one chunk for source compatibility). Forward them into the executor's event channel (`Executor::with_token_tx` / `RunConfig::token_tx`) to surface `GraphEvent::Token` (the LangGraph `messages` stream mode).
+- **LLM & tool layer** — a minimal `ChatModel` trait, an `OpenAiCompatibleClient` (works with OpenAI, vLLM, Ollama, LM Studio, Azure-compatible gateways), and a `ToolRegistry` / `ToolExecutor` that dispatches tool calls **in parallel**, preserves call order, and isolates per-tool failures: everything needed for the ReAct pattern.
 - **`Command` routing** — nodes can override static edges with `NodeOutput::route(Command::goto(...))`, unifying state transition and control flow the way LangGraph's `Command` does.
 - **MCP client** *(v0.3)* — the `mcp` module lets an `agentgraph` `Tool` call any MCP server's tools over stdio transport. MCP tool servers register into `ToolRegistry` / `ToolExecutor` exactly like native tools, so the prebuilt ReAct agent drives them with no graph changes.
-- **Remote nodes** *(v0.3)* — the `remote` module's `RemoteNode` POSTs node execution to worker services over HTTP; the companion `agentgraph-worker` crate is the SDK that serves your handlers. HITL interrupts cross the wire — a remote node can suspend the run and resume with a human payload just like a local node.
+- **Remote nodes** *(v0.3)* — the `remote` module's `RemoteNode` POSTs node execution to worker services over HTTP; the companion `agentgraph-worker` crate is the SDK that serves your handlers. HITL interrupts cross the wire: a remote node can suspend the run and resume with a human payload just like a local node.
 - **Time travel** *(v0.4)* — every checkpoint is a handle: `Checkpointer::get_by_id` fetches any checkpoint of a thread, `Checkpointer::fork_thread` copies a thread's history (full, or up to a checkpoint) into a new thread, and `RunConfig::with_checkpoint_id` replays a run from that checkpoint's state and next-node set instead of the latest. Fork first, replay on the fork.
-- **WASM nodes** *(v0.4, feature `wasm`)* — `WasmNode` runs sandboxed WebAssembly modules as graph nodes via Wasmtime: untrusted or community code executes with capability isolation behind the same `Node` trait as local and remote nodes — no separate worker fleet, no process boundary to manage.
+- **WASM nodes** *(v0.4, feature `wasm`)* — `WasmNode` runs sandboxed WebAssembly modules as graph nodes via Wasmtime: untrusted or community code executes with capability isolation behind the same `Node` trait as local and remote nodes, with no separate worker fleet and no process boundary to manage.
 
 ## Quickstart
 
@@ -114,7 +114,7 @@ use std::sync::Arc;
 async fn run_with_approval(graph: &Graph, spec: &StateSpec) -> Result<()> {
     // Persist a checkpoint at every super-step boundary.
     let checkpointer = Arc::new(InMemoryCheckpointer::new());
-    let executor = Executor::with_checkpointer(checkpointer);
+    let executor = Executor::with_checkpointer(checkpointer.clone());
 
     // A node that asks a human for approval before continuing. On the first
     // pass it interrupts; on resume, `ctx.resume_value()` carries the
@@ -141,6 +141,36 @@ async fn run_with_approval(graph: &Graph, spec: &StateSpec) -> Result<()> {
     Ok(())
 }
 ```
+
+### Time travel: fork & replay
+
+Every checkpoint is a handle. Fork the thread's history into a branch, then replay the run from an earlier checkpoint on the fork, so the live timeline is left alone:
+
+```rust
+// Continuing the setup above: `checkpointer` and `executor` are in scope.
+let history = checkpointer.list("thread-42").await?; // oldest first
+let first = history[0].id.clone();
+
+// Copy history up to and including `first` into a branch thread
+// (pass `None` to copy the full history).
+let copied = checkpointer
+    .fork_thread("thread-42", "thread-42-branch", Some(&first))
+    .await?;
+println!("forked {copied} checkpoint(s)");
+
+// Replay the run from that checkpoint instead of the latest.
+let replayed = executor
+    .run(
+        graph,
+        spec,
+        State::new(),
+        RunConfig::new("thread-42-branch").with_checkpoint_id(first),
+    )
+    .await?;
+let _ = replayed;
+```
+
+`Checkpointer::get_by_id` fetches any single checkpoint by id; `fork_thread` preserves checkpoint ids, steps, states, and next-node sets; only the `thread_id` changes. The server crate exposes the same two operations over HTTP (`POST /threads/{id}/fork` and `"checkpoint": {"checkpoint_id": …}` on the run endpoints).
 
 ## Architecture
 
@@ -200,7 +230,7 @@ Design rules worth knowing:
 |---|---|---|
 | State graph with channels & reducers | ✅ `Annotated[T, reducer]` | ✅ `StateSpec` + `Reducer` (type-checked at build time) |
 | Conditional edges & cycles | ✅ | ✅ (`Route`, `Command::goto`) |
-| Checkpointing / durable execution | ✅ memory/SQLite/Postgres savers | ✅ `Checkpointer` trait + in-memory, JSON-file, and Postgres (`postgres` feature) savers |
+| Checkpointing / durable execution | ✅ memory/SQLite/Postgres savers | ✅ `Checkpointer` trait + in-memory, JSON-file, and Postgres (`postgres` feature) implementations |
 | Human-in-the-loop interrupts | ✅ `interrupt()` / `Command(resume=)` | ✅ `ctx.interrupt()` / `RunConfig::with_resume` |
 | Dynamic fan-out (`Send` API) | ✅ | ✅ `Route::Send(Vec<Send>)` |
 | Streaming events | ✅ stream modes | ✅ typed `GraphEvent` stream over `tokio::mpsc`, incl. `Token` deltas (`messages` mode) |
@@ -225,7 +255,7 @@ Design rules worth knowing:
 | `Send`-style fan-out | ❌ | ❌ | ❌ | ✅ |
 | Maturity | ~8k stars, production users | ~350 stars, single maintainer | ~570 stars, v1.0 (2026) | v0.4.0 |
 
-**Positioning:** `agentgraph` is the orchestration *core*, not another provider client. Its `ChatModel` trait is deliberately minimal so you can bring Rig, `async-openai`, or `genai` as the provider layer — the same pairing `graph-flow` demonstrates. The wedge no Rust crate ships today is the LangGraph quartet — state graph + durable checkpointing + HITL interrupts + resumable execution — as first-class, production-grade primitives.
+**Positioning:** `agentgraph` is the orchestration *core*, not another provider client. Its `ChatModel` trait is deliberately minimal so you can bring Rig, `async-openai`, or `genai` as the provider layer — the same pairing `graph-flow` demonstrates. The wedge no Rust crate ships today is the LangGraph quartet (state graph + durable checkpointing + HITL interrupts + resumable execution) as first-class, production-grade primitives.
 
 ## Examples
 

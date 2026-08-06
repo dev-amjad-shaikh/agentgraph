@@ -1,6 +1,8 @@
 //! Live-Postgres integration tests for the `postgres` feature: the
-//! `PostgresStore` CRUD surface (assistants / crons / KV) plus the
-//! Postgres-backed run checkpointer, exercised end-to-end over HTTP.
+//! `PostgresStore` CRUD surface (assistants / crons / threads / KV — the
+//! four `server_*` tables created by the auto-migration, `server_threads`
+//! included) plus the Postgres-backed run checkpointer, exercised
+//! end-to-end over HTTP.
 //!
 //! Gated two ways — none of this runs in the default test suite:
 //!
@@ -351,4 +353,60 @@ async fn postgres_run_checkpoints_and_time_travel() {
     .await;
     assert_eq!(status, StatusCode::OK, "replay failed: {v}");
     assert_eq!(v["output"]["log"], json!(["first", "second"]));
+}
+
+// --------------------------------------------------------------------- //
+// Threads (server_threads table)
+// --------------------------------------------------------------------- //
+
+#[tokio::test]
+#[ignore = "requires a live Postgres (DATABASE_URL)"]
+async fn postgres_threads_survive_router_rebuild_and_rollback_is_409() {
+    let app = postgres_app();
+
+    // Create a thread (persisted in server_threads) and run it.
+    let (status, v) = call(
+        &app,
+        "POST",
+        "/threads",
+        Some(json!({"graph": "pipeline", "thread_id": format!("t-{}", uniq())})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "thread create failed: {v}");
+    let thread = v["thread_id"].as_str().unwrap().to_string();
+    let (status, v) = call(
+        &app,
+        "POST",
+        &format!("/threads/{thread}/runs/wait"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "run failed: {v}");
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+
+    // A fresh router over the same DATABASE_URL (restart stand-in) reloads
+    // the thread record, so pre-restart checkpoints stay reachable.
+    let app2 = postgres_app();
+    let (status, v) = call(&app2, "GET", &format!("/threads/{thread}/state"), None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "pre-restart thread 404d after rebuild: {v}"
+    );
+    assert_eq!(v["values"]["log"], json!(["first", "second"]));
+
+    // Rollback answers 409 on the Postgres backend rather than silently
+    // deleting nothing.
+    let (status, v) = call(
+        &app2,
+        "DELETE",
+        &format!("/threads/{thread}/runs/{run_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "Postgres rollback must be 409: {v}"
+    );
 }

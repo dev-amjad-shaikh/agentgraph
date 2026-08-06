@@ -78,6 +78,7 @@ class AgentGraphClient:
             convention). Leave ``None`` against a dev-mode server.
         timeout: Default per-request timeout in seconds. Streaming
             requests use this as the socket read timeout between frames.
+            ``0`` disables the timeout (blocking with no deadline).
 
     Example:
         >>> client = AgentGraphClient("http://127.0.0.1:8100")
@@ -99,11 +100,15 @@ class AgentGraphClient:
     # Low-level transport
     # ------------------------------------------------------------------
 
-    def _headers(self, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
+    def _headers(
+        self,
+        extra: Optional[Dict[str, str]] = None,
+        has_body: bool = False,
+    ) -> Dict[str, str]:
+        headers = {"Accept": "application/json"}
+        if has_body:
+            # Bodiless GET/DELETE requests carry no Content-Type.
+            headers["Content-Type"] = "application/json"
         if self.api_key is not None:
             headers["X-Api-Key"] = self.api_key
         if extra:
@@ -118,17 +123,24 @@ class AgentGraphClient:
         headers: Optional[Dict[str, str]] = None,
         timeout: Optional[float] = None,
     ) -> urllib.response.addinfourl:
-        """Open a request, translating failures into AgentGraphError."""
+        """Open a request, translating failures into AgentGraphError.
+
+        ``timeout`` falls back to the client default when ``None``;
+        ``0`` disables the timeout entirely (parity with the JS client).
+        """
         url = self.base_url + path
         payload = None if body is None else json.dumps(body).encode("utf-8")
         req = urllib.request.Request(
             url,
             data=payload,
-            headers=self._headers(headers),
+            headers=self._headers(headers, has_body=payload is not None),
             method=method,
         )
+        effective = self.timeout if timeout is None else timeout
+        if effective == 0:
+            effective = None  # 0 = no timeout (urllib: None = blocking)
         try:
-            return urllib.request.urlopen(req, timeout=timeout or self.timeout)
+            return urllib.request.urlopen(req, timeout=effective)
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
             raise AgentGraphError(
@@ -154,6 +166,15 @@ class AgentGraphClient:
         resp = self._open(method, path, body=body, timeout=timeout)
         try:
             raw = resp.read().decode("utf-8")
+        except OSError as exc:
+            # Read-time transport failure (socket.timeout, connection
+            # reset mid-body); honor the everything-is-AgentGraphError
+            # contract that _open establishes for connect-time failures.
+            raise AgentGraphError(
+                f"{method} {path} -> transport error while reading response: {exc}",
+                status=None,
+                body=None,
+            ) from exc
         finally:
             resp.close()
         if not raw:
@@ -163,7 +184,8 @@ class AgentGraphClient:
         except json.JSONDecodeError as exc:
             raise AgentGraphError(
                 f"{method} {path} -> invalid JSON response: {raw[:200]}",
-                status=resp.status,
+                # getcode(), not .status: the attribute is 3.9+ only.
+                status=resp.getcode(),
                 body=raw,
             ) from exc
 
@@ -408,7 +430,8 @@ class AgentGraphClient:
                 the server replays only frames after the given
                 ``{checkpoint_id}:{step}:{seq}`` id.
             timeout: Socket read timeout between frames (defaults to the
-                client timeout; raise it for slow LLM graphs).
+                client timeout; raise it for slow LLM graphs; ``0``
+                disables).
 
         Example:
             >>> for frame in client.run_stream(tid):
@@ -579,7 +602,10 @@ def _iter_sse(resp: urllib.response.addinfourl) -> Generator[SSEEvent, None, Non
             line = raw.decode("utf-8", errors="replace")
             line = line.rstrip("\r\n")
             if line == "":
-                if data_lines or event != "message" or event_id is not None:
+                # Dispatch only when data was buffered; per the SSE spec,
+                # event:/id:-only blocks update parser state but emit
+                # nothing.
+                if data_lines:
                     yield SSEEvent(
                         event=event,
                         data=_decode_data("\n".join(data_lines)),
@@ -601,12 +627,20 @@ def _iter_sse(resp: urllib.response.addinfourl) -> Generator[SSEEvent, None, Non
             elif field == "id":
                 event_id = value
         # Flush a trailing frame not terminated by a blank line.
-        if data_lines or event != "message" or event_id is not None:
+        if data_lines:
             yield SSEEvent(
                 event=event,
                 data=_decode_data("\n".join(data_lines)),
                 id=event_id,
             )
+    except OSError as exc:
+        # Read-time transport failure on a stalled stream
+        # (socket.timeout between frames, reset by peer).
+        raise AgentGraphError(
+            f"SSE stream read failed: {exc}",
+            status=None,
+            body=None,
+        ) from exc
     finally:
         resp.close()
 
@@ -615,5 +649,5 @@ def _decode_data(raw: str) -> Any:
     """JSON-decode an SSE data payload when possible."""
     try:
         return json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:  # JSONDecodeError subclasses ValueError
         return raw

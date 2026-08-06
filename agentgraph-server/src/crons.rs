@@ -11,7 +11,7 @@
 //! leaves the cron active, `delete` removes it once the first fired run
 //! reaches a terminal state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -21,8 +21,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::routes::{AppState, ThreadRecord};
+use crate::routes::AppState;
 use crate::runs::{self, MultitaskStrategy, RunPayload};
+use crate::threads::ThreadRecord;
 
 /// What happens to a cron after one of its runs reaches a terminal state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -78,14 +79,26 @@ pub(crate) struct CronRecord {
     pub runs_fired: u64,
 }
 
+/// Upper bound for `interval_secs` (one year). Unbounded values are a
+/// security problem, not just a UX one: `u64` seconds above `i64::MAX`
+/// would wrap negative in the duration cast (a next-due in the past fires
+/// every 200 ms tick — a self-inflicted fire-storm), and large positive
+/// values can overflow chrono's timestamp math inside the single scheduler
+/// task, killing the schedule for every tenant.
+const MAX_INTERVAL_SECS: u64 = 31_536_000;
+
 /// Validate a create-payload schedule pair: exactly one of interval or
-/// expression, interval >= 1s, expression parseable.
+/// expression, interval within `1..=MAX_INTERVAL_SECS`, expression
+/// parseable.
 pub(crate) fn validate_schedule(
     interval_secs: Option<u64>,
     cron_expr: Option<&str>,
 ) -> Result<(), String> {
     match (interval_secs, cron_expr) {
         (Some(0), None) => Err("`interval_secs` must be >= 1".to_string()),
+        (Some(secs), None) if secs > MAX_INTERVAL_SECS => Err(format!(
+            "`interval_secs` must be <= {MAX_INTERVAL_SECS} (one year)"
+        )),
         (Some(_), None) => Ok(()),
         (None, Some(expr)) => parse_expr(expr).map(|_| ()),
         (None, None) => {
@@ -104,11 +117,15 @@ fn parse_expr(expr: &str) -> Result<cron::Schedule, String> {
         .map_err(|e| format!("invalid cron expression `{expr}`: {e}"))
 }
 
-/// The next firing strictly after `now` (`None` only for corrupt records,
-/// which creation-time validation prevents).
+/// The next firing strictly after `now`; `None` for corrupt records (the
+/// clamp + checked math also keep pre-validation records persisted by older
+/// versions from panicking the scheduler loop).
 fn next_after(cron: &CronRecord, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     match (cron.interval_secs, &cron.cron_expr) {
-        (Some(secs), None) => Some(now + chrono::Duration::seconds(secs.max(1) as i64)),
+        (Some(secs), None) => {
+            let secs = i64::try_from(secs.clamp(1, MAX_INTERVAL_SECS)).ok()?;
+            now.checked_add_signed(chrono::Duration::seconds(secs))
+        }
         (None, Some(expr)) => parse_expr(expr).ok()?.upcoming(Utc).next(),
         _ => None,
     }
@@ -176,6 +193,11 @@ pub(crate) fn spawn_scheduler(state: Arc<AppState>) {
     tokio::spawn(async move {
         // Per-cron next-due bookkeeping, rebuilt as crons come and go.
         let mut next_due: HashMap<String, DateTime<Utc>> = HashMap::new();
+        // One-shot (`on_run_completed: "delete"`) crons that have fired but
+        // whose run hasn't reached a terminal state yet. Without this
+        // tombstone a one-shot cron would keep firing on schedule until its
+        // first run finishes and deletes it.
+        let mut oneshot_fired: HashSet<String> = HashSet::new();
         let mut ticker = tokio::time::interval(Duration::from_millis(200));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -187,8 +209,17 @@ pub(crate) fn spawn_scheduler(state: Arc<AppState>) {
                     continue;
                 }
             };
+            // Prune bookkeeping for deleted crons: a stale entry would
+            // accumulate forever, and a later cron reusing the id would
+            // inherit the stale due time (immediate off-schedule firing).
+            let listed: HashSet<&str> = crons.iter().map(|c| c.cron_id.as_str()).collect();
+            next_due.retain(|id, _| listed.contains(id.as_str()));
+            oneshot_fired.retain(|id| listed.contains(id.as_str()));
             let now = Utc::now();
             for cron in crons {
+                if oneshot_fired.contains(&cron.cron_id) {
+                    continue; // one-shot draining: its first run deletes it
+                }
                 if !next_due.contains_key(&cron.cron_id) {
                     match next_after(&cron, now) {
                         Some(due) => {
@@ -206,6 +237,9 @@ pub(crate) fn spawn_scheduler(state: Arc<AppState>) {
                     None => {
                         next_due.remove(&cron.cron_id);
                     }
+                }
+                if cron.on_run_completed == OnRunCompleted::Delete {
+                    oneshot_fired.insert(cron.cron_id.clone());
                 }
                 tokio::spawn(fire(Arc::clone(&state), cron));
             }
@@ -225,18 +259,23 @@ async fn fire(state: Arc<AppState>, cron: CronRecord) {
     let external_cron_id = crate::auth::strip_owned(tenant, &cron.cron_id).unwrap_or(&cron.cron_id);
     let thread_id = uuid::Uuid::new_v4().to_string();
     let internal_thread_id = crate::auth::scope_id(tenant, &thread_id);
+    let record = ThreadRecord {
+        thread_id: thread_id.clone(),
+        tenant: tenant.to_string(),
+        graph: cron.graph.clone(),
+        metadata: json!({"cron_id": external_cron_id, "trigger": "cron"}),
+        created_at: Utc::now(),
+    };
+    // Persist like API-created threads: a cron-fired thread's checkpoints
+    // must survive a restart too. (A `false` here means a UUID collision —
+    // practically impossible; the run is still scheduled.)
+    if let Err(error) = state
+        .server_store
+        .create_thread(&internal_thread_id, &record)
+        .await
     {
-        let mut threads = state.threads.lock().await;
-        threads.insert(
-            internal_thread_id.clone(),
-            ThreadRecord {
-                thread_id: thread_id.clone(),
-                tenant: tenant.to_string(),
-                graph: cron.graph.clone(),
-                metadata: json!({"cron_id": external_cron_id, "trigger": "cron"}),
-                created_at: Utc::now(),
-            },
-        );
+        tracing::warn!(cron_id = %cron.cron_id, %error, "cron thread persistence failed");
+        return;
     }
 
     let payload = RunPayload {
@@ -288,5 +327,57 @@ async fn fire(state: Arc<AppState>, cron: CronRecord) {
         Err(error) => {
             tracing::warn!(cron_id = %cron.cron_id, %error, "cron run scheduling failed")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn interval_cron(secs: u64) -> CronRecord {
+        CronRecord {
+            cron_id: "c".to_string(),
+            graph: "g".to_string(),
+            interval_secs: Some(secs),
+            cron_expr: None,
+            input: None,
+            metadata: Value::Null,
+            on_run_completed: OnRunCompleted::Keep,
+            created_at: Utc::now(),
+            last_run_at: None,
+            runs_fired: 0,
+        }
+    }
+
+    #[test]
+    fn validate_schedule_accepts_one_schedule_in_bounds() {
+        assert!(validate_schedule(Some(1), None).is_ok());
+        assert!(validate_schedule(Some(MAX_INTERVAL_SECS), None).is_ok());
+        assert!(validate_schedule(None, Some("0 9 * * *")).is_ok());
+    }
+
+    #[test]
+    fn validate_schedule_rejects_zero_huge_and_double_schedules() {
+        assert!(validate_schedule(Some(0), None).is_err());
+        // The fire-storm / scheduler-killing inputs from the DoS review.
+        assert!(validate_schedule(Some(MAX_INTERVAL_SECS + 1), None).is_err());
+        assert!(validate_schedule(Some(u64::MAX), None).is_err());
+        assert!(validate_schedule(None, None).is_err());
+        assert!(validate_schedule(Some(60), Some("0 9 * * *")).is_err());
+    }
+
+    #[test]
+    fn next_after_never_panics_and_never_returns_the_past() {
+        let now = Utc::now();
+        // In-range interval: next firing is in the near future.
+        let due = next_after(&interval_cron(60), now).unwrap();
+        assert!(due > now);
+        assert!(due <= now + chrono::Duration::seconds(61));
+        // Out-of-range legacy records are clamped, never negative-overflowed
+        // or panicked on — a next-due in the past would fire every tick.
+        let due = next_after(&interval_cron(u64::MAX), now).unwrap();
+        assert!(due > now);
+        let due = next_after(&interval_cron(0), now).unwrap();
+        assert!(due > now);
     }
 }

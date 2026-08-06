@@ -2,6 +2,14 @@
 target/
 **/*.rs.bk
 
+# Python (SDKs)
+__pycache__/
+*.pyc
+
+# Local e2e scratch / server pid
+.tmp-e2e
+srv.pid
+
 # Checkpoint / demo data produced by examples
 agentgraph-server/data/
 data/

@@ -106,7 +106,9 @@ export interface RunPayload {
   checkpoint?: { checkpoint_id: string };
   metadata?: Record<string, JsonValue>;
   /** SSE frame families for streaming runs. Default `["values", "updates"]`. */
-  stream_mode?: Array<'values' | 'updates' | 'messages' | 'metadata' | 'error' | 'end' | string>;
+  stream_mode?: Array<
+    'values' | 'updates' | 'messages' | 'metadata' | 'error' | 'end' | (string & {})
+  >;
   multitask_strategy?: 'enqueue' | 'reject';
   /** Run through a named assistant (must bind the thread's graph). */
   assistant_id?: string;
@@ -123,7 +125,7 @@ export interface RunRecord {
 
 /** Terminal result of a blocking run. */
 export interface RunTerminal {
-  status: 'success' | 'interrupted' | 'error' | string;
+  status: 'success' | 'interrupted' | 'error' | (string & {});
   output?: Record<string, JsonValue>;
   interrupt?: JsonValue;
   error?: string;
@@ -140,7 +142,7 @@ export interface RunStatus {
   thread_id: string;
   graph: string;
   attempt: number;
-  status: 'pending' | 'running' | 'success' | 'interrupted' | 'error' | string;
+  status: 'pending' | 'running' | 'success' | 'interrupted' | 'error' | (string & {});
   output?: Record<string, JsonValue>;
   error?: string;
   interrupt?: JsonValue;
@@ -210,6 +212,8 @@ export interface RunStreamOptions {
   lastEventId?: string | number;
   /** Convenience for `payload.stream_mode`. */
   streamMode?: string[];
+  /** snake_case alias of `streamMode` (accepted; `streamMode` wins when both are set). */
+  stream_mode?: string[];
   /** Timeout (ms) for establishing the stream; the open stream is not timed. */
   timeout?: number;
   /** Abort the stream at any time. */

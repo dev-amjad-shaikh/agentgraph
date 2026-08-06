@@ -52,10 +52,16 @@ export class AgentGraphError extends Error {
         body = text;
       }
     }
+    // The server's error body is {"error": <kind>, "message": <detail>};
+    // surface the human-readable message, falling back to the machine kind.
     const detail =
-      body && typeof body === 'object' && body !== null && 'error' in body
-        ? String(/** @type {{error: unknown}} */ (body).error)
-        : typeof body === 'string'
+      body && typeof body === 'object' && body !== null
+        ? String(
+            /** @type {{message?: unknown, error?: unknown}} */ (body).message ??
+              /** @type {{message?: unknown, error?: unknown}} */ (body).error ??
+              response.statusText,
+          )
+        : typeof body === 'string' && body
           ? body
           : response.statusText;
     return new AgentGraphError(
@@ -195,6 +201,15 @@ export class AgentGraphClient {
       if (err instanceof AgentGraphError) throw err;
       if (err instanceof Error && err.name === 'AbortError') {
         throw new AgentGraphError('agentgraph-server request aborted', {
+          status: 0,
+          url,
+          cause: err,
+        });
+      }
+      if (err instanceof TypeError) {
+        // fetch rejects with TypeError for network-level failures (DNS,
+        // refused connection, TLS) before any response exists.
+        throw new AgentGraphError(`agentgraph-server network error: ${err.message}`, {
           status: 0,
           url,
           cause: err,
@@ -708,6 +723,11 @@ export async function* parseSseStream(body, signal) {
     }
   } finally {
     if (signal) signal.removeEventListener('abort', onAbort);
+    // A consumer that breaks out of `for await` early lands here with the
+    // HTTP body still streaming; cancel it so the connection is torn down
+    // instead of draining until the server finishes the run. (No-op after
+    // a normal EOF or an abort, which already cancels via onAbort.)
+    await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
 }

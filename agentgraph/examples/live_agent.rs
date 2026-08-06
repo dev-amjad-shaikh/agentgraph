@@ -1,10 +1,11 @@
-//! The hero live demo: a real ReAct agent against any OpenAI-compatible
+//! Live demo: a real ReAct agent against any OpenAI-compatible
 //! chat-completions endpoint — OpenAI, Ollama, vLLM, LM Studio, ...
 //!
 //! Unlike `react_agent.rs` (scripted mock model, no network), this example
-//! drives [`create_react_agent`] with a real [`OpenAiCompatibleClient`] and
-//! three real tools (`get_current_time`, `calculator`, `word_count`), while
-//! pretty-printing the [`GraphEvent`] stream as the agent reasons and acts.
+//! drives [`create_react_agent_streaming`] with a real
+//! [`OpenAiCompatibleClient`] and three real tools (`get_current_time`,
+//! `calculator`, `word_count`), while pretty-printing the [`GraphEvent`]
+//! stream — including live token deltas — as the agent reasons and acts.
 //!
 //! # Configuration (environment variables)
 //!
@@ -35,6 +36,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentgraph::prelude::*;
+use agentgraph::react::create_react_agent_streaming;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
@@ -124,7 +126,10 @@ impl Tool for Calculator {
         // arrive quoted (`{"a": "128"}`), keys get renamed (`operation`,
         // `lhs`/`rhs`, `x`/`y`). `Value::as_f64() + unwrap_or(0.0)` used to
         // swallow all of that into a silent `0 op 0 = 0`, so coerce
-        // defensively and log the raw payload when coercion still fails.
+        // defensively — and when coercion still fails, fail the tool call
+        // with the raw payload: the `ToolExecutor` turns tool errors into
+        // `ERROR:` tool messages the model can see and react to, whereas a
+        // printed warning is invisible to it.
         let op = get_any(&args, &["op", "operation", "operator"])
             .and_then(Value::as_str)
             .unwrap_or("add")
@@ -133,9 +138,10 @@ impl Tool for Calculator {
         let b = get_any(&args, &["b", "rhs", "right", "second_operand", "y"]).and_then(coerce_f64);
         let (a, b) = match (a, b) {
             (Some(a), Some(b)) => (a, b),
-            (a, b) => {
-                println!("    [tool:calculator] WARN: could not coerce operands; raw args: {args}");
-                (a.unwrap_or(0.0), b.unwrap_or(0.0))
+            _ => {
+                return Err(AgentGraphError::Tool(format!(
+                    "calculator: could not coerce operands to numbers; raw args: {args}"
+                )));
             }
         };
         let result = match op.as_str() {
@@ -227,11 +233,13 @@ async fn main() -> Result<()> {
 
     // 2. A real OpenAI-compatible client. Timeouts keep the demo snappy when
     //    the endpoint is down or hung (connection refused fails fast anyway).
+    //    `expect` is deliberate: a builder failure here means the demo is
+    //    misconfigured and should die loudly, not silently drop its timeouts.
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(120))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .expect("reqwest client builder with only timeouts must build");
     let client =
         OpenAiCompatibleClient::new(&base_url, Some(api_key), &model).with_http_client(http);
 
@@ -241,16 +249,21 @@ async fn main() -> Result<()> {
     registry.register(Calculator);
     registry.register(WordCount);
 
-    // 4. The prebuilt ReAct graph: agent ⇄ tools over the `messages` channel.
+    // 4. The event channel: the graph's agent node forwards token deltas
+    //    into it, and the executor emits its own events into the same sink.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<GraphEvent>(64);
+
+    // 5. The prebuilt ReAct graph, streaming variant: agent ⇄ tools over the
+    //    `messages` channel, with token deltas forwarded as GraphEvent::Token.
     let model: Arc<dyn ChatModel> = Arc::new(client);
-    let graph = create_react_agent(model, registry)?;
+    let graph = create_react_agent_streaming(model, registry, tx.clone())?;
     println!(
         "graph compiled: {} nodes, entry point `{}`\n",
         graph.node_count(),
         graph.entry_point()
     );
 
-    // 5. Seed the conversation with a question that needs all three tools.
+    // 6. Seed the conversation with a question that needs all three tools.
     let spec = StateSpec::new().channel("messages", Reducer::AddMessages);
     let question = "What time is it right now in UTC? Then multiply 128 by 46, \
                     and count the words in 'the quick brown fox jumps over the lazy dog'.";
@@ -262,8 +275,7 @@ async fn main() -> Result<()> {
     println!("user: {question}\n");
     println!("--- live event stream ---");
 
-    // 6. Pretty-print the GraphEvent stream as the loop runs.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<GraphEvent>(64);
+    // 7. Pretty-print the GraphEvent stream as the loop runs.
     let tracer = tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
             match event {
@@ -295,7 +307,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    // 7. Run — and treat a failed run as a friendly setup hint, not a crash.
+    // 8. Run — and treat a failed run as a friendly setup hint, not a crash.
     let config = RunConfig::new("live-demo")
         .with_max_steps(12)
         .with_event_tx(tx);
@@ -309,7 +321,7 @@ async fn main() -> Result<()> {
     };
     drop(tracer); // the trace task ends once the sender is dropped
 
-    // 8. Print the final answer.
+    // 9. Print the final answer.
     println!("\n--- final answer ---");
     match &outcome {
         ExecutionOutcome::Done(state) => {
@@ -431,5 +443,26 @@ mod tests {
             .call(json!({"op": "divide", "a": 1, "b": 0}))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn calculator_errors_with_raw_args_when_operands_do_not_coerce() {
+        // Non-coercible operands are a tool *error* the model can see (the
+        // ToolExecutor surfaces it as an ERROR: tool message), never a
+        // confident `0 op 0` result.
+        let err = Calculator
+            .call(json!({"op": "add", "a": "abc", "b": 2}))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("could not coerce"), "got: {msg}");
+        assert!(msg.contains("abc"), "raw args must be embedded, got: {msg}");
+
+        // Missing operand: same treatment.
+        let err = Calculator
+            .call(json!({"op": "add", "a": 1}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("could not coerce"), "got: {err}");
     }
 }

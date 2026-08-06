@@ -2,6 +2,35 @@
 
 All notable changes to the agentgraph platform. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); crates are versioned independently (`agentgraph`, `agentgraph-server`, `agentgraph-otel`, `agentgraph-worker`).
 
+## [Unreleased] — Quality & documentation review pass
+
+### Correctness
+
+- Deterministic fan-in merge when several nodes write the same channel in one super-step.
+- Interrupt suspension re-schedules the **entire** active set on resume (the super-step is transactional; completed siblings' discarded writes are no longer lost).
+- `GraphEvent::StateUpdate` now reports post-reducer merged values instead of raw partial writes.
+- Per-thread JSON checkpoint serialization.
+- SSE decoding handles multi-byte UTF-8 sequences split across byte-chunk boundaries.
+- MCP client enforces frame-size caps.
+- WASM node output bounds are validated.
+- Tenant isolation hardening across threads/checkpoints, runs, assistants, crons, and KV.
+- Cron interval clamping.
+- Thread durability across server restarts.
+- OpenTelemetry initialization and filter fixes (`agentgraph-otel`).
+- Python/TypeScript SDK stream parsing and error-mapping fixes.
+
+### Security
+
+- API keys are masked in `Debug` output.
+
+### Validation
+
+- Duplicate, reserved, and mixed graph edges are now rejected at `compile()` time.
+
+### Documentation
+
+- Full rustdoc review pass: module inventory in `agentgraph/src/lib.rs` corrected (file saver no longer marked WIP; `PostgresCheckpointer` / MCP / `RemoteNode` / WASM documented), `create_react_agent_streaming` added to the prelude, `RemoteNode` wire-error semantics and `NodeContext::interrupt` run-wide suspension semantics documented.
+
 ## [0.5.0] — 2026-08-05
 
 ### Added
@@ -46,7 +75,7 @@ All notable changes to the agentgraph platform. Format loosely follows [Keep a C
 
 **Added**
 
-- **Postgres checkpointer** — `PostgresCheckpointer` (`checkpoint_postgres` module, exported from the prelude) behind the `postgres` cargo feature, backed by `sqlx` (tokio + rustls). Same `Checkpointer` trait as the in-memory and JSON-file savers: thread-scoped, versioned snapshots with time-travel listing.
+- **Postgres checkpointer** — `PostgresCheckpointer` (`checkpoint_postgres` module, exported from the prelude) behind the `postgres` cargo feature, backed by `sqlx` (tokio + rustls). Same `Checkpointer` trait as the in-memory and JSON-file checkpointers: thread-scoped, versioned snapshots with time-travel listing.
 - **Token streaming** — `ChatModel::chat_stream` delivers incremental `TokenChunk`s through a callback; `OpenAiCompatibleClient` decodes real SSE deltas from the wire (`SseDecoder`, byte-chunk agnostic, multi-line `data:` per the SSE spec). The default trait impl falls back to a single chunk, so existing `ChatModel` implementors remain source-compatible.
 - **`GraphEvent::Token` + executor plumbing** — forward `chat_stream` deltas into the executor's event channel via `Executor::with_token_tx` / `RunConfig::token_tx` to stream LLM tokens as run events (the LangGraph `messages` stream mode).
 - **`examples/live_agent.rs`** — a live ReAct agent against any OpenAI-compatible endpoint (Ollama / OpenAI / vLLM / LM Studio, configured via `AGENTGRAPH_BASE_URL` / `AGENTGRAPH_API_KEY` / `AGENTGRAPH_MODEL`), with token streaming; exits 0 with setup instructions when no endpoint is reachable. Plus `examples/README.md`, a guided tour of all four examples.

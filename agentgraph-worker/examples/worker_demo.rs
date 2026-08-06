@@ -19,7 +19,8 @@
 //! builder.add_node("gate", RemoteNode::new("approval_gate", "http://127.0.0.1:8200"));
 //! ```
 //!
-//! Or probe it by hand:
+//! Or probe it by hand (`probe_body()` builds this JSON with the current
+//! protocol version):
 //!
 //! ```sh
 //! curl http://127.0.0.1:8200/ok
@@ -38,7 +39,7 @@ async fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "agentgraph_worker=info,info".into()),
+                .unwrap_or_else(|_| "info,agentgraph_worker=info".into()),
         )
         .init();
 
@@ -90,8 +91,16 @@ async fn main() -> std::io::Result<()> {
     println!();
     println!("Or probe it by hand:");
     println!("  curl http://{addr}/ok");
+    // Built from `probe_body()` so the printed snippet always carries the
+    // current PROTOCOL_VERSION and task shape instead of a stale literal.
+    let mut probe = agentgraph_worker::probe_body();
+    probe["node"] = json!("greeter");
+    probe["state"] = json!({"name": "rustacean"});
     println!("  curl -X POST http://{addr}/execute -H 'content-type: application/json' \\");
-    println!("    -d '{{\"protocol_version\":1,\"node\":\"greeter\",\"state\":{{\"name\":\"rustacean\"}},\"config\":{{\"thread_id\":\"t-1\",\"step\":0,\"resume\":null,\"extra\":{{}}}}}}'");
+    println!(
+        "    -d '{}'",
+        serde_json::to_string(&probe).expect("probe body serializes")
+    );
 
     serve(registry, addr).await
 }

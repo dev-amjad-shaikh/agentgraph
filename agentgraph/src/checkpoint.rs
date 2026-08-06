@@ -77,11 +77,24 @@ pub trait Checkpointer: Send + Sync {
     async fn put(&self, checkpoint: Checkpoint) -> Result<()>;
 
     /// The most recent checkpoint for a thread, or `None` if the thread has
-    /// never been checkpointed. Recency is defined by insertion order
-    /// (monotonic super-steps), not wall-clock time.
+    /// never been checkpointed. Recency is defined by **insertion (put)
+    /// order — the last successfully stored checkpoint wins** — not by
+    /// super-step number: replay on the same thread legitimately appends
+    /// checkpoints whose `step` is at or below the existing head, and a
+    /// later resume must continue that newest timeline.
+    ///
+    /// Backends without an explicit insertion sequence use `created_at` as
+    /// the insertion proxy. That is exact as long as checkpoints are minted
+    /// fresh ([`Checkpoint::new`]) when stored and forked histories are
+    /// copied oldest-first, which [`Checkpointer::fork_thread`] does.
     async fn get_latest(&self, thread_id: &str) -> Result<Option<Checkpoint>>;
 
     /// All checkpoints for a thread, oldest first (time-travel listing).
+    ///
+    /// The order is total and identical across backends — ascending
+    /// `(step, created_at, id)` — so that [`Checkpointer::fork_thread`]'s
+    /// truncation-by-position is deterministic even when replay has appended
+    /// several checkpoints sharing the same `step`.
     async fn list(&self, thread_id: &str) -> Result<Vec<Checkpoint>>;
 
     /// Fetch one specific checkpoint of a thread by id (time-travel handle).
@@ -160,8 +173,9 @@ pub trait Checkpointer: Send + Sync {
     }
 }
 
-/// In-memory checkpointer: fast, thread-safe, lost on restart. Suitable for
-/// development, tests, and ephemeral runs.
+/// In-memory checkpointer: thread-safe (all operations take a single mutex
+/// over the store), lost on restart. Suitable for development, tests, and
+/// ephemeral runs.
 #[derive(Debug, Default, Clone)]
 pub struct InMemoryCheckpointer {
     // thread_id -> checkpoints in insertion (super-step) order.
@@ -169,7 +183,8 @@ pub struct InMemoryCheckpointer {
 }
 
 impl InMemoryCheckpointer {
-    /// An empty in-memory store.
+    /// An empty store. Clones of the returned checkpointer share the same
+    /// underlying map.
     pub fn new() -> Self {
         Self::default()
     }
@@ -209,7 +224,18 @@ impl Checkpointer for InMemoryCheckpointer {
 
     async fn list(&self, thread_id: &str) -> Result<Vec<Checkpoint>> {
         let guard = self.lock()?;
-        Ok(guard.get(thread_id).cloned().unwrap_or_default())
+        let mut all = guard.get(thread_id).cloned().unwrap_or_default();
+        // Same total order as every other backend (ascending
+        // `(step, created_at, id)`), not raw insertion order: replay can
+        // append out-of-step-order checkpoints, and fork truncation must be
+        // deterministic across backends.
+        all.sort_by(|a, b| {
+            a.step
+                .cmp(&b.step)
+                .then(a.created_at.cmp(&b.created_at))
+                .then(a.id.cmp(&b.id))
+        });
+        Ok(all)
     }
 }
 
@@ -220,7 +246,12 @@ impl Checkpointer for InMemoryCheckpointer {
 ///
 /// Writes are atomic: payload is written to a uniquely named temp file in the
 /// same directory and then renamed over the target path, so a crash mid-write
-/// can never leave a truncated checkpoint file behind.
+/// can never leave a truncated checkpoint file behind. Puts are serialized
+/// per thread (an in-process lock per `thread_id`), so concurrent same-thread
+/// puts cannot interleave the checkpoint file and pointer writes and leave
+/// `latest` pointing at the older checkpoint. The lock is per-process:
+/// multiple writer PROCESSES over the same directory are not serialized —
+/// treat one writer process per thread directory as a precondition.
 ///
 /// Read paths are forgiving: a missing thread directory yields `None` / an
 /// empty list, a missing or corrupt `latest` pointer falls back to scanning
@@ -230,17 +261,37 @@ impl Checkpointer for InMemoryCheckpointer {
 #[derive(Debug, Clone)]
 pub struct JsonFileCheckpointer {
     dir: PathBuf,
+    // Per-thread put locks behind a map mutex: the map is locked only long
+    // enough to clone the per-thread `Arc`, never across the put itself.
+    put_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl JsonFileCheckpointer {
     /// A checkpointer rooted at `dir` (created lazily on first `put`).
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            put_locks: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// The root directory checkpoints are stored under.
     pub fn dir(&self) -> &std::path::Path {
         &self.dir
+    }
+
+    /// The lock serializing `put` for one thread. `Clone`s of this
+    /// checkpointer share the same lock map, so clones still serialize
+    /// against each other.
+    fn put_lock(&self, thread_id: &str) -> Result<Arc<tokio::sync::Mutex<()>>> {
+        let mut map = self
+            .put_locks
+            .lock()
+            .map_err(|_| AgentGraphError::Checkpoint("put-lock map poisoned".into()))?;
+        Ok(map
+            .entry(thread_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone())
     }
 
     /// `{dir}/{thread_id}/` — per-thread subdirectory.
@@ -354,7 +405,12 @@ impl JsonFileCheckpointer {
                 }
             }
         }
-        checkpoints.sort_by(|a, b| a.step.cmp(&b.step).then(a.created_at.cmp(&b.created_at)));
+        checkpoints.sort_by(|a, b| {
+            a.step
+                .cmp(&b.step)
+                .then(a.created_at.cmp(&b.created_at))
+                .then(a.id.cmp(&b.id))
+        });
         Ok(checkpoints)
     }
 }
@@ -362,6 +418,14 @@ impl JsonFileCheckpointer {
 #[async_trait]
 impl Checkpointer for JsonFileCheckpointer {
     async fn put(&self, checkpoint: Checkpoint) -> Result<()> {
+        // Serialize the whole put (checkpoint file THEN pointer file) per
+        // thread: without this, two concurrent same-thread puts can
+        // interleave (file A, file B, pointer B, pointer A) and leave
+        // `latest` pointing at the older checkpoint. Held across `.await`s,
+        // hence a tokio mutex — a std guard would make the future `!Send`.
+        let lock = self.put_lock(&checkpoint.thread_id)?;
+        let _put_guard = lock.lock().await;
+
         let thread_dir = self.thread_dir(&checkpoint.thread_id);
         tokio::fs::create_dir_all(&thread_dir).await.map_err(|e| {
             AgentGraphError::Checkpoint(format!(
@@ -426,8 +490,16 @@ impl Checkpointer for JsonFileCheckpointer {
                 }
             }
         }
-        // Fallback: highest-step checkpoint from a directory scan.
-        Ok(self.scan_thread(thread_id).await?.into_iter().last())
+        // Fallback: the checkpoint with the greatest `created_at` — the
+        // insertion-order proxy shared with the other backends (see the
+        // trait's `get_latest` contract), not the highest step, so a replay
+        // that appended lower-step checkpoints still resumes the newest
+        // timeline.
+        Ok(self
+            .scan_thread(thread_id)
+            .await?
+            .into_iter()
+            .max_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id))))
     }
 
     async fn list(&self, thread_id: &str) -> Result<Vec<Checkpoint>> {
@@ -564,12 +636,45 @@ mod tests {
         assert_eq!(all[1].step, 1);
         assert_eq!(all[2].step, 2);
 
-        // Latest falls back to the highest step via the pointer's target,
-        // which is the most recent put (step 1) — insertion-order recency.
-        // The pointer contract is "most recent put"; the scan fallback
-        // returns highest step. Both are valid; here the pointer wins.
+        // Recency is insertion order, not highest step: the pointer tracks
+        // the most recent put (step 1), and the scan fallback agrees because
+        // the freshest `created_at` is also the last put's.
         let latest = store.get_latest("t1").await.unwrap().unwrap();
         assert_eq!(latest.step, 1);
+    }
+
+    /// The `get_latest`/`list` contract is backend-independent: recency =
+    /// insertion order, listing = ascending `(step, created_at, id)`. Every
+    /// `Checkpointer` impl must agree with this test.
+    #[tokio::test]
+    async fn recency_and_list_order_agree_across_backends() {
+        let tmp = TestDir::new();
+        let memory = InMemoryCheckpointer::new();
+        let json_file = JsonFileCheckpointer::new(tmp.0.clone());
+
+        // Out-of-step-order puts (as replay-on-same-thread produces): each
+        // checkpoint is minted fresh, so `created_at` increases per put.
+        let steps = [2usize, 0, 1];
+        for step in steps {
+            memory.put(cp("t1", step)).await.unwrap();
+            json_file.put(cp("t1", step)).await.unwrap();
+        }
+
+        let stores: [&dyn Checkpointer; 2] = [&memory, &json_file];
+        for store in stores {
+            // Latest = last put (step 1), not highest step (step 2).
+            let latest = store.get_latest("t1").await.unwrap().unwrap();
+            assert_eq!(latest.step, 1, "backend disagrees on recency");
+            // List = ascending step order regardless of put order.
+            let listed: Vec<usize> = store
+                .list("t1")
+                .await
+                .unwrap()
+                .iter()
+                .map(|c| c.step)
+                .collect();
+            assert_eq!(listed, [0, 1, 2], "backend disagrees on list order");
+        }
     }
 
     #[tokio::test]

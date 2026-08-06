@@ -8,7 +8,7 @@ exporter feeding any OTel-compatible backend (collector, Jaeger, Tempo, ...).
 ## What gets traced
 
 `agentgraph`'s executor is already instrumented; this crate only wires the
-export. The span taxonomy emitted by `agentgraph` v0.3.0:
+export. The span taxonomy emitted by `agentgraph` v0.4.0:
 
 | Span / event            | Level | Fields                                   | Meaning                                            |
 |-------------------------|-------|------------------------------------------|----------------------------------------------------|
@@ -17,8 +17,8 @@ export. The span taxonomy emitted by `agentgraph` v0.3.0:
 | `agentgraph.node`       | INFO  | `node`, `step`                           | One per spawned node task (attached via `.instrument()`). |
 | barrier-merge event     | DEBUG | channels written                         | Reducer merge at each super-step barrier.          |
 | run-complete event      | INFO  | `steps`, `duration_ms`                   | Run finished.                                      |
-| interrupt event         | INFO  | —                                        | Run interrupted (human-in-the-loop).               |
-| error events            | WARN  | —                                        | Node/routing failures.                             |
+| interrupt event         | INFO  | `node`, `step`                           | Run interrupted (human-in-the-loop).               |
+| error events            | WARN  | `node`, `step`, `error`, `retryable`     | Node/routing failures.                             |
 
 Because spans nest (`run` → `super_step` → `node`), a single
 `agentgraph.run` trace in Jaeger fans out into the full execution tree with
@@ -34,7 +34,9 @@ let _guard = agentgraph_otel::init_local("my-agent")?;
 
 Pretty span logs go to stderr, filtered by `RUST_LOG` or the built-in
 default `info,agentgraph=debug` (which surfaces the DEBUG `super_step`
-spans without flooding other crates).
+spans without flooding other crates). The filter is **per-layer**: it gates
+the stderr logs only and never throttles OTLP span export, so a restrictive
+`RUST_LOG=warn` still ships the full trace tree to the collector.
 
 ### With a collector (OTLP export)
 
@@ -85,11 +87,11 @@ summaries via its `debug` exporter (`docker compose logs -f otel-collector`).
 
 | Item                              | Purpose                                                        |
 |-----------------------------------|----------------------------------------------------------------|
-| `init(OTelConfig) -> Result<OTelGuard>` | Install the global subscriber: `Registry + EnvFilter + fmt (+ OTLP layer when `otlp_endpoint` is set)`. |
+| `init(OTelConfig) -> Result<OTelGuard>` | Install the global subscriber: filtered `fmt` layer on stderr (+ unfiltered OTLP layer when `otlp_endpoint` is set). |
 | `init_local(&str) -> Result<OTelGuard>` | Shorthand for fmt-only local logging.                      |
 | `OTelConfig { service_name, otlp_endpoint, log_filter }` | Service name (OTel `service.name` resource), optional OTLP/HTTP endpoint, optional filter directive. |
 | `OTelGuard::shutdown(&mut self)`  | Flush + shut down the tracer provider. Idempotent; also runs on drop. |
-| `OTelError`                       | `SubscriberAlreadyInstalled` (second `init`) or `ExporterBuild` (bad endpoint/config). |
+| `OTelError`                       | `SubscriberAlreadyInstalled` (second `init`), `ExporterBuild` (bad endpoint/config), or `FilterParse` (invalid `log_filter` directive). |
 | `DEFAULT_FILTER`                  | `info,agentgraph=debug` — the fallback `EnvFilter`.           |
 
 ## Tests

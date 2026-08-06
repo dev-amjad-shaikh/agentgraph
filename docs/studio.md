@@ -15,7 +15,7 @@ studio/
   header). Connect calls `GET /info` and shows the service version, checkpointer kind, and every registered
   graph with its channel names. URL, key, and thread list persist in `localStorage`.
 - **Graphs panel** — one card per registered graph, with a **New thread** button (`POST /threads`).
-- **Threads panel (local-only)** — the v0.3 API has **no list-threads endpoint**, so threads you create or
+- **Threads panel (local-only)** — the server API (as of v0.4) has **no list-threads endpoint**, so threads you create or
   attach are remembered in your browser, keyed by server URL. **Attach by id** re-connects a thread the
   server already knows, and offers to re-create it with the same id when the in-memory thread registry has
   forgotten it (e.g. after a server restart — on-disk checkpoints then re-attach). ✕ *forget* only removes
@@ -71,7 +71,7 @@ Open `http://127.0.0.1:8000/` and connect with base URL **`/api`** (the proxy fo
 cd studio && python3 -m http.server 8000     # → http://localhost:8000/index.html
 ```
 
-Then connect to `http://127.0.0.1:8100`. Since `agentgraph-server` v0.3 sends permissive CORS headers
+Then connect to `http://127.0.0.1:8100`. Since `agentgraph-server` (v0.3 and later) sends permissive CORS headers
 (see below), plain cross-origin calls from any static host just work.
 
 ### Option C — double-click `index.html` (file://)
@@ -118,7 +118,7 @@ no network) and `react_agent` (channel `messages`, scripted model + echo tool, n
 
 ## Limitations (by design or by server version)
 
-- **Thread list is local-only.** The v0.3 server has no `GET /threads`; the Studio's thread list lives in
+- **Thread list is local-only.** The server (as of v0.4) has no `GET /threads`; the Studio's thread list lives in
   `localStorage`, keyed by server base URL, and is not shared across browsers or machines. Server restarts
   drop the in-memory thread registry — **Attach** re-creates a thread with the same id to re-attach to its
   on-disk checkpoints.

@@ -1,9 +1,12 @@
 //! SSE stream construction: event-log replay + live broadcast fan-out.
 //!
-//! Frame ids follow `{checkpoint_id}:{step}:{seq}` (see [`crate::runs`]); a
-//! client that reconnects with a `Last-Event-ID` header skips every frame
-//! whose sequence number it has already seen. The stream terminates after
-//! the run's `end` frame.
+//! Frame ids follow `{checkpoint_id}:{step}:{seq}` (see [`crate::runs`]).
+//! Replay semantics live on the attach endpoint (`GET /runs/{id}/stream`):
+//! a client that reconnects with a `Last-Event-ID` header skips every frame
+//! whose sequence number it has already seen, then follows the live stream.
+//! The run-create endpoint starts a fresh sequence per run and ignores the
+//! header — applying a stale seq there would silently drop the new run's
+//! first frames. The stream terminates after the run's `end` frame.
 
 use std::convert::Infallible;
 

@@ -84,9 +84,11 @@ async fn main() -> Result<()> {
     let mut tools = ToolRegistry::new();
     tools.register(Calculator);
     tools.register(Echo);
-    let model: Arc<dyn ChatModel> = Arc::new(
-        OpenAiCompatibleClient::from_env("OPENAI_API_KEY")?,
-    );
+    let model: Arc<dyn ChatModel> = Arc::new(OpenAiCompatibleClient::from_env(
+        "https://api.openai.com/v1",
+        "OPENAI_API_KEY",
+        "gpt-4o-mini",
+    ));
     let react = create_react_agent(model, tools)?;
     let react_spec = StateSpec::new().channel("messages", Reducer::AddMessages);
 
@@ -131,7 +133,7 @@ COPY --from=build /app/target/release/my-agent /my-agent
 ENTRYPOINT ["/my-agent"]
 ```
 
-The result is a ~20 MB image with no interpreter, no pip layer, no system Python.
+The result is a single-binary image with no interpreter, no pip layer, no system Python.
 
 **The collapse vs. LangGraph's runtime.** Per `langgraph_platform_api.md` §4.2, a
 self-hosted LangGraph standalone deployment needs **three moving parts**: the API
@@ -142,7 +144,7 @@ agentgraph-server collapses this:
 | Concern | LangGraph Platform | agentgraph-server v0.2 |
 |---|---|---|
 | User-code loading | `langgraph.json` + pip install at image build | `Cargo.toml` + `main.rs`, static link |
-| Deployment unit | API image + Postgres + Redis (compose) | one static binary (~20 MB) |
+| Deployment unit | API image + Postgres + Redis (compose) | one static binary |
 | Checkpoint store | Postgres | embedded `JsonFileCheckpointer`; `postgres` cargo feature later |
 | Stream fan-out | Redis pub/sub | in-process `tokio::sync::broadcast` per run |
 | Background-run queue | Postgres task queue + workers | in-process per-thread run queue |
@@ -379,7 +381,9 @@ checkpointer behind the `postgres` feature, token streaming via `ChatModel::chat
 Deviations from the design draft as implemented: config is code-only
 (`ServerConfig::new(bind_addr, store_path)` + builders `with_api_key`,
 `with_max_concurrent_runs_per_thread`, `with_event_log_capacity`); no `from_env()` and
-no `AGENTGRAPH_*` env vars are read by the crate. The checkpointer is wired from
+no `AGENTGRAPH_*` env vars are read by the crate. The §2 sample has been corrected to
+the shipped `OpenAiCompatibleClient::from_env(base_url, api_key_env, model)` (three
+arguments, returns `Self`, not `Result`). The checkpointer is wired from
 `ServerConfig::store_path` (`JsonFileCheckpointer`); there is no `with_checkpointer`
 builder. `multitask_strategy` ships as `enqueue` (default) / `reject`; LangGraph's
 `rollback` is an explicit `DELETE` on a finished run instead. Thread records are

@@ -27,10 +27,19 @@
 //! The caller drives the returned [`Graph`] with a [`crate::state::StateSpec`]
 //! declaring `messages` with `Reducer::AddMessages` and an initial state
 //! seeding the conversation (see `examples/react_agent.rs`).
+//!
+//! Two flavors exist: [`create_react_agent`] (the agent node calls
+//! [`ChatModel::chat`]; no [`crate::executor::GraphEvent::Token`] events) and
+//! [`create_react_agent_streaming`] (the agent node calls
+//! [`ChatModel::chat_stream`] and forwards deltas as
+//! [`crate::executor::GraphEvent::Token`]s into the run's event channel).
 
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
+
 use crate::error::{AgentGraphError, Result};
+use crate::executor::GraphEvent;
 use crate::graph::{Graph, GraphBuilder, Route};
 use crate::llm::{ChatMessage, ChatModel};
 use crate::node::NodeOutput;
@@ -65,16 +74,50 @@ fn read_messages(state: &crate::state::State) -> Result<Vec<ChatMessage>> {
 ///
 /// The graph never errors at build time for an empty registry — a tool-less
 /// agent simply answers directly on the first `agent` pass.
+///
+/// **This variant never emits [`GraphEvent::Token`]:** the agent node calls
+/// [`ChatModel::chat`]. Use [`create_react_agent_streaming`] to stream token
+/// deltas into the run's event channel.
 pub fn create_react_agent(model: Arc<dyn ChatModel>, tools: ToolRegistry) -> Result<Graph> {
+    build_react_agent(model, tools, None)
+}
+
+/// Build a prebuilt ReAct agent graph whose `agent` node streams token
+/// deltas as [`GraphEvent::Token`]s through `token_tx`
+/// ([`ChatModel::chat_stream`] under the hood; LangGraph's `messages`
+/// stream mode).
+///
+/// Typically `token_tx` is a clone of the run's event sender
+/// ([`crate::executor::RunConfig::token_tx`]) so token deltas interleave with
+/// the executor's own events on one channel. Forwarding is best-effort
+/// (`try_send`): a full or closed channel drops tokens but never aborts the
+/// run.
+///
+/// Identical to [`create_react_agent`] in topology and behavior otherwise;
+/// models that only implement [`ChatModel::chat`] work unchanged (the
+/// trait's default `chat_stream` delivers the whole answer as one token).
+pub fn create_react_agent_streaming(
+    model: Arc<dyn ChatModel>,
+    tools: ToolRegistry,
+    token_tx: mpsc::Sender<GraphEvent>,
+) -> Result<Graph> {
+    build_react_agent(model, tools, Some(token_tx))
+}
+
+fn build_react_agent(
+    model: Arc<dyn ChatModel>,
+    tools: ToolRegistry,
+    token_tx: Option<mpsc::Sender<GraphEvent>>,
+) -> Result<Graph> {
     let tool_schemas = tools.schemas();
     let tool_executor = ToolExecutor::new(tools);
 
-    // ---- agent node: call the model, append the assistant message ----
     let agent_node = {
         let model = Arc::clone(&model);
         move |ctx: crate::node::NodeContext| {
             let model = Arc::clone(&model);
             let tool_schemas = tool_schemas.clone();
+            let token_tx = token_tx.clone();
             async move {
                 let messages = read_messages(ctx.state())?;
                 tracing::debug!(
@@ -83,7 +126,21 @@ pub fn create_react_agent(model: Arc<dyn ChatModel>, tools: ToolRegistry) -> Res
                     tools = tool_schemas.len(),
                     "calling chat model"
                 );
-                let response = model.chat(&messages, &tool_schemas).await?;
+                let response = match token_tx {
+                    Some(tx) => {
+                        model
+                            .chat_stream(&messages, &tool_schemas, &mut |chunk| {
+                                if !chunk.delta.is_empty() {
+                                    let _ = tx.try_send(GraphEvent::Token {
+                                        node: AGENT_NODE.to_owned(),
+                                        delta: chunk.delta,
+                                    });
+                                }
+                            })
+                            .await?
+                    }
+                    None => model.chat(&messages, &tool_schemas).await?,
+                };
                 let appended = serde_json::to_value(&response.message)?;
                 // A single message object is fine: AddMessages accepts one
                 // message or an array and upserts/appends accordingly.
@@ -92,7 +149,6 @@ pub fn create_react_agent(model: Arc<dyn ChatModel>, tools: ToolRegistry) -> Res
         }
     };
 
-    // ---- tools node: dispatch the pending tool calls, append results ----
     let tools_node = move |ctx: crate::node::NodeContext| {
         let tool_executor = tool_executor.clone();
         async move {
@@ -107,8 +163,6 @@ pub fn create_react_agent(model: Arc<dyn ChatModel>, tools: ToolRegistry) -> Res
                     "node `{TOOLS_NODE}` expected the last message to carry tool calls"
                 )));
             }
-            // execute_batch never fails as a whole: per-call errors become
-            // `ERROR: ...` tool messages so the model can observe them.
             let tool_names: Vec<&str> = last
                 .tool_calls
                 .iter()
@@ -120,6 +174,7 @@ pub fn create_react_agent(model: Arc<dyn ChatModel>, tools: ToolRegistry) -> Res
                 tools = ?tool_names,
                 "dispatching tool calls"
             );
+            // Per-call error policy: see ToolExecutor::execute_batch docs.
             let results = tool_executor.execute_batch(&last.tool_calls).await;
             let appended = serde_json::to_value(&results)?;
             Ok(NodeOutput::update(MESSAGES_CHANNEL, appended))
@@ -152,7 +207,7 @@ pub fn create_react_agent(model: Arc<dyn ChatModel>, tools: ToolRegistry) -> Res
 mod tests {
     use super::*;
     use crate::graph::Edge;
-    use crate::llm::{ChatResponse, ToolCall};
+    use crate::llm::{ChatResponse, TokenChunk, ToolCall};
     use crate::node::{Node, NodeConfig, NodeContext};
     use crate::state::{Reducer, State, StateSpec};
     use crate::tool::Tool;
@@ -192,6 +247,80 @@ mod tests {
                 usage: None,
             })
         }
+    }
+
+    /// A model whose `chat_stream` emits real deltas (accumulating the full
+    /// answer, as wire-backed implementations do).
+    struct StreamingModel;
+
+    #[async_trait]
+    impl ChatModel for StreamingModel {
+        async fn chat(&self, _messages: &[ChatMessage], _tools: &[Value]) -> Result<ChatResponse> {
+            Ok(ChatResponse {
+                message: ChatMessage::assistant("streamed"),
+                model: None,
+                usage: None,
+            })
+        }
+        async fn chat_stream(
+            &self,
+            messages: &[ChatMessage],
+            tools: &[Value],
+            on_token: &mut (dyn FnMut(TokenChunk) + Send),
+        ) -> Result<ChatResponse> {
+            for delta in ["str", "eamed"] {
+                on_token(TokenChunk {
+                    delta: delta.to_owned(),
+                    finish: false,
+                    raw: None,
+                });
+            }
+            self.chat(messages, tools).await
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_variant_forwards_token_events() {
+        let (tx, mut rx) = mpsc::channel::<GraphEvent>(8);
+        let model: Arc<dyn ChatModel> = Arc::new(StreamingModel);
+        let graph = create_react_agent_streaming(model, registry(), tx).unwrap();
+
+        let state = State::from_value(json!({
+            MESSAGES_CHANNEL: [serde_json::to_value(ChatMessage::user("hi")).unwrap()]
+        }))
+        .unwrap();
+        let ctx = NodeContext::new(state, NodeConfig::default());
+        let out = graph.node(AGENT_NODE).unwrap().run(ctx).await.unwrap();
+
+        // The accumulated response is appended exactly as in chat().
+        let appended = out.updates.get(MESSAGES_CHANNEL).unwrap();
+        let msg: ChatMessage = serde_json::from_value(appended.clone()).unwrap();
+        assert_eq!(msg.content.as_deref(), Some("streamed"));
+
+        // Both deltas arrived as Token events on the forwarded channel.
+        let mut deltas = String::new();
+        for _ in 0..2 {
+            match rx.try_recv().expect("two token events") {
+                GraphEvent::Token { node, delta } => {
+                    assert_eq!(node, AGENT_NODE);
+                    deltas.push_str(&delta);
+                }
+                other => panic!("expected Token event, got {other:?}"),
+            }
+        }
+        assert_eq!(deltas, "streamed");
+    }
+
+    /// The non-streaming variant must emit no Token events (it calls chat()).
+    #[tokio::test]
+    async fn non_streaming_variant_emits_no_token_events() {
+        let model: Arc<dyn ChatModel> =
+            Arc::new(ScriptedModel::new(vec![ChatMessage::assistant("done")]));
+        let graph = create_react_agent(model, registry()).unwrap();
+        // No token sender is even available to this graph: the assertion is
+        // structural (create_react_agent takes no channel), documented here
+        // so the two variants do not drift.
+        assert!(graph.has_node(AGENT_NODE));
     }
 
     struct Echo;

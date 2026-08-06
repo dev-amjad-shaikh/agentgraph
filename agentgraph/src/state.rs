@@ -18,7 +18,7 @@
 //! [`StateSpec`] is the graph's state schema: channel name → reducer. It also
 //! performs super-step write validation in [`StateSpec::apply_super_step`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -52,8 +52,10 @@ impl State {
     pub fn from_value(value: Value) -> Result<Self> {
         match value {
             Value::Object(inner) => Ok(Self { inner }),
+            // Report only the type: the value itself may be a multi-MB blob.
             other => Err(AgentGraphError::InvalidUpdate(format!(
-                "state must be a JSON object, got {other}"
+                "state must be a JSON object, got {}",
+                json_type_name(&other)
             ))),
         }
     }
@@ -95,7 +97,8 @@ impl State {
     pub fn get_as<T: serde::de::DeserializeOwned>(&self, channel: &str) -> Result<Option<T>> {
         match self.inner.get(channel) {
             None => Ok(None),
-            Some(v) => Ok(Some(serde_json::from_value(v.clone())?)),
+            // `&Value` implements `Deserializer`; no need to clone first.
+            Some(v) => Ok(Some(T::deserialize(v)?)),
         }
     }
 
@@ -135,9 +138,13 @@ pub enum Reducer {
     Overwrite,
 
     /// List-concat semantics: the current value is treated as an array
-    /// (missing/non-array current values start as `[]`). If the update is an
+    /// (a missing current value starts as `[]`). If the update is an
     /// array it is extended onto the current array; otherwise the update is
     /// pushed as a single element.
+    ///
+    /// A **non-array current value** is rejected by
+    /// [`StateSpec::apply_super_step`] with [`AgentGraphError::InvalidUpdate`];
+    /// only direct calls to [`Reducer::apply`] coerce it to `[]`.
     Append,
 
     /// Recursive object merge: two JSON objects are merged key-by-key
@@ -151,7 +158,11 @@ pub enum Reducer {
     /// update may be a single message object or an array of messages. Each
     /// incoming message is **upserted**: if it has an `"id"` field equal to
     /// an existing message's `"id"`, the existing message is replaced in
-    /// place; otherwise the message is appended.
+    /// place; otherwise the message is appended. Messages whose `"id"` is
+    /// present but not a string are treated as id-less (always appended).
+    ///
+    /// Like [`Reducer::Append`], a non-array current value is rejected by
+    /// [`StateSpec::apply_super_step`].
     AddMessages,
 }
 
@@ -161,13 +172,19 @@ impl Reducer {
     /// Only `LastValue`-style channels ([`Reducer::Overwrite`]) are
     /// single-write; aggregating reducers exist precisely to support
     /// parallel fan-in.
-    pub fn allows_multiple_writes(&self) -> bool {
+    pub fn allows_multiple_writes(self) -> bool {
         !matches!(self, Reducer::Overwrite)
     }
 
     /// Apply one update to a channel's current value.
     ///
     /// `current` is `None` when the channel has never been written.
+    ///
+    /// For [`Reducer::Append`] and [`Reducer::AddMessages`], a non-array
+    /// `current` is treated as `[]` (the update starts a fresh array).
+    /// [`StateSpec::apply_super_step`] rejects that case with
+    /// [`AgentGraphError::InvalidUpdate`] before reducers run; the coercion
+    /// here exists only for direct callers of this method.
     pub fn apply(&self, current: Option<&Value>, update: Value) -> Value {
         match self {
             Reducer::Overwrite => update,
@@ -180,7 +197,6 @@ impl Reducer {
                     }
                     Value::Array(out)
                 }
-                // No array yet: start a fresh one from the update.
                 _ => match update {
                     Value::Array(items) => Value::Array(items),
                     single => Value::Array(vec![single]),
@@ -192,6 +208,30 @@ impl Reducer {
             },
             Reducer::AddMessages => add_messages(current, update),
         }
+    }
+}
+
+impl std::fmt::Display for Reducer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Reducer::Overwrite => "overwrite",
+            Reducer::Append => "append",
+            Reducer::DeepMerge => "deep_merge",
+            Reducer::AddMessages => "add_messages",
+        };
+        f.write_str(name)
+    }
+}
+
+/// Short type name for error messages (avoids embedding the value itself).
+fn json_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -214,6 +254,9 @@ fn deep_merge(a: &Value, b: &Value) -> Value {
 }
 
 /// `add_messages` semantics: ID-aware upsert + append over a message array.
+///
+/// A message whose `"id"` is not a string (e.g. `{"id": 123}`) is treated as
+/// id-less and always appended — it can never match an existing message.
 fn add_messages(current: Option<&Value>, update: Value) -> Value {
     let mut messages: Vec<Value> = match current {
         Some(Value::Array(existing)) => existing.clone(),
@@ -223,16 +266,24 @@ fn add_messages(current: Option<&Value>, update: Value) -> Value {
         Value::Array(items) => items,
         single => vec![single],
     };
+    // One pass to index existing ids; the upsert loop then runs O(1) per
+    // incoming message instead of scanning the whole array each time.
+    let mut index_of: HashMap<String, usize> = HashMap::with_capacity(messages.len());
+    for (i, m) in messages.iter().enumerate() {
+        if let Some(id) = m.get("id").and_then(Value::as_str) {
+            index_of.entry(id.to_owned()).or_insert(i);
+        }
+    }
     for msg in incoming {
         let msg_id = msg.get("id").and_then(Value::as_str).map(str::to_owned);
-        let pos = msg_id.as_deref().and_then(|id| {
-            messages
-                .iter()
-                .position(|m| m.get("id").and_then(Value::as_str) == Some(id))
-        });
-        match pos {
+        match msg_id.as_deref().and_then(|id| index_of.get(id).copied()) {
             Some(i) => messages[i] = msg,
-            None => messages.push(msg),
+            None => {
+                if let Some(id) = msg_id {
+                    index_of.insert(id, messages.len());
+                }
+                messages.push(msg);
+            }
         }
     }
     Value::Array(messages)
@@ -277,9 +328,21 @@ impl StateSpec {
     }
 
     /// The reducer for a channel, defaulting to [`Reducer::Overwrite`]
-    /// (`LastValue` semantics).
+    /// (`LastValue` semantics) for undeclared channels.
+    ///
+    /// The default is a convenience for contexts where the channel is known
+    /// to be declared. When the channel may be undeclared, use
+    /// [`StateSpec::try_reducer_for`] and handle `None` — silently treating
+    /// an undeclared channel as `Overwrite` is almost never the intent.
+    /// [`StateSpec::apply_super_step`] always validates channels first, so
+    /// the default is unreachable on that path.
     pub fn reducer_for(&self, channel: &str) -> Reducer {
         self.channels.get(channel).copied().unwrap_or_default()
+    }
+
+    /// The reducer for a channel, or `None` if the channel is not declared.
+    pub fn try_reducer_for(&self, channel: &str) -> Option<Reducer> {
+        self.channels.get(channel).copied()
     }
 
     /// All declared channel names.
@@ -307,64 +370,77 @@ impl StateSpec {
     ///    (i.e. [`Reducer::Overwrite`]) may appear in at most one node's
     ///    updates per super-step; a second write is
     ///    [`AgentGraphError::InvalidUpdate`].
-    /// 3. Surviving writes are merged in iteration order via the channel
-    ///    reducer.
+    /// 3. For [`Reducer::Append`] and [`Reducer::AddMessages`] channels, the
+    ///    current state value (if present) must be an array; a non-array
+    ///    current value indicates a type bug in the graph spec and is
+    ///    rejected with [`AgentGraphError::InvalidUpdate`] rather than
+    ///    silently discarded.
+    /// 4. Surviving writes are merged via the channel reducer in
+    ///    **deterministic order: sorted by node name**. The executor
+    ///    collects writes from concurrently completing tasks, so callers
+    ///    cannot rely on input order; canonicalizing here keeps fan-in
+    ///    results (and checkpoints derived from them) stable run-to-run.
     ///
-    /// On error the state is left unmodified for the offending channel and
-    /// the caller (executor) should abort the super-step — LangGraph treats
-    /// a super-step as transactional.
+    /// Validation completes before any mutation: on error the state is left
+    /// entirely unmodified and the caller (executor) should abort the
+    /// super-step — LangGraph treats a super-step as transactional.
     pub fn apply_super_step<I, S>(&self, state: &mut State, writes: I) -> Result<()>
     where
         I: IntoIterator<Item = (S, HashMap<String, Value>)>,
         S: AsRef<str>,
     {
-        // Collect first so validation borrows live in `collected` (owned),
-        // avoiding borrow/move conflicts with the input iterator.
-        let collected: Vec<(String, HashMap<String, Value>)> = writes
+        // Collect up front so the whole super-step is validated before a
+        // single channel is touched — that is what makes failure
+        // all-or-nothing. Also canonicalize the merge order: executors feed
+        // writes in task-completion order, which is nondeterministic.
+        let mut collected: Vec<(String, HashMap<String, Value>)> = writes
             .into_iter()
             .map(|(node, updates)| (node.as_ref().to_owned(), updates))
             .collect();
+        collected.sort_by(|a, b| a.0.cmp(&b.0));
 
-        // Pass 1: validation — collect write counts per channel.
         let mut write_counts: HashMap<&str, usize> = HashMap::new();
         let mut first_writer: HashMap<&str, &str> = HashMap::new();
 
         for (node, updates) in &collected {
-            let mut seen_in_node: HashSet<&str> = HashSet::new();
             for channel in updates.keys() {
-                if !self.has_channel(channel) {
+                let Some(reducer) = self.try_reducer_for(channel) else {
                     return Err(AgentGraphError::InvalidUpdate(format!(
                         "node `{node}` wrote to undeclared channel `{channel}`; \
                          declare it in the StateSpec"
                     )));
-                }
-                // A HashMap can hold one value per key, so duplicate writes
-                // within a single node are impossible; track defensively
-                // anyway to keep the invariant explicit.
-                if !seen_in_node.insert(channel.as_str()) {
-                    return Err(AgentGraphError::InvalidUpdate(format!(
-                        "node `{node}` wrote channel `{channel}` twice in one update"
-                    )));
+                };
+                // Aggregating-over-array reducers must not silently discard
+                // a mistyped current value; that is a spec bug, not data.
+                if matches!(reducer, Reducer::Append | Reducer::AddMessages) {
+                    if let Some(current) = state.get(channel) {
+                        if !current.is_array() {
+                            return Err(AgentGraphError::InvalidUpdate(format!(
+                                "node `{node}` wrote to channel `{channel}` (reducer: \
+                                 {reducer}), but the current value is a {}; the \
+                                 reducer requires an array",
+                                json_type_name(current)
+                            )));
+                        }
+                    }
                 }
                 let count = write_counts.entry(channel.as_str()).or_insert(0);
                 *count += 1;
                 first_writer
                     .entry(channel.as_str())
                     .or_insert(node.as_str());
-                if *count > 1 && !self.reducer_for(channel).allows_multiple_writes() {
+                if *count > 1 && !reducer.allows_multiple_writes() {
                     return Err(AgentGraphError::InvalidUpdate(format!(
                         "channel `{channel}` can receive only one value per super-step \
-                         (reducer: {:?}); already written by node `{}`, second write from \
+                         (reducer: {reducer}); already written by node `{}`, second write from \
                          node `{node}`. Use a multi-write reducer (Append/DeepMerge/\
                          AddMessages) to handle concurrent writes.",
-                        self.reducer_for(channel),
                         first_writer[channel.as_str()],
                     )));
                 }
             }
         }
 
-        // Pass 2: merge via reducers.
         for (_node, updates) in collected {
             for (channel, update) in updates {
                 let reducer = self.reducer_for(&channel);
@@ -488,5 +564,64 @@ mod tests {
             .apply_single(&mut state, "n", updates(&[("y", json!(1))]))
             .unwrap_err();
         assert!(matches!(err, AgentGraphError::InvalidUpdate(_)));
+    }
+
+    #[test]
+    fn fan_in_merge_order_is_deterministic() {
+        // The executor feeds writes in task-completion order; the merge must
+        // not depend on it.
+        let spec = StateSpec::new()
+            .channel("xs", Reducer::Append)
+            .channel("messages", Reducer::AddMessages);
+        let forward = vec![
+            (
+                "b".to_string(),
+                updates(&[("xs", json!([2])), ("messages", json!({"id": "b", "v": 2}))]),
+            ),
+            (
+                "a".to_string(),
+                updates(&[("xs", json!([1])), ("messages", json!({"id": "a", "v": 1}))]),
+            ),
+        ];
+        let mut reversed = forward.clone();
+        reversed.reverse();
+
+        let mut s1 = State::new();
+        let mut s2 = State::new();
+        spec.apply_super_step(&mut s1, forward).unwrap();
+        spec.apply_super_step(&mut s2, reversed).unwrap();
+        assert_eq!(s1, s2);
+        assert_eq!(s1.get("xs"), Some(&json!([1, 2])));
+        assert_eq!(
+            s1.get("messages"),
+            Some(&json!([{"id": "a", "v": 1}, {"id": "b", "v": 2}]))
+        );
+    }
+
+    #[test]
+    fn append_rejects_non_array_current_value() {
+        let mut state = State::from_value(json!({"xs": {"oops": "object"}})).unwrap();
+        let spec = StateSpec::new().channel("xs", Reducer::Append);
+        let err = spec
+            .apply_single(&mut state, "n", updates(&[("xs", json!([1]))]))
+            .unwrap_err();
+        assert!(matches!(err, AgentGraphError::InvalidUpdate(_)));
+        // All-or-nothing: the failed super-step leaves state untouched.
+        assert_eq!(state.get("xs"), Some(&json!({"oops": "object"})));
+    }
+
+    #[test]
+    fn add_messages_rejects_non_array_current_value() {
+        let mut state = State::from_value(json!({"messages": 42})).unwrap();
+        let spec = StateSpec::new().channel("messages", Reducer::AddMessages);
+        let err = spec
+            .apply_single(
+                &mut state,
+                "n",
+                updates(&[("messages", json!({"id": "m1"}))]),
+            )
+            .unwrap_err();
+        assert!(matches!(err, AgentGraphError::InvalidUpdate(_)));
+        assert_eq!(state.get("messages"), Some(&json!(42)));
     }
 }

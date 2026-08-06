@@ -1,16 +1,17 @@
-//! Server-side persistence for the platform surface: assistants, crons, and
-//! the cross-thread KV store.
+//! Server-side persistence for the platform surface: assistants, crons,
+//! threads, and the cross-thread KV store.
 //!
 //! [`ServerStore`] is the async CRUD trait the routes program against. Two
 //! implementations ship:
 //!
 //! - [`JsonFileStore`] — the default. Existing v0.2 behavior, extracted:
-//!   assistants and crons live in an in-memory index persisted as one JSON
-//!   file per record under `{store_path}/{assistants,crons}/`; KV items are
-//!   pure file-backed reads/writes under `{store_path}/store/`.
+//!   assistants, crons, and threads live in an in-memory index persisted as
+//!   one JSON file per record under `{store_path}/{assistants,crons,threads}/`;
+//!   KV items are pure file-backed reads/writes under `{store_path}/store/`.
 //! - [`PostgresStore`] (feature `postgres`) — tables `server_assistants`,
-//!   `server_crons`, and `server_kv` with JSONB payloads, auto-migrated on
-//!   (lazy) connect. Selected via `ServerConfig::with_postgres(url)`.
+//!   `server_crons`, `server_threads`, and `server_kv` with JSONB payloads,
+//!   auto-migrated on (lazy) connect. Selected via
+//!   `ServerConfig::with_postgres(url)`.
 //!
 //! All trait errors are plain `String`s; routes map them to 500s — no store
 //! error is ever a client error (validation happens before the store call).
@@ -24,6 +25,7 @@ use tokio::sync::Mutex;
 use crate::assistants::{self, AssistantRecord};
 use crate::crons::{self, CronRecord};
 use crate::store::{self, StoreItem};
+use crate::threads::{self, ThreadRecord};
 
 /// Store operation result. The `String` payload is a 500-class internal
 /// failure (IO error, DB error, serialization bug).
@@ -56,6 +58,13 @@ pub(crate) trait ServerStore: Send + Sync {
     /// Delete a cron; `true` when it existed.
     async fn delete_cron(&self, cron_id: &str) -> StoreResult<bool>;
 
+    /// Insert a new thread under its internal (tenant-scoped) id; `false`
+    /// (no write) when the id exists. Thread records are durable so
+    /// pre-restart checkpoints stay reachable through the API.
+    async fn create_thread(&self, internal_id: &str, record: &ThreadRecord) -> StoreResult<bool>;
+    /// Fetch one thread by internal (tenant-scoped) id.
+    async fn get_thread(&self, internal_id: &str) -> StoreResult<Option<ThreadRecord>>;
+
     /// Insert or replace a KV item. Returns the stored item plus `true`
     /// when the key was newly created (`created_at` preserved on replace).
     async fn kv_put(
@@ -79,25 +88,27 @@ pub(crate) trait ServerStore: Send + Sync {
 
 /// JSON-file-backed store rooted at `ServerConfig::store_path`.
 ///
-/// Assistants and crons are served from an in-memory index (loaded from
-/// disk at construction) with one file per record written through on every
-/// mutation — exactly the v0.2 route behavior. KV items go straight to the
-/// file system, serialized by `kv_lock` so `created_at` preservation cannot
-/// race.
+/// Assistants, crons, and threads are served from an in-memory index
+/// (loaded from disk at construction) with one file per record written
+/// through on every mutation — exactly the v0.2 route behavior. KV items go
+/// straight to the file system, serialized by `kv_lock` so `created_at`
+/// preservation cannot race.
 pub(crate) struct JsonFileStore {
     root: PathBuf,
     assistants: Mutex<HashMap<String, AssistantRecord>>,
     crons: Mutex<HashMap<String, CronRecord>>,
+    threads: Mutex<HashMap<String, ThreadRecord>>,
     kv_lock: Mutex<()>,
 }
 
 impl JsonFileStore {
-    /// Load the persisted assistants/crons under `root` into memory.
+    /// Load the persisted assistants/crons/threads under `root` into memory.
     pub(crate) fn load(root: &Path) -> Self {
         Self {
             root: root.to_path_buf(),
             assistants: Mutex::new(assistants::load(root)),
             crons: Mutex::new(crons::load(root)),
+            threads: Mutex::new(threads::load(root)),
             kv_lock: Mutex::new(()),
         }
     }
@@ -161,12 +172,41 @@ impl ServerStore for JsonFileStore {
     }
 
     async fn delete_cron(&self, cron_id: &str) -> StoreResult<bool> {
-        let removed = self.crons.lock().await.remove(cron_id).is_some();
-        if removed {
-            let path = crons::dir(&self.root).join(format!("{cron_id}.json"));
-            let _ = tokio::fs::remove_file(path).await;
+        let mut map = self.crons.lock().await;
+        let Some(record) = map.remove(cron_id) else {
+            return Ok(false);
+        };
+        let path = crons::dir(&self.root).join(format!("{cron_id}.json"));
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(true),
+            // The file is already gone; the in-memory index was authoritative.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            // On removal failure the record must stay in memory: dropping it
+            // here would let the orphaned file resurrect the cron on the
+            // next restart while the API already answered `deleted: true`.
+            Err(e) => {
+                map.insert(cron_id.to_string(), record);
+                Err(format!("remove cron file: {e}"))
+            }
         }
-        Ok(removed)
+    }
+
+    async fn create_thread(&self, internal_id: &str, record: &ThreadRecord) -> StoreResult<bool> {
+        let mut map = self.threads.lock().await;
+        if map.contains_key(internal_id) {
+            return Ok(false);
+        }
+        // Hold the lock across the file write so a concurrent create of the
+        // same id can't interleave.
+        threads::persist(&self.root, internal_id, record)
+            .await
+            .map_err(io_err("persist thread"))?;
+        map.insert(internal_id.to_string(), record.clone());
+        Ok(true)
+    }
+
+    async fn get_thread(&self, internal_id: &str) -> StoreResult<Option<ThreadRecord>> {
+        Ok(self.threads.lock().await.get(internal_id).cloned())
     }
 
     async fn kv_put(
@@ -216,6 +256,7 @@ mod postgres {
     use crate::assistants::AssistantRecord;
     use crate::crons::CronRecord;
     use crate::store::StoreItem;
+    use crate::threads::ThreadRecord;
 
     // -- Schema (auto-migrated on connect) ------------------------------ //
 
@@ -235,6 +276,14 @@ mod postgres {
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )";
 
+    /// `server_threads`: one row per thread, whole record as JSONB.
+    pub(crate) const CREATE_THREADS_SQL: &str = "
+        CREATE TABLE IF NOT EXISTS server_threads (
+            thread_id  TEXT PRIMARY KEY,
+            payload    JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )";
+
     /// `server_kv`: one row per (namespace, key), JSONB value plus explicit
     /// created/updated timestamps (`created_at` preserved across replaces).
     pub(crate) const CREATE_KV_SQL: &str = r#"
@@ -248,8 +297,12 @@ mod postgres {
         )"#;
 
     /// All idempotent migration statements, executed in order on connect.
-    pub(crate) const MIGRATION_SQL: &[&str] =
-        &[CREATE_ASSISTANTS_SQL, CREATE_CRONS_SQL, CREATE_KV_SQL];
+    pub(crate) const MIGRATION_SQL: &[&str] = &[
+        CREATE_ASSISTANTS_SQL,
+        CREATE_CRONS_SQL,
+        CREATE_THREADS_SQL,
+        CREATE_KV_SQL,
+    ];
 
     /// Transaction-scoped advisory lock key serializing concurrent
     /// first-use migrations of the server tables.
@@ -287,6 +340,16 @@ mod postgres {
     pub(crate) const LIST_CRONS_SQL: &str = "SELECT payload FROM server_crons";
 
     pub(crate) const DELETE_CRON_SQL: &str = "DELETE FROM server_crons WHERE cron_id = $1";
+
+    /// Insert-only thread create; returns no row on conflict → 409.
+    pub(crate) const INSERT_THREAD_SQL: &str = "
+        INSERT INTO server_threads (thread_id, payload)
+        VALUES ($1, $2)
+        ON CONFLICT (thread_id) DO NOTHING
+        RETURNING thread_id";
+
+    pub(crate) const SELECT_THREAD_SQL: &str =
+        "SELECT payload FROM server_threads WHERE thread_id = $1";
 
     /// KV upsert that preserves `created_at` on replace and reports whether
     /// the row pre-existed (the `created` flag drives 201 vs 200).
@@ -488,6 +551,31 @@ mod postgres {
             Ok(result.rows_affected() > 0)
         }
 
+        async fn create_thread(
+            &self,
+            internal_id: &str,
+            record: &ThreadRecord,
+        ) -> StoreResult<bool> {
+            let payload = record_to_payload(record)?;
+            let row = sqlx::query(INSERT_THREAD_SQL)
+                .bind(internal_id)
+                .bind(payload)
+                .fetch_optional(self.pool().await?)
+                .await
+                .map_err(db_err("insert thread"))?;
+            Ok(row.is_some())
+        }
+
+        async fn get_thread(&self, internal_id: &str) -> StoreResult<Option<ThreadRecord>> {
+            let row = sqlx::query(SELECT_THREAD_SQL)
+                .bind(internal_id)
+                .fetch_optional(self.pool().await?)
+                .await
+                .map_err(db_err("select thread"))?;
+            row.map(|r| record_from_payload("thread", r.get::<Value, _>("payload")))
+                .transpose()
+        }
+
         async fn kv_put(
             &self,
             namespace: &str,
@@ -643,8 +731,8 @@ mod postgres {
         use serde_json::json;
 
         #[test]
-        fn migration_sql_creates_all_three_tables_idempotently() {
-            assert_eq!(MIGRATION_SQL.len(), 3);
+        fn migration_sql_creates_all_tables_idempotently() {
+            assert_eq!(MIGRATION_SQL.len(), 4);
             for stmt in MIGRATION_SQL {
                 assert!(
                     stmt.contains("CREATE TABLE IF NOT EXISTS"),
@@ -655,6 +743,8 @@ mod postgres {
             assert!(CREATE_ASSISTANTS_SQL.contains("JSONB"));
             assert!(CREATE_CRONS_SQL.contains("server_crons"));
             assert!(CREATE_CRONS_SQL.contains("JSONB"));
+            assert!(CREATE_THREADS_SQL.contains("server_threads"));
+            assert!(CREATE_THREADS_SQL.contains("JSONB"));
             assert!(CREATE_KV_SQL.contains("server_kv"));
             assert!(CREATE_KV_SQL.contains("JSONB"));
             assert!(CREATE_KV_SQL.contains("PRIMARY KEY (namespace"));
@@ -716,6 +806,24 @@ mod postgres {
             assert_eq!(back.input, record.input);
             assert_eq!(back.runs_fired, record.runs_fired);
             assert_eq!(back.last_run_at, record.last_run_at);
+        }
+
+        #[test]
+        fn thread_payload_round_trip() {
+            let record = ThreadRecord {
+                thread_id: "t-1".to_string(),
+                tenant: "acme".to_string(),
+                graph: "pipeline".to_string(),
+                metadata: json!({"origin": "cron"}),
+                created_at: Utc::now(),
+            };
+            let payload = record_to_payload(&record).unwrap();
+            let back: ThreadRecord = record_from_payload("thread", payload).unwrap();
+            assert_eq!(back.thread_id, record.thread_id);
+            assert_eq!(back.tenant, record.tenant);
+            assert_eq!(back.graph, record.graph);
+            assert_eq!(back.metadata, record.metadata);
+            assert_eq!(back.created_at, record.created_at);
         }
 
         #[test]

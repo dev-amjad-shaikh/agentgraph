@@ -9,6 +9,20 @@ use agentgraph::remote::RemoteNode;
 use agentgraph_worker::{router, WorkerRegistry};
 use serde_json::json;
 
+/// Serve a registry on an ephemeral port; returns the base URL.
+async fn start_worker_with(registry: WorkerRegistry) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router(registry))
+            .await
+            .expect("worker server");
+    });
+    format!("http://{addr}")
+}
+
 /// Start a worker with the test handlers on an ephemeral port; returns the
 /// base URL to point `RemoteNode`s at.
 async fn start_worker() -> String {
@@ -33,16 +47,7 @@ async fn start_worker() -> String {
             }
         });
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral port");
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, router(registry))
-            .await
-            .expect("worker server");
-    });
-    format!("http://{addr}")
+    start_worker_with(registry).await
 }
 
 /// The mixed local/remote graph used by both tests:
@@ -207,6 +212,24 @@ async fn interrupt_resume_round_trip_across_the_wire() {
 /// Minimal GET helper (the worker crate intentionally has no HTTP client
 /// dependency): one raw HTTP/1.1 request over a tokio TCP stream.
 async fn http_get_json(url: &str) -> serde_json::Value {
+    let (_status, body) = http_request("GET", url, None).await;
+    body
+}
+
+/// Minimal POST helper returning the status code alongside the JSON body —
+/// the contract tests below assert on both.
+async fn http_post_json(url: &str, body: &serde_json::Value) -> (u16, serde_json::Value) {
+    http_request("POST", url, Some(body)).await
+}
+
+/// One raw HTTP/1.1 request over a tokio TCP stream. The worker crate
+/// intentionally has no HTTP client dependency, so tests hand-roll the
+/// framing instead of pulling one in.
+async fn http_request(
+    method: &str,
+    url: &str,
+    body: Option<&serde_json::Value>,
+) -> (u16, serde_json::Value) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let authority = url
@@ -219,15 +242,131 @@ async fn http_get_json(url: &str) -> serde_json::Value {
     let mut stream = tokio::net::TcpStream::connect(host)
         .await
         .expect("connect to worker");
-    stream
-        .write_all(
-            format!("GET {path} HTTP/1.1\r\nhost: {host}\r\nconnection: close\r\n\r\n").as_bytes(),
-        )
-        .await
-        .unwrap();
+    let request = match body {
+        Some(body) => {
+            let payload = serde_json::to_string(body).unwrap();
+            format!(
+                "{method} {path} HTTP/1.1\r\nhost: {host}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                payload.len()
+            )
+        }
+        None => format!("{method} {path} HTTP/1.1\r\nhost: {host}\r\nconnection: close\r\n\r\n"),
+    };
+    stream.write_all(request.as_bytes()).await.unwrap();
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).await.unwrap();
     let raw = String::from_utf8(raw).unwrap();
-    let body = raw.split("\r\n\r\n").nth(1).expect("HTTP body present");
-    serde_json::from_str(body).expect("valid JSON from /ok")
+    let (head, body) = raw
+        .split_once("\r\n\r\n")
+        .expect("HTTP response has a header/body split");
+    let status: u16 = head
+        .split_whitespace()
+        .nth(1)
+        .expect("status line carries a code")
+        .parse()
+        .expect("status code is numeric");
+    let body = serde_json::from_str(body).expect("valid JSON response body");
+    (status, body)
+}
+
+// ---------------------------------------------------------------------------
+// HTTP-layer contract tests: the branches that keep `RemoteNode`'s retry
+// semantics honest — 4xx is fatal client-side, application outcomes always
+// arrive as 200 + a one-payload body.
+// ---------------------------------------------------------------------------
+
+/// A task body valid except where a test patches it; built from
+/// `probe_body()` so the shape tracks the protocol.
+fn task_body(node: &str) -> serde_json::Value {
+    let mut body = agentgraph_worker::probe_body();
+    body["node"] = json!(node);
+    body
+}
+
+#[tokio::test]
+async fn protocol_version_mismatch_is_400_with_error_body() {
+    let worker_url = start_worker().await;
+
+    let mut body = task_body("doubler");
+    body["protocol_version"] = json!(agentgraph::remote::PROTOCOL_VERSION + 1);
+    let (status, response) = http_post_json(&format!("{worker_url}/execute"), &body).await;
+
+    assert_eq!(status, 400);
+    let error = response["error"].as_str().expect("error payload");
+    assert!(
+        error.contains("unsupported protocol_version"),
+        "unexpected error body: {error}"
+    );
+    assert!(response.get("output").is_none() && response.get("interrupt").is_none());
+}
+
+#[tokio::test]
+async fn unknown_handler_is_200_with_error_body() {
+    let worker_url = start_worker().await;
+
+    let (status, response) =
+        http_post_json(&format!("{worker_url}/execute"), &task_body("ghost")).await;
+
+    // Unknown handler is an application outcome, not a transport failure —
+    // 200 so the client never retries it.
+    assert_eq!(status, 200);
+    let error = response["error"].as_str().expect("error payload");
+    assert!(
+        error.contains("no handler registered for node `ghost`"),
+        "unexpected error body: {error}"
+    );
+    // The registered-name list is sorted for deterministic logs.
+    assert!(
+        error.contains("[\"approval_gate\", \"doubler\"]"),
+        "unexpected registered list: {error}"
+    );
+}
+
+#[tokio::test]
+async fn handler_error_is_200_with_error_body() {
+    let registry = WorkerRegistry::new().with("failer", |_ctx: NodeContext| async {
+        Err(AgentGraphError::Tool("backend exploded".into()))
+    });
+    let worker_url = start_worker_with(registry).await;
+
+    let (status, response) =
+        http_post_json(&format!("{worker_url}/execute"), &task_body("failer")).await;
+
+    assert_eq!(status, 200);
+    let error = response["error"].as_str().expect("error payload");
+    assert!(
+        error.contains("backend exploded"),
+        "unexpected error body: {error}"
+    );
+    assert!(response.get("output").is_none() && response.get("interrupt").is_none());
+}
+
+#[tokio::test]
+async fn handler_panic_is_caught_and_returned_as_error_body() {
+    let registry = WorkerRegistry::new()
+        .with("panicker", |_ctx: NodeContext| async {
+            panic!("kaboom");
+        })
+        .with("alive", |_ctx: NodeContext| async {
+            Ok(NodeOutput::update("ok", json!(true)))
+        });
+    let worker_url = start_worker_with(registry).await;
+
+    let (status, response) =
+        http_post_json(&format!("{worker_url}/execute"), &task_body("panicker")).await;
+
+    // The panic must NOT drop the connection: that would read as a
+    // transport failure client-side and be retried, replaying node logic.
+    assert_eq!(status, 200);
+    let error = response["error"].as_str().expect("error payload");
+    assert!(
+        error.contains("panicked") && error.contains("kaboom"),
+        "unexpected error body: {error}"
+    );
+
+    // The worker survives and keeps serving other handlers.
+    let (status, response) =
+        http_post_json(&format!("{worker_url}/execute"), &task_body("alive")).await;
+    assert_eq!(status, 200);
+    assert_eq!(response["output"]["updates"]["ok"], json!(true));
 }

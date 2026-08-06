@@ -5,11 +5,38 @@
 //! the OpenAI wire conventions: roles, assistant `tool_calls`, and tool
 //! results carried by `role: "tool"` messages with `tool_call_id`.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
 
 use crate::error::{AgentGraphError, Result};
+
+/// Maximum characters of an HTTP error body embedded in an error message:
+/// enough for diagnosis, bounded so a verbose server cannot bloat logs.
+/// Shared with `crate::remote`.
+pub(crate) const ERROR_BODY_MAX_CHARS: usize = 512;
+
+/// Truncate a response body for inclusion in an error message.
+pub(crate) fn truncate_body(body: &str) -> String {
+    body.chars().take(ERROR_BODY_MAX_CHARS).collect()
+}
+
+/// Exponential backoff `base * 2^attempt` with the exponent capped at 6 and
+/// cheap time-based jitter (×[0.5, 1.5)) so concurrent retry loops
+/// decorrelate without pulling in a `rand` dependency. Shared with
+/// `crate::remote`.
+pub(crate) fn backoff_delay(base: Duration, attempt: u32) -> Duration {
+    let base = base.saturating_mul(2u32.saturating_pow(attempt.min(6)));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let jitter = 0.5 + f64::from(nanos % 1000) / 1000.0; // [0.5, 1.5)
+    let jittered = (base.as_nanos() as f64 * jitter) as u128;
+    Duration::from_nanos(jittered.min(u64::MAX as u128) as u64)
+}
 
 /// Chat message role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -273,6 +300,12 @@ pub struct TokenChunk {
 /// Forwarding uses `try_send` (best-effort), matching the executor's own
 /// emission policy: a full or closed channel drops tokens but never aborts
 /// the run.
+///
+/// The prebuilt ReAct agent comes in two flavors for exactly this wiring:
+/// [`crate::react::create_react_agent`] never streams (it calls
+/// [`ChatModel::chat`], so no `Token` events can fire), while
+/// [`crate::react::create_react_agent_streaming`] performs the forwarding
+/// above internally.
 #[async_trait]
 pub trait ChatModel: Send + Sync {
     /// Produce the next assistant message for the conversation.
@@ -302,16 +335,51 @@ pub trait ChatModel: Send + Sync {
     }
 }
 
+/// Default number of retries *after* the initial attempt for transient
+/// failures (connect errors, timeouts, HTTP 5xx / 408 / 429).
+pub const DEFAULT_MAX_RETRIES: u32 = 2;
+
+/// Default base delay for exponential backoff between retries (exponent
+/// capped, jittered; see [`OpenAiCompatibleClient::with_backoff`]).
+pub const DEFAULT_BASE_BACKOFF: Duration = Duration::from_millis(100);
+
 /// A client for any OpenAI-compatible `/chat/completions` endpoint (OpenAI,
 /// Azure-OpenAI-compatible gateways, vLLM, Ollama, LM Studio, ...).
 ///
 /// Uses `reqwest` with rustls; no default TLS features.
-#[derive(Debug, Clone)]
+///
+/// Transient failures are retried with capped, jittered exponential backoff
+/// (same classification policy as `crate::remote::RemoteNode`): connect
+/// errors, timeouts, and HTTP 5xx / 408 / 429 are retryable; a `Retry-After`
+/// header (integer seconds) floors the delay. Other 4xx statuses and
+/// request/response decode errors are fatal. Configure with
+/// [`OpenAiCompatibleClient::with_retries`] /
+/// [`OpenAiCompatibleClient::with_backoff`].
+#[derive(Clone)]
 pub struct OpenAiCompatibleClient {
     base_url: String,
     api_key: Option<String>,
     model: String,
     client: reqwest::Client,
+    /// Retries after the initial attempt.
+    max_retries: u32,
+    /// Base delay for exponential backoff.
+    base_backoff: Duration,
+}
+
+// Hand-written because the derived impl would print `api_key` in cleartext
+// on any `{:?}` (logging middleware, panic messages, `dbg!`).
+impl std::fmt::Debug for OpenAiCompatibleClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAiCompatibleClient")
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "***"))
+            .field("model", &self.model)
+            .field("client", &self.client)
+            .field("max_retries", &self.max_retries)
+            .field("base_backoff", &self.base_backoff)
+            .finish()
+    }
 }
 
 impl OpenAiCompatibleClient {
@@ -327,21 +395,48 @@ impl OpenAiCompatibleClient {
             api_key,
             model: model.into(),
             client: reqwest::Client::new(),
+            max_retries: DEFAULT_MAX_RETRIES,
+            base_backoff: DEFAULT_BASE_BACKOFF,
         }
     }
 
     /// Read the API key from an environment variable.
+    ///
+    /// A missing variable maps to "no key" (requests go out unauthenticated
+    /// and typically fail 401 far from the cause), so a warning is logged at
+    /// construction time to keep the cause close to the effect.
     pub fn from_env(
         base_url: impl Into<String>,
         api_key_env: &str,
         model: impl Into<String>,
     ) -> Self {
-        Self::new(base_url, std::env::var(api_key_env).ok(), model)
+        let api_key = std::env::var(api_key_env).ok();
+        if api_key.is_none() {
+            tracing::warn!(
+                env_var = api_key_env,
+                "API key environment variable is not set; sending requests unauthenticated"
+            );
+        }
+        Self::new(base_url, api_key, model)
     }
 
     /// Override the underlying `reqwest::Client` (timeouts, proxies, ...).
     pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
         self.client = client;
+        self
+    }
+
+    /// Override the number of retries after the initial attempt
+    /// (`0` = single attempt, no retries).
+    pub fn with_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = max_retries;
+        self
+    }
+
+    /// Override the base backoff delay (attempt *n* waits roughly
+    /// `base * 2^n`, exponent capped and jittered).
+    pub fn with_backoff(mut self, base_backoff: Duration) -> Self {
+        self.base_backoff = base_backoff;
         self
     }
 
@@ -353,6 +448,105 @@ impl OpenAiCompatibleClient {
     fn endpoint(&self) -> String {
         format!("{}/chat/completions", self.base_url)
     }
+
+    /// Send the request produced by `build()` with the configured retry
+    /// policy. Only the initial request/response exchange is covered; once a
+    /// 2xx response is returned, streaming-read failures are not retried.
+    async fn send_with_retries(
+        &self,
+        build: impl Fn() -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response> {
+        let mut attempt: u32 = 0;
+        loop {
+            match self.try_send(build()).await {
+                Ok(response) => return Ok(response),
+                Err(AttemptError::Fatal(e)) => return Err(e),
+                Err(AttemptError::Retryable { error, retry_after })
+                    if attempt < self.max_retries =>
+                {
+                    let mut delay = backoff_delay(self.base_backoff, attempt);
+                    if let Some(floor) = retry_after {
+                        // A server that says Retry-After knows better than
+                        // our backoff guess.
+                        delay = delay.max(floor);
+                    }
+                    tracing::warn!(
+                        url = %self.base_url,
+                        attempt = attempt + 1,
+                        max_retries = self.max_retries,
+                        backoff_ms = delay.as_millis() as u64,
+                        error = %error,
+                        "chat completions attempt failed; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                Err(AttemptError::Retryable { error, .. }) => return Err(error),
+            }
+        }
+    }
+
+    /// One HTTP attempt. `Ok` means a 2xx response (the body may still be
+    /// streamed); `Err` is classified for retry.
+    async fn try_send(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> std::result::Result<reqwest::Response, AttemptError> {
+        let response = request.send().await.map_err(|e| {
+            let err = AgentGraphError::Llm(format!("request to {} failed: {e}", self.base_url));
+            if e.is_timeout() || e.is_connect() {
+                AttemptError::Retryable {
+                    error: err,
+                    retry_after: None,
+                }
+            } else {
+                AttemptError::Fatal(err)
+            }
+        })?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(Duration::from_secs);
+        let body = response.text().await.unwrap_or_default();
+        let err = AgentGraphError::Llm(format!(
+            "chat completions returned {status}: {}",
+            truncate_body(&body)
+        ));
+        // 5xx and 408/429 are transient by convention; other 4xx are
+        // definitive (bad request, auth failure, ...).
+        let retryable = status.is_server_error()
+            || status == reqwest::StatusCode::REQUEST_TIMEOUT
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+        Err(if retryable {
+            AttemptError::Retryable {
+                error: err,
+                retry_after,
+            }
+        } else {
+            AttemptError::Fatal(err)
+        })
+    }
+}
+
+/// Internal classification of a failed HTTP attempt (mirrors
+/// `crate::remote::AttemptError`).
+#[derive(Debug)]
+enum AttemptError {
+    /// Transient failure eligible for retry (connect, timeout, 5xx/408/429),
+    /// with an optional server-provided `Retry-After` floor.
+    Retryable {
+        error: AgentGraphError,
+        retry_after: Option<Duration>,
+    },
+    /// Definitive failure; never retried.
+    Fatal(AgentGraphError),
 }
 
 /// Wire shape of one completion choice.
@@ -447,6 +641,9 @@ impl StreamAccumulator {
         let mut tool_calls = Vec::with_capacity(self.tool_calls.len());
         for (index, acc) in self.tool_calls.into_iter().enumerate() {
             let arguments = if acc.arguments.trim().is_empty() {
+                // Note: a stream truncated mid-arguments also lands here —
+                // the accumulator cannot distinguish "the model sent no
+                // arguments" from "bytes were lost".
                 Value::Object(serde_json::Map::new())
             } else {
                 serde_json::from_str(&acc.arguments).map_err(|e| {
@@ -482,19 +679,76 @@ impl StreamAccumulator {
 /// are separated by blank lines, each event's `data:` lines (possibly
 /// several) join with `\n` into one payload, `:`-prefixed lines are
 /// comments/heartbeats, and other fields (`event:`, `id:`, `retry:`) are
-/// ignored. The decoder buffers partial lines across `feed` calls, so a
-/// single `data:` line split across TCP chunks still decodes correctly.
+/// ignored. [`SseDecoder::feed_bytes`] buffers partial lines *and* partial
+/// UTF-8 sequences across calls, so a `data:` line — or a single multi-byte
+/// character — split across TCP chunks still decodes correctly. One leading
+/// BOM is stripped, and a bare `data` line (no colon) is an empty-string
+/// field, both per the SSE spec.
 #[derive(Default)]
 struct SseDecoder {
-    /// Bytes received but not yet terminated by `\n`.
+    /// Raw bytes held back because they end mid-UTF-8-sequence.
+    pending: Vec<u8>,
+    /// Decoded text received but not yet terminated by `\n`.
     buf: String,
     /// `data:` lines of the event currently being assembled.
     data_lines: Vec<String>,
+    /// Whether any bytes have been consumed yet (for one-time BOM stripping).
+    started: bool,
 }
 
 impl SseDecoder {
     fn new() -> Self {
         Self::default()
+    }
+
+    /// Feed raw bytes as they arrive from the transport; returns the payloads
+    /// of all events completed by them (usually zero or one).
+    ///
+    /// Only complete UTF-8 is decoded: a trailing partial sequence is held in
+    /// `pending` for the next feed, so a chunk boundary can never corrupt
+    /// text into U+FFFD. Genuinely invalid bytes (not fixable by more data)
+    /// are replaced with U+FFFD.
+    fn feed_bytes(&mut self, bytes: &[u8]) -> Vec<String> {
+        self.pending.extend_from_slice(bytes);
+        if !self.started {
+            self.started = true;
+            // Spec: a single leading U+FEFF is ignored. (If the BOM itself is
+            // split across feeds, the tail decodes to U+FEFF in the first
+            // line, which the JSON parse of real providers never produces.)
+            if self.pending.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                self.pending.drain(..3);
+            }
+        }
+        let mut text = String::new();
+        let mut consumed = 0;
+        while consumed < self.pending.len() {
+            match std::str::from_utf8(&self.pending[consumed..]) {
+                Ok(s) => {
+                    text.push_str(s);
+                    consumed = self.pending.len();
+                }
+                Err(e) => {
+                    let end = consumed + e.valid_up_to();
+                    text.push_str(
+                        std::str::from_utf8(&self.pending[consumed..end])
+                            .expect("bytes up to valid_up_to are valid UTF-8"),
+                    );
+                    match e.error_len() {
+                        Some(bad) => {
+                            text.push('\u{FFFD}');
+                            consumed = end + bad;
+                        }
+                        // Incomplete trailing sequence: wait for more bytes.
+                        None => {
+                            consumed = end;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        self.pending.drain(..consumed);
+        self.feed(&text)
     }
 
     /// Feed a text fragment; returns the payloads of all events completed by
@@ -511,10 +765,17 @@ impl SseDecoder {
         events
     }
 
-    /// Flush any unterminated trailing line and any event that ended without
-    /// its blank-line terminator (end of stream).
+    /// Flush any undecoded trailing bytes (lossily), any unterminated
+    /// trailing line, and any event that ended without its blank-line
+    /// terminator (end of stream).
     fn finish(&mut self) -> Vec<String> {
         let mut events = Vec::new();
+        if !self.pending.is_empty() {
+            // Bytes that never completed a UTF-8 sequence before EOF.
+            let tail = String::from_utf8_lossy(&self.pending).into_owned();
+            self.pending.clear();
+            events.extend(self.feed(&tail));
+        }
         if !self.buf.is_empty() {
             let line = std::mem::take(&mut self.buf);
             if let Some(payload) = self.process_line(line.trim_end_matches('\r')) {
@@ -546,6 +807,9 @@ impl SseDecoder {
             // Per spec, a single leading space after the colon is stripped.
             self.data_lines
                 .push(data.strip_prefix(' ').unwrap_or(data).to_owned());
+        } else if line == "data" {
+            // Per spec, a field with no colon has the empty string as value.
+            self.data_lines.push(String::new());
         }
         None
     }
@@ -554,6 +818,11 @@ impl SseDecoder {
 /// Apply one decoded SSE `data:` payload to the accumulator, invoking
 /// `on_token` for text deltas. Returns `Ok(true)` on the terminal `[DONE]`
 /// sentinel.
+///
+/// Fail-fast policy: one malformed payload aborts the whole stream
+/// (discarding accumulated deltas) rather than guessing which bytes to skip
+/// — after a desynchronized JSON parse, event boundaries can no longer be
+/// trusted. Empty payloads (bare `data:` keep-alives) are skipped.
 fn handle_sse_payload(
     payload: &str,
     acc: &mut StreamAccumulator,
@@ -562,6 +831,9 @@ fn handle_sse_payload(
     let trimmed = payload.trim();
     if trimmed == "[DONE]" {
         return Ok(true);
+    }
+    if trimmed.is_empty() {
+        return Ok(false);
     }
 
     let value: Value = serde_json::from_str(trimmed)
@@ -623,23 +895,15 @@ impl ChatModel for OpenAiCompatibleClient {
             body["tools"] = Value::Array(tools.to_vec());
         }
 
-        let mut request = self.client.post(self.endpoint()).json(&body);
-        if let Some(key) = &self.api_key {
-            request = request.bearer_auth(key);
-        }
-
-        let response = request.send().await.map_err(|e| {
-            AgentGraphError::Llm(format!("request to {} failed: {e}", self.base_url))
-        })?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(AgentGraphError::Llm(format!(
-                "chat completions returned {status}: {}",
-                text.chars().take(512).collect::<String>()
-            )));
-        }
+        let response = self
+            .send_with_retries(|| {
+                let mut request = self.client.post(self.endpoint()).json(&body);
+                if let Some(key) = &self.api_key {
+                    request = request.bearer_auth(key);
+                }
+                request
+            })
+            .await?;
 
         let wire: WireResponse = response.json().await.map_err(|e| {
             AgentGraphError::Llm(format!("malformed chat completions response: {e}"))
@@ -675,23 +939,15 @@ impl ChatModel for OpenAiCompatibleClient {
             body["tools"] = Value::Array(tools.to_vec());
         }
 
-        let mut request = self.client.post(self.endpoint()).json(&body);
-        if let Some(key) = &self.api_key {
-            request = request.bearer_auth(key);
-        }
-
-        let mut response = request.send().await.map_err(|e| {
-            AgentGraphError::Llm(format!("request to {} failed: {e}", self.base_url))
-        })?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(AgentGraphError::Llm(format!(
-                "chat completions returned {status}: {}",
-                text.chars().take(512).collect::<String>()
-            )));
-        }
+        let mut response = self
+            .send_with_retries(|| {
+                let mut request = self.client.post(self.endpoint()).json(&body);
+                if let Some(key) = &self.api_key {
+                    request = request.bearer_auth(key);
+                }
+                request
+            })
+            .await?;
 
         // Read the body as raw bytes and decode SSE manually (`chunk()` is
         // used because the `stream` feature of reqwest is not enabled; the
@@ -711,7 +967,7 @@ impl ChatModel for OpenAiCompatibleClient {
                     )))
                 }
             };
-            for payload in decoder.feed(&String::from_utf8_lossy(&bytes)) {
+            for payload in decoder.feed_bytes(&bytes) {
                 if handle_sse_payload(&payload, &mut acc, on_token)? {
                     done = true;
                     break;
@@ -889,5 +1145,176 @@ mod tests {
             Some("full answer"),
             "the fallback returns the chat() response unchanged"
         );
+    }
+
+    #[test]
+    fn feed_bytes_preserves_multibyte_chars_split_across_chunks() {
+        let mut decoder = SseDecoder::new();
+        // "你" is E4 BD A0 in UTF-8; split the sequence across two feeds.
+        let mut first = b"data: {\"c\":\"".to_vec();
+        first.push(0xE4);
+        assert!(decoder.feed_bytes(&first).is_empty());
+        assert!(decoder.feed_bytes(&[0xBD, 0xA0]).is_empty());
+        let events = decoder.feed_bytes(b"\"}\n\n");
+        assert_eq!(events, vec!["{\"c\":\"你\"}".to_string()]);
+    }
+
+    #[test]
+    fn sse_strips_leading_bom_and_handles_bare_data_line() {
+        let mut decoder = SseDecoder::new();
+        assert!(decoder.feed_bytes(&[0xEF, 0xBB, 0xBF]).is_empty());
+        // A bare `data` line (no colon) is an empty-string field per spec.
+        assert_eq!(decoder.feed("data\n\n"), vec![String::new()]);
+        assert_eq!(decoder.feed("data: x\n\n"), vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn empty_payload_is_skipped_not_parsed() {
+        let mut acc = StreamAccumulator::default();
+        let mut on_token = |_chunk: TokenChunk| {};
+        // Bare `data:` keep-alive events decode to empty payloads and must
+        // not abort the stream as "malformed JSON".
+        assert!(!handle_sse_payload("", &mut acc, &mut on_token).unwrap());
+    }
+
+    #[test]
+    fn client_debug_redacts_the_api_key() {
+        let client =
+            OpenAiCompatibleClient::new("http://localhost", Some("sk-secret-123".into()), "m");
+        let debug = format!("{client:?}");
+        assert!(!debug.contains("sk-secret-123"), "got: {debug}");
+        assert!(debug.contains("***"), "got: {debug}");
+
+        let no_key = OpenAiCompatibleClient::new("http://localhost", None, "m");
+        assert!(format!("{no_key:?}").contains("api_key: None"));
+    }
+
+    // ---------- retry policy over a hand-rolled mock HTTP server ----------
+
+    /// Start a minimal HTTP/1.1 server; `handler` maps the 1-based attempt
+    /// number to a (status, body) response.
+    fn start_http_mock(
+        handler: impl Fn(usize) -> (u16, String) + Send + Sync + 'static,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempts = StdArc::new(AtomicUsize::new(0));
+        let attempts2 = attempts.clone();
+        let handler = StdArc::new(handler);
+        tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                let attempts = attempts2.clone();
+                let handler = handler.clone();
+                tokio::spawn(async move {
+                    // Read the request: headers up to \r\n\r\n, then the
+                    // content-length bytes of body (contents irrelevant).
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&buf[..pos]).to_lowercase();
+                            let len: usize = headers
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse().ok())
+                                .unwrap_or(0);
+                            if buf.len() >= pos + 4 + len {
+                                break;
+                            }
+                        }
+                        let Ok(n) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let n = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                    let (status, body) = handler(n);
+                    let reason = match status {
+                        200 => "OK",
+                        400 => "Bad Request",
+                        429 => "Too Many Requests",
+                        500 => "Internal Server Error",
+                        _ => "Status",
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\n\
+                         content-type: application/json\r\n\
+                         content-length: {}\r\n\
+                         connection: close\r\n\
+                         \r\n\
+                         {body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (addr, attempts)
+    }
+
+    #[tokio::test]
+    async fn chat_retries_transient_5xx_then_succeeds() {
+        let (addr, attempts) = start_http_mock(|n| {
+            if n < 3 {
+                (500, r#"{"error":"overloaded"}"#.to_string())
+            } else {
+                (
+                    200,
+                    r#"{"choices":[{"message":{"role":"assistant","content":"hi after retry"}}]}"#
+                        .to_string(),
+                )
+            }
+        });
+        let client = OpenAiCompatibleClient::new(format!("http://{addr}"), None, "m")
+            .with_backoff(Duration::from_millis(1));
+        let response = client.chat(&[ChatMessage::user("hi")], &[]).await.unwrap();
+        assert_eq!(response.message.content.as_deref(), Some("hi after retry"));
+        // 1 initial + 2 retries = 3 attempts.
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn chat_does_not_retry_fatal_4xx() {
+        let (addr, attempts) =
+            start_http_mock(|_n| (400, r#"{"error":"bad request"}"#.to_string()));
+        let client = OpenAiCompatibleClient::new(format!("http://{addr}"), None, "m")
+            .with_backoff(Duration::from_millis(1));
+        let err = client
+            .chat(&[ChatMessage::user("hi")], &[])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("400"), "got: {err}");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn chat_gives_up_after_retries_exhausted() {
+        let (addr, attempts) =
+            start_http_mock(|_n| (429, r#"{"error":"rate limited"}"#.to_string()));
+        let client = OpenAiCompatibleClient::new(format!("http://{addr}"), None, "m")
+            .with_retries(1)
+            .with_backoff(Duration::from_millis(1));
+        let err = client
+            .chat(&[ChatMessage::user("hi")], &[])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("429"), "got: {err}");
+        // 1 initial + 1 retry = 2 attempts.
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

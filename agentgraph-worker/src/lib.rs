@@ -48,10 +48,21 @@
 //! ```ignore
 //! builder.add_node("greeter", RemoteNode::new("greeter", "http://127.0.0.1:8200"));
 //! ```
+//!
+//! ## Error semantics across the wire
+//!
+//! Handler errors are flattened to a message string in
+//! [`NodeTaskResponse::error`] and arrive client-side as
+//! `AgentGraphError::Node`, which the executor treats as a **hard failure** —
+//! the retryable classes (`Llm`, `Tool`) do not survive the wire. A remote
+//! node whose transient failures should be retried must therefore rely on
+//! transport-level retry (connection/timeout/5xx on the client) or surface
+//! retryable outcomes through its own protocol on top of `extra`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use agentgraph::error::AgentGraphError;
 use agentgraph::node::{Node, NodeContext};
 use agentgraph::remote::{NodeTask, NodeTaskResponse, PROTOCOL_VERSION};
 use axum::extract::State as AxumState;
@@ -61,6 +72,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use serde::Serialize;
 use serde_json::{json, Value};
+use tracing::Instrument;
 use uuid::Uuid;
 
 /// The registry of named node handlers a worker serves.
@@ -156,9 +168,12 @@ async fn ok_handler(AxumState(registry): AxumState<SharedRegistry>) -> Json<OkRe
 /// Status codes:
 ///
 /// - `200 OK` for all handler-level outcomes (success, handler error,
-///   interrupt, unknown handler) — outcome lives in the response body, so
-///   `RemoteNode` never mistakes a worker-side application error for a
-///   transport failure.
+///   interrupt, unknown handler, handler panic) — outcome lives in the
+///   response body, so `RemoteNode` never mistakes a worker-side application
+///   error for a transport failure. A panicking handler is caught and
+///   returned as an error body rather than dropped connection, because the
+///   client retries transport failures and node logic must not be replayed
+///   silently.
 /// - `400 Bad Request` when the protocol version is unsupported (a
 ///   client/worker mismatch the client should not retry blindly).
 async fn execute_handler(
@@ -174,8 +189,18 @@ async fn execute_handler(
         step = task.config.step,
         protocol_version = task.protocol_version,
     );
-    let _enter = span.enter();
+    // Attached via `.instrument()` (never `.enter()`) so no span guard is
+    // held across `.await` points — the same discipline as the core
+    // executor, which otherwise misattributes spans on multi-threaded
+    // runtimes.
+    execute_task(registry, task).instrument(span).await
+}
 
+/// The body of `execute_handler`, run inside the `execute` span.
+async fn execute_task(
+    registry: SharedRegistry,
+    task: NodeTask,
+) -> (StatusCode, Json<NodeTaskResponse>) {
     if task.protocol_version != PROTOCOL_VERSION {
         tracing::warn!("unsupported protocol version");
         return (
@@ -189,19 +214,48 @@ async fn execute_handler(
 
     let Some(handler) = registry.handler(&task.node) else {
         tracing::warn!("no handler registered for node");
+        let mut registered: Vec<&str> = registry.names().collect();
+        registered.sort_unstable();
         return (
             StatusCode::OK,
             Json(NodeTaskResponse::error(format!(
-                "no handler registered for node `{}` on this worker (registered: {:?})",
+                "no handler registered for node `{}` on this worker (registered: {registered:?})",
                 task.node,
-                registry.names().collect::<Vec<_>>()
             ))),
         );
     };
 
+    let node_name = task.node.clone();
     let resuming = task.config.resume.is_some();
     let ctx = NodeContext::new(task.state, task.config);
-    match handler.run(ctx).await {
+    // The handler runs on its own task so a panic surfaces as a `JoinError`
+    // instead of tearing down the connection: a dropped connection reaches
+    // the client as a *transport* failure, which `RemoteNode` retries —
+    // silently replaying node logic the protocol says must never be
+    // replayed. Mapping the panic to a 200 + error body keeps it a hard,
+    // non-retried node failure.
+    let outcome = tokio::spawn(async move { handler.run(ctx).await }).await;
+    let result = match outcome {
+        Ok(result) => result,
+        Err(join_err) => {
+            let detail = if join_err.is_panic() {
+                let payload = join_err.into_panic();
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_owned())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_owned());
+                format!("handler panicked: {message}")
+            } else {
+                // Only reachable if the runtime is shutting down mid-request.
+                "handler task cancelled".to_owned()
+            };
+            Err(AgentGraphError::Node(format!(
+                "node `{node_name}` {detail}"
+            )))
+        }
+    };
+    match result {
         Ok(output) => {
             tracing::info!(resuming, "node executed");
             (StatusCode::OK, Json(NodeTaskResponse::ok(output)))

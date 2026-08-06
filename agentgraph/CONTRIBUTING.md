@@ -51,17 +51,22 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 | `src/state.rs` | `State`, `StateSpec`, `Reducer` | The `LastValue` single-write-per-super-step rule and undeclared-channel rejection live in `StateSpec::apply_super_step`; keep super-steps transactional. |
 | `src/node.rs` | `Node` trait, `NodeContext`, `NodeOutput`, `Command` | Nodes see only an immutable snapshot; document idempotency requirements when touching interrupt/resume helpers. |
 | `src/graph.rs` | `GraphBuilder`, `Graph`, `Edge`, `Route`, `Send` | `compile()` must validate everything that *can* be validated before execution; router/`Send` targets are data-dependent and validated at runtime by the executor. |
-| `src/executor.rs` | `Executor`, `RunConfig`, `ExecutionOutcome`, `GraphEvent` | The super-step algorithm is specified in the `run()` doc comment — implement exactly that contract (barrier, transactional merge, routing precedence, best-effort event emission). **Current status: `todo!()` — the top good-first-issue.** |
-| `src/checkpoint.rs` | `Checkpointer` trait, `Checkpoint`, `InMemoryCheckpointer`, `JsonFileCheckpointer` | Checkpoints happen only at super-step boundaries. `put` must never overwrite an existing id. `JsonFileCheckpointer` is declared but `todo!()` (pure `serde_json` + `tokio::fs`, no DB deps). |
+| `src/executor.rs` | `Executor`, `RunConfig`, `ExecutionOutcome`, `GraphEvent` | The super-step algorithm is specified in the `run()` doc comment: barrier, transactional merge, routing precedence, best-effort event emission. Honor that contract exactly; changes here are semantics changes (see "Semantics over churn" below). |
+| `src/checkpoint.rs` | `Checkpointer` trait, `Checkpoint`, `InMemoryCheckpointer`, `JsonFileCheckpointer` | Checkpoints happen only at super-step boundaries. `put` must never overwrite an existing id. `get_by_id` and `fork_thread` are default trait methods; a backend with globally unique ids must override `fork_thread`. |
+| `src/checkpoint_postgres.rs` | `PostgresCheckpointer` (feature `postgres`) | Auto-migrates its table on first use inside a transaction holding an advisory lock. Keep observable behavior identical to the other checkpointers. |
 | `src/llm.rs` | `ChatModel` trait, `ChatMessage`/`ToolCall` wire types, `OpenAiCompatibleClient` | Wire format follows OpenAI chat-completions; keep the trait minimal so Rig/async-openai/genai adapters stay thin. |
 | `src/tool.rs` | `Tool` trait, `ToolRegistry`, `ToolExecutor` | `execute_batch` must stay parallel, order-stable, and failure-isolating (a failed call becomes an `ERROR:` tool message, not a batch failure). |
+| `src/react.rs` | `react::create_react_agent` | The prebuilt `agent → tools → agent` loop is assembled from plain nodes and edges; keep it a consumer of the public API, not a privileged path. |
+| `src/mcp.rs` | MCP client (stdio transport) | MCP tool servers register into `ToolRegistry` / `ToolExecutor` exactly like native tools. |
+| `src/remote.rs` | `RemoteNode`, `NodeTask` / `NodeTaskResponse` wire protocol | Protocol evolution is additive-only within v1. Only transport-class failures are retried; worker-reported errors and interrupts are definitive. |
+| `src/wasm_node.rs` | `WasmNode` (feature `wasm`) | Sandboxed execution behind the same `Node` trait; capability isolation is the point, so widen the host surface only with care. |
 
 ### Good first issues
 
-1. **Executor super-step loop** (`src/executor.rs`) — fully specified in its doc comment, including the interrupt and `Send` handling.
-2. **`JsonFileCheckpointer`** (`src/checkpoint.rs`) — signatures are stable; write to temp file + rename for atomicity.
-3. **Examples** under `examples/` (quickstart, ReAct agent, HITL approval, map-reduce fan-out).
-4. **Provider adapters** — `ChatModel` impls wrapping Rig / `async-openai` / `genai`, behind feature flags.
+1. **Provider adapters** — `ChatModel` impls wrapping Rig / `async-openai` / `genai`, behind feature flags.
+2. **GenAI span attributes** (`agentgraph-otel`) — map the executor's existing `tracing` spans to the OpenTelemetry GenAI semantic conventions.
+3. **Examples** — the four under `examples/` cover the core patterns; new runnable demos (for example, local and remote nodes in one graph) are welcome.
+4. **WASM target exploration** — running graphs in browser or edge runtimes (sans native checkpointers) is on the roadmap; spike PRs welcome.
 
 ## PR guidelines
 

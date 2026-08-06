@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::FutureExt;
 use serde_json::{json, Value};
 
 use crate::error::{AgentGraphError, Result};
@@ -143,29 +144,53 @@ impl ToolExecutor {
     /// call yields a tool message whose content is the error description
     /// (prefixed with `ERROR:`), so the model can observe and recover from
     /// tool failures — matching `ToolNode`'s default `handle_tool_errors`
-    /// behavior.
+    /// behavior. A *panicking* tool is contained the same way: the unwind is
+    /// caught and reported as an `ERROR:` tool message instead of taking
+    /// down the batch (and the executor task driving it).
     pub async fn execute_batch(&self, calls: &[ToolCall]) -> Vec<ChatMessage> {
         let futures = calls.iter().map(|call| {
             let registry = self.registry.clone();
             async move {
-                let result: Result<String> = async {
+                let result = std::panic::AssertUnwindSafe(async {
                     let tool = registry.get(&call.name).ok_or_else(|| {
                         AgentGraphError::Tool(format!("unknown tool `{}`", call.name))
                     })?;
                     let value = tool.call(call.arguments.clone()).await?;
-                    Ok(match value {
+                    Ok::<String, AgentGraphError>(match value {
                         Value::String(s) => s,
                         other => other.to_string(),
                     })
-                }
+                })
+                .catch_unwind()
                 .await;
                 match result {
-                    Ok(content) => ChatMessage::tool_result(&call.id, content),
-                    Err(e) => ChatMessage::tool_result(&call.id, format!("ERROR: {e}")),
+                    Ok(Ok(content)) => ChatMessage::tool_result(&call.id, content),
+                    Ok(Err(e)) => ChatMessage::tool_result(&call.id, format!("ERROR: {e}")),
+                    Err(payload) => ChatMessage::tool_result(
+                        &call.id,
+                        format!(
+                            "ERROR: tool `{}` panicked: {}",
+                            call.name,
+                            // `&*`: `&payload` would unsize-coerce the *Box*
+                            // itself into `&dyn Any`, hiding the real payload.
+                            panic_message(&*payload)
+                        ),
+                    ),
                 }
             }
         });
         futures::future::join_all(futures).await
+    }
+}
+
+/// Best-effort extraction of a panic payload for error reporting.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string payload>".to_owned()
     }
 }
 
@@ -246,5 +271,46 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("unknown tool"));
+    }
+
+    struct Panic;
+
+    #[async_trait]
+    impl Tool for Panic {
+        fn name(&self) -> &str {
+            "panic"
+        }
+        fn description(&self) -> &str {
+            "Always panics."
+        }
+        fn parameters_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        async fn call(&self, _args: Value) -> Result<Value> {
+            panic!("kaboom");
+        }
+    }
+
+    #[tokio::test]
+    async fn panicking_tool_is_contained_as_error_message() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Echo);
+        registry.register(Panic);
+        let executor = ToolExecutor::new(registry);
+
+        let calls = vec![
+            ToolCall::new("c1", "panic", json!({})),
+            ToolCall::new("c2", "echo", json!({"text": "still alive"})),
+        ];
+        let results = executor.execute_batch(&calls).await;
+
+        // The panic joins the same ERROR: channel as ordinary failures, and
+        // the rest of the batch completes normally.
+        assert_eq!(results.len(), 2);
+        let msg = results[0].content.as_deref().unwrap();
+        assert!(msg.starts_with("ERROR:"), "got: {msg}");
+        assert!(msg.contains("panicked"), "got: {msg}");
+        assert!(msg.contains("kaboom"), "got: {msg}");
+        assert_eq!(results[1].content.as_deref(), Some("still alive"));
     }
 }

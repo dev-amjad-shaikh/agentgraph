@@ -67,6 +67,14 @@ pub enum ExecutionOutcome {
     /// A node called `interrupt(payload)`: the run is suspended and
     /// resumable. Carry on by calling [`Executor::run`] again with the same
     /// `thread_id` and `RunConfig::resume` set.
+    ///
+    /// Suspension is run-wide, not node-local. The in-flight super-step is
+    /// transactional: every write of the step is discarded (including writes
+    /// from sibling nodes that completed before the interrupt was observed
+    /// at the barrier), still-running siblings are aborted, and the
+    /// suspension checkpoint re-schedules **every** node of the step. On
+    /// resume all of them re-execute from their start, so node logic must be
+    /// idempotent.
     Interrupted {
         /// The payload passed to `interrupt()` (surfaced to the caller,
         /// e.g. a human-approval request).
@@ -74,7 +82,9 @@ pub enum ExecutionOutcome {
         /// The state as of the suspension point.
         state: State,
         /// The checkpoint persisted at the suspension point, for resuming
-        /// or time travel.
+        /// or time travel. When the executor has no checkpointer attached,
+        /// the run still suspends but nothing is persisted: the id is then
+        /// only an opaque handle and can never be replayed.
         checkpoint_id: String,
     },
 }
@@ -88,14 +98,15 @@ impl ExecutionOutcome {
         }
     }
 
-    /// `true` if the run was interrupted.
+    /// Whether the run ended in [`ExecutionOutcome::Interrupted`] (suspended,
+    /// resumable) rather than [`ExecutionOutcome::Done`].
     pub fn is_interrupted(&self) -> bool {
         matches!(self, ExecutionOutcome::Interrupted { .. })
     }
 }
 
 /// Per-run configuration (the LangGraph `RunnableConfig` analog).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RunConfig {
     /// Thread (session) id. Stable across interrupt/resume; namespaces all
     /// checkpoints for this run. Required for persistence and resume.
@@ -107,9 +118,16 @@ pub struct RunConfig {
     pub max_steps: usize,
 
     /// Resume value for continuing an interrupted run. When set, the
-    /// executor restores the latest checkpoint for `thread_id` and the
-    /// interrupted node re-executes with
+    /// executor restores the latest checkpoint for `thread_id` and
+    /// re-executes the checkpointed next-node set with
     /// [`crate::node::NodeContext::resume_value`] returning this value.
+    ///
+    /// The value is **broadcast**: every node scheduled in the first
+    /// super-step after the resume observes it, not only the node that
+    /// originally interrupted (a suspension checkpoint re-schedules the
+    /// whole active set — see [`ExecutionOutcome::Interrupted`]). Nodes that
+    /// should react only when they themselves were resumed must key off
+    /// their own state, not the presence of a resume value.
     pub resume: Option<Value>,
 
     /// Replay/time-travel handle: the id of a specific checkpoint of
@@ -134,6 +152,16 @@ pub struct RunConfig {
     /// super-step boundaries). Consumers implement LangGraph's stream modes
     /// (`values` / `updates` / `tasks` / ...) as filters over this stream.
     pub event_tx: Option<mpsc::Sender<GraphEvent>>,
+}
+
+impl Default for RunConfig {
+    /// A config with an empty `thread_id` and the default step limit —
+    /// identical to `RunConfig::new("")`. Derived `Default` would zero
+    /// `max_steps`, so any `default()`-built run would instantly trip the
+    /// step guard; keep this impl in sync with [`RunConfig::new`].
+    fn default() -> Self {
+        Self::new(String::new())
+    }
 }
 
 impl RunConfig {
@@ -186,7 +214,9 @@ impl RunConfig {
     }
 }
 
-/// Default super-step limit (matches LangGraph's default `recursion_limit`).
+/// Default super-step limit. Deliberately far above LangGraph's default
+/// `recursion_limit` of 25: ReAct-style loops burn one super-step per
+/// agent/tool hop, so long tool chains legitimately exceed 25.
 pub const DEFAULT_MAX_STEPS: usize = 1000;
 
 /// Streaming events emitted by the executor during a run. All of LangGraph's
@@ -228,7 +258,9 @@ pub enum GraphEvent {
     StateUpdate {
         /// Super-step index at which the update was applied.
         step: usize,
-        /// The merged partial updates (`channel -> new value`).
+        /// Every channel written in this step mapped to its **post-reducer**
+        /// value (e.g. the full appended list for an `Append` channel), read
+        /// back from the merged state — not the raw per-node partials.
         updates: serde_json::Map<String, Value>,
     },
     /// A checkpoint was persisted at a super-step boundary.
@@ -295,7 +327,8 @@ impl Executor {
         self.token_tx.as_ref()
     }
 
-    /// The configured checkpointer, if any.
+    /// The configured checkpointer, if any. Shared (not consumed) so one
+    /// `Executor` can drive many concurrent runs over the same store.
     pub fn checkpointer(&self) -> Option<&Arc<dyn Checkpointer>> {
         self.checkpointer.as_ref()
     }
@@ -316,51 +349,20 @@ impl Executor {
     /// - `config`: run configuration (thread id, step limit, resume value,
     ///   streaming sink).
     ///
-    /// # Super-step algorithm (implementation plan)
+    /// # Super-step semantics
     ///
-    /// ```text
-    /// state := initial_state
-    /// active := if config.resume.is_some() && checkpoint exists {
-    ///               (state, next_nodes) := checkpointer.get_latest(thread_id)
-    ///           } else { [graph.entry_point()] }
-    /// loop over step in 0..config.max_steps {
-    ///     emit GraphEvent::SuperStep { step, active }
-    ///     snapshot := state.clone()                      // immutable for the step
-    ///     join_set := JoinSet::new()
-    ///     for node_name in active {
-    ///         node := graph.node(node_name)              // Arc<dyn Node>
-    ///         ctx := NodeContext::new(snapshot.clone(), NodeConfig {
-    ///                   thread_id, step, resume: (only for the resumed node), .. })
-    ///         join_set.spawn(node.run(ctx))              // parallel compute
-    ///         emit GraphEvent::NodeStart { node, step }
-    ///     }
-    ///     // ---- barrier: collect results; any failure aborts the step ----
-    ///     writes: Vec<(node_name, updates)> ; commands: Vec<Command>
-    ///     for result in join_set.join_all().await {
-    ///         match result {
-    ///             Ok(NodeOutput { updates, command }) => { writes.push(..); collect command }
-    ///             Err(Interrupt { value }) => {
-    ///                 checkpoint := put(step, state, next_nodes = [interrupting node])
-    ///                 return Ok(ExecutionOutcome::Interrupted { value, state, checkpoint_id })
-    ///             }
-    ///             Err(e) => return Err(e)                // step discarded (transactional)
-    ///         }
-    ///         emit GraphEvent::NodeEnd { node, step }
-    ///     }
-    ///     // ---- merge: reducers + LastValue single-write validation ----
-    ///     spec.apply_super_step(&mut state, writes)?     // InvalidUpdate on conflict
-    ///     emit GraphEvent::StateUpdate { step, updates }
-    ///     // ---- route: commands override edges; else evaluate outgoing edges ----
-    ///     //   Command::goto / Route::Node      -> activate named nodes
-    ///     //   Route::Send(sends)               -> apply each send.state via spec, activate send.node
-    ///     //   Route::End / empty next set      -> checkpoint & return Done(state)
-    ///     // ---- checkpoint at the boundary ----
-    ///     checkpoint := Checkpoint { id: uuid v4, thread_id, step, state, next_nodes }
-    ///     checkpointer.put(checkpoint).await?            // when configured
-    ///     emit GraphEvent::CheckpointSaved { checkpoint_id, step }
-    /// }
-    /// Err(Graph("max_steps exceeded"))                   // recursion limit guard
-    /// ```
+    /// Each loop iteration runs one super-step as a transaction: the active
+    /// nodes execute in parallel over an immutable start-of-step snapshot;
+    /// the barrier discards the whole step's writes on any node failure and
+    /// suspends the run on an interrupt; only then are writes merged via the
+    /// channel reducers, routing computed against the post-barrier state,
+    /// and a boundary checkpoint persisted. The module-level docs enumerate
+    /// the six phases; `execute_super_step` is the implementation.
+    ///
+    /// The loop returns [`ExecutionOutcome::Done`] when routing yields an
+    /// empty next set, [`ExecutionOutcome::Interrupted`] when a node
+    /// interrupts, and an [`AgentGraphError::Graph`] error once
+    /// `config.max_steps` super-steps have run without termination.
     pub async fn run(
         &self,
         graph: &Graph,
@@ -399,8 +401,9 @@ impl Executor {
         //
         // On resume the checkpointed state and next-node set take precedence
         // over `initial_state`; the resume value is delivered to the first
-        // super-step (whose active set is exactly the interrupted node set)
-        // via `NodeContext::resume_value()`.
+        // super-step (whose active set is the checkpointed next-node set —
+        // after an interrupt, every node of the suspended step) via
+        // `NodeContext::resume_value()`.
         //
         // Time travel: when `config.checkpoint_id` is set, THAT checkpoint is
         // restored instead of the latest — this is replay from an arbitrary
@@ -475,9 +478,8 @@ impl Executor {
                 )));
             }
 
-            // One span per super-step covering plan -> barrier -> merge ->
-            // route (and the boundary checkpoint). The step body runs in a
-            // dedicated method so the whole body is one instrumented future.
+            // The step body runs in a dedicated method so the whole body is
+            // one instrumented future under the per-step span.
             let step_span = tracing::debug_span!(
                 "agentgraph.super_step",
                 step = step,
@@ -532,7 +534,7 @@ impl Executor {
         step: usize,
         pending_resume: &mut Option<Value>,
     ) -> Result<StepTransition> {
-        // -- plan: the active set is fully determined at this point.
+        // -- plan.
         Self::emit(
             config,
             GraphEvent::SuperStep {
@@ -541,11 +543,9 @@ impl Executor {
             },
         );
 
-        // -- compute: run every active node concurrently over an
-        //    immutable snapshot of the start-of-step state. Scoped
-        //    (Send) state is overlaid onto that invocation's private
-        //    copy of the snapshot, so fan-out items never collide in
-        //    the shared state.
+        // -- compute. Scoped (Send) state is overlaid onto each invocation's
+        //    private copy of the start-of-step snapshot, so fan-out items
+        //    never collide in the shared state.
         let snapshot = state.clone();
         let mut join_set: JoinSet<(String, Result<NodeOutput>)> = JoinSet::new();
 
@@ -654,18 +654,23 @@ impl Executor {
         }
 
         if let Some((name, value)) = interrupted {
-            // Suspend the run: discard the in-flight step and persist a
-            // checkpoint scheduling the interrupted node to re-run on
-            // resume. Dropping the JoinSet first aborts stragglers,
-            // preserving the transactional suspension point.
+            // Suspend the run. The step is transactional, so no write of
+            // this step survived — not even from siblings that completed
+            // before the interrupt reached the barrier. The suspension
+            // checkpoint therefore re-schedules the ENTIRE active set (the
+            // interrupting node plus all siblings), otherwise completed
+            // siblings' discarded writes would be silently lost and aborted
+            // siblings would never re-run. Dropping the JoinSet first aborts
+            // stragglers, preserving the transactional suspension point.
             drop(join_set);
             tracing::info!(
                 node = %name,
                 step = step,
                 "node interrupted; run suspended (resumable via RunConfig::resume)"
             );
+            let pending: Vec<String> = active.iter().map(|t| t.name.clone()).collect();
             let checkpoint =
-                Checkpoint::new(config.thread_id.clone(), step, state.clone(), vec![name]);
+                Checkpoint::new(config.thread_id.clone(), step, state.clone(), pending);
             let checkpoint_id = checkpoint.id.clone();
             if let Some(checkpointer) = &self.checkpointer {
                 checkpointer.put(checkpoint).await?;
@@ -687,13 +692,21 @@ impl Executor {
         // -- merge: reducers + LastValue single-write validation. On
         //    error the mutated state is dropped with the run
         //    (transactional super-step).
+        let written_channels: HashSet<String> = writes
+            .iter()
+            .flat_map(|(_, updates)| updates.keys().cloned())
+            .collect();
+        spec.apply_super_step(state, writes)?;
+        // The event carries the post-reducer values read back out of the
+        // merged state: when several nodes write the same channel in one
+        // step (the normal Append fan-in case), reporting the raw partials
+        // would keep only the last write and hide the rest.
         let mut merged_updates = serde_json::Map::new();
-        for (_node, updates) in &writes {
-            for (channel, value) in updates {
+        for channel in &written_channels {
+            if let Some(value) = state.get(channel) {
                 merged_updates.insert(channel.clone(), value.clone());
             }
         }
-        spec.apply_super_step(state, writes)?;
         let channels_written: Vec<&str> = merged_updates.keys().map(String::as_str).collect();
         tracing::debug!(
             step = step,
@@ -985,10 +998,164 @@ mod tests {
         }
     }
 
+    #[test]
+    fn run_config_default_uses_default_step_limit() {
+        // Regression: a derived `Default` would zero `max_steps`, making
+        // every `RunConfig::default()` run fail immediately.
+        let config = RunConfig::default();
+        assert_eq!(config.max_steps, DEFAULT_MAX_STEPS);
+        assert!(config.thread_id.is_empty());
+        assert!(config.resume.is_none() && config.checkpoint_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn interrupt_reschedules_entire_active_set() {
+        // Regression: the suspension checkpoint used to schedule only the
+        // interrupting node, silently dropping parallel siblings — including
+        // ones that had already completed, whose writes are discarded with
+        // the aborted step.
+        let spec = StateSpec::new()
+            .channel("log", Reducer::Append)
+            .channel("answer", Reducer::Overwrite);
+
+        let mut builder = GraphBuilder::new();
+        builder.add_node("start", |_ctx: NodeContext| async {
+            Ok(NodeOutput::empty())
+        });
+        builder.add_node("gate", |ctx: NodeContext| async move {
+            match ctx.resume_value() {
+                Some(v) => Ok(NodeOutput::update("answer", v.clone())),
+                None => Err(ctx.interrupt(json!({"question": "approve?"}))),
+            }
+        });
+        // Completes immediately in the interrupted step; its write is
+        // discarded with the step and must be recomputed on resume.
+        builder.add_node("fast", |_ctx: NodeContext| async {
+            Ok(NodeOutput::update("log", json!("fast")))
+        });
+        // Still in flight when the interrupt hits; aborted, re-run on resume.
+        builder.add_node("slow", |ctx: NodeContext| async move {
+            if ctx.resume_value().is_none() {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+            Ok(NodeOutput::update("log", json!("slow")))
+        });
+        builder.set_entry_point("start");
+        builder.add_edge("start", "gate");
+        builder.add_edge("start", "slow");
+        builder.add_edge("start", "fast");
+        let graph = builder.compile().unwrap();
+
+        let checkpointer = Arc::new(InMemoryCheckpointer::new());
+        let executor = Executor::with_checkpointer(checkpointer.clone());
+
+        let outcome = executor
+            .run(&graph, &spec, State::new(), RunConfig::new("t-par-hitl"))
+            .await
+            .unwrap();
+        match &outcome {
+            ExecutionOutcome::Interrupted { state, .. } => {
+                // Transactional suspension: fast's completed write was
+                // discarded with the rest of the step.
+                assert_eq!(state.get("log"), None);
+            }
+            other => panic!("expected Interrupted, got {other:?}"),
+        }
+
+        // The suspension checkpoint re-schedules every node of the step.
+        let stored = checkpointer
+            .get_latest("t-par-hitl")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut scheduled = stored.next_nodes.clone();
+        scheduled.sort_unstable();
+        assert_eq!(scheduled, ["fast", "gate", "slow"]);
+
+        // Resume: all three re-run (the resume value is broadcast to the
+        // whole step); fast's write lands exactly once.
+        let outcome = executor
+            .run(
+                &graph,
+                &spec,
+                State::new(),
+                RunConfig::new("t-par-hitl").with_resume(json!(true)),
+            )
+            .await
+            .unwrap();
+        match outcome {
+            ExecutionOutcome::Done(state) => {
+                assert_eq!(state.get("answer"), Some(&json!(true)));
+                let mut log: Vec<String> = state
+                    .get("log")
+                    .and_then(Value::as_array)
+                    .expect("log channel must exist")
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_owned())
+                    .collect();
+                log.sort_unstable();
+                assert_eq!(log, ["fast", "slow"]);
+            }
+            other => panic!("expected Done after resume, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn state_update_event_reports_post_reducer_values() {
+        // Regression: with several writers on one channel, the event used to
+        // carry raw per-node partials collapsed by last-write-wins, hiding
+        // all but one write behind its documented "merged" contract.
+        let spec = StateSpec::new().channel("results", Reducer::Append);
+
+        let mut builder = GraphBuilder::new();
+        builder.add_node("start", |_ctx: NodeContext| async {
+            Ok(NodeOutput::empty())
+        });
+        builder.add_node("worker_a", |_ctx: NodeContext| async {
+            Ok(NodeOutput::update("results", json!("a")))
+        });
+        builder.add_node("worker_b", |_ctx: NodeContext| async {
+            Ok(NodeOutput::update("results", json!("b")))
+        });
+        builder.set_entry_point("start");
+        builder.add_edge("start", "worker_a");
+        builder.add_edge("start", "worker_b");
+        let graph = builder.compile().unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<GraphEvent>(64);
+        let outcome = Executor::new()
+            .run(
+                &graph,
+                &spec,
+                State::new(),
+                RunConfig::new("t-event").with_event_tx(tx),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ExecutionOutcome::Done(_)));
+
+        let mut merged: Option<Vec<String>> = None;
+        while let Ok(event) = rx.try_recv() {
+            if let GraphEvent::StateUpdate { step: 1, updates } = event {
+                let values = updates
+                    .get("results")
+                    .and_then(Value::as_array)
+                    .expect("StateUpdate must carry the results channel")
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_owned())
+                    .collect();
+                merged = Some(values);
+            }
+        }
+        let mut merged = merged.expect("expected a StateUpdate event for step 1");
+        merged.sort_unstable();
+        // Both partial writes are visible in the single post-reducer value.
+        assert_eq!(merged, ["a", "b"]);
+    }
+
     #[tokio::test]
     async fn max_steps_guard_aborts_infinite_cycles() {
         let spec = StateSpec::new().channel("x", Reducer::Overwrite);
-
         let mut builder = GraphBuilder::new();
         builder.add_node("loop_node", |_ctx: NodeContext| async {
             Ok(NodeOutput::empty())

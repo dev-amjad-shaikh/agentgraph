@@ -482,3 +482,32 @@ test('SSE parser: api key and extra headers are sent on requests', async () => {
   assert.equal(frames.length, 1);
   assert.equal(frames[0].data.status, 'success');
 });
+
+test('runStream cancels the HTTP body when the consumer breaks early', async () => {
+  // Regression: breaking out of `for await` must tear down the response
+  // stream instead of letting it drain until the server finishes the run.
+  let cancelled = false;
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('event: updates\ndata: {}\n\n'));
+      // Never closes — simulates a long-running server stream.
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  const fakeFetch = async () =>
+    new Response(stream, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    });
+  const fake = new AgentGraphClient('http://unit.test', { fetch: fakeFetch });
+
+  let first = null;
+  for await (const frame of fake.runStream('t1')) {
+    first = frame;
+    break;
+  }
+  assert.equal(first.event, 'updates');
+  assert.ok(cancelled, 'underlying stream cancelled after early break');
+});

@@ -59,9 +59,10 @@ pub struct NodeConfig {
 
 /// The input to every node invocation.
 ///
-/// Cheap to construct per super-step; the state snapshot is cloned once per
-/// super-step by the executor and shared with all nodes in that step, so
-/// snapshot isolation is structural, not conventional.
+/// The state snapshot is cloned per node invocation, so snapshot isolation
+/// is structural, not conventional: nodes running in the same super-step
+/// each hold their own owned snapshot and can never observe each other's
+/// writes.
 #[derive(Debug, Clone)]
 pub struct NodeContext {
     state: State,
@@ -99,11 +100,20 @@ impl NodeContext {
     ///
     /// Typical pattern inside a resumable node:
     ///
-    /// ```ignore
+    /// ```
+    /// use agentgraph::node::{NodeConfig, NodeContext};
+    /// use agentgraph::state::State;
+    /// use serde_json::{json, Value};
+    ///
+    /// # fn pattern(ctx: NodeContext) -> agentgraph::error::Result<Value> {
     /// let approved = match ctx.resume_value() {
     ///     Some(v) => v.clone(),            // resumed: interrupt() "returns" v
-    ///     None => return Err(ctx.interrupt(serde_json::json!({"question": "approve?"}))),
+    ///     None => return Err(ctx.interrupt(json!({"question": "approve?"}))),
     /// };
+    /// # Ok(approved)
+    /// # }
+    /// # let ctx = NodeContext::new(State::new(), NodeConfig::default());
+    /// # assert!(pattern(ctx).unwrap_err().is_interrupt());
     /// ```
     pub fn resume_value(&self) -> Option<&Value> {
         self.config.resume.as_ref()
@@ -112,10 +122,15 @@ impl NodeContext {
     /// Build the interrupt error for a payload.
     ///
     /// Returning `Err(ctx.interrupt(payload))` from a node suspends the whole
-    /// graph: the executor discards the in-flight super-step, persists a
-    /// checkpoint, and surfaces `payload` in
-    /// [`crate::executor::ExecutionOutcome::Interrupted`]. On resume, this
-    /// node re-runs from its start with [`NodeContext::resume_value`] set.
+    /// run — not just this node. The super-step is transactional: no write of
+    /// the in-flight step survives, not even from sibling nodes that already
+    /// completed. The executor therefore persists a checkpoint that
+    /// re-schedules the **entire active set** of the suspended step — the
+    /// interrupting node plus all of its siblings — and surfaces `payload` in
+    /// [`crate::executor::ExecutionOutcome::Interrupted`]. On resume, every
+    /// node of that set re-executes from its start (node logic must be
+    /// idempotent), with [`NodeContext::resume_value`] set for the first
+    /// super-step.
     pub fn interrupt(&self, value: Value) -> AgentGraphError {
         AgentGraphError::Interrupt { value }
     }
@@ -130,6 +145,9 @@ pub struct NodeOutput {
     pub updates: HashMap<String, Value>,
 
     /// Optional dynamic routing decision (overrides static edges).
+    ///
+    /// `Some(Command::default())` is a no-op in disguise (see
+    /// [`Command::is_noop`]); prefer `None` for "no override".
     pub command: Option<Command>,
 }
 
@@ -157,7 +175,16 @@ impl NodeOutput {
         }
     }
 
+    /// Alias for [`NodeOutput::updates`] that reads better next to
+    /// [`NodeOutput::update`] / [`NodeOutput::with_update`].
+    pub fn from_updates(updates: HashMap<String, Value>) -> Self {
+        Self::updates(updates)
+    }
+
     /// An output that only routes (no state updates).
+    ///
+    /// Note that [`Command::default`] is a no-op ([`Command::is_noop`]);
+    /// wrapping one in `Some` here is accepted but has no effect.
     pub fn route(command: Command) -> Self {
         Self {
             updates: HashMap::new(),
@@ -223,6 +250,13 @@ impl Command {
             goto: Vec::new(),
             resume: Some(value),
         }
+    }
+
+    /// `true` if this command carries no routing override and no resume
+    /// value — i.e. `Command::default()`. Consumers can use this to treat
+    /// `Some(noop)` the same as `None`.
+    pub fn is_noop(&self) -> bool {
+        self.goto.is_empty() && self.resume.is_none()
     }
 }
 

@@ -7,7 +7,11 @@
 //!
 //! - an entry point must be set and must reference a known node;
 //! - every edge endpoint must reference a known node;
-//! - at least one node must be registered.
+//! - at least one node must be registered;
+//! - node names must not collide with the reserved [`END`] sentinel;
+//! - edges must be unambiguous: no duplicate `from → to` edges, at most one
+//!   conditional edge per source node, and no source node mixing static and
+//!   conditional edges.
 //!
 //! Edge types:
 //!
@@ -19,7 +23,7 @@
 //!   [`Route`] — one node, dynamic fan-out via [`Send`], or the end of the
 //!   run.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -32,8 +36,11 @@ use crate::error::{AgentGraphError, Result};
 use crate::node::Node;
 use crate::state::State;
 
-/// Sentinel node name for the terminal route. Not a real node; returned by
-/// routers as [`Route::End`] and accepted by the executor.
+/// Reserved node name for the terminal route. Not a real node: routers
+/// signal termination with [`Route::End`] instead of naming a node.
+/// [`GraphBuilder::compile`] rejects registering a node under this name (or
+/// any `__`-prefixed name) so the sentinel namespace can never collide with
+/// user nodes.
 pub const END: &str = "__end__";
 
 /// The routing decision of a conditional edge.
@@ -229,8 +236,11 @@ impl GraphBuilder {
     /// the same node activate all destinations in parallel in the next
     /// super-step.
     ///
-    /// **Do not** mix static edges and dynamic routing (`Command::goto` /
-    /// conditional edges) from the same node — both paths will execute.
+    /// [`GraphBuilder::compile`] rejects a node that has both static and
+    /// conditional edges — ambiguous routing is a compile-time error, not a
+    /// runtime surprise. Dynamic routing via `Command::goto` from a node
+    /// that also has static edges remains a runtime rule: both paths
+    /// execute.
     pub fn add_edge(&mut self, from: impl Into<String>, to: impl Into<String>) -> &mut Self {
         self.edges.push(Edge::Direct {
             from: from.into(),
@@ -242,7 +252,10 @@ impl GraphBuilder {
     /// Add a conditional edge: after `from` completes, run `router` against
     /// the post-barrier state and follow the returned [`Route`].
     ///
-    /// ```ignore
+    /// ```
+    /// use agentgraph::graph::{GraphBuilder, Route};
+    ///
+    /// let mut builder = GraphBuilder::new();
     /// builder.add_conditional_edges("agent", |state| async move {
     ///     let needs_tools = state.get("messages")
     ///         .and_then(|m| m.as_array())
@@ -278,7 +291,14 @@ impl GraphBuilder {
     /// - at least one node is registered;
     /// - the entry point is set and references a known node;
     /// - every edge endpoint (`from`, and `to` for static edges) references
-    ///   a known node.
+    ///   a known node;
+    /// - no node is registered under a reserved name ([`END`] or any
+    ///   `__`-prefixed name);
+    /// - no duplicate static `from → to` edge (a duplicate would activate
+    ///   the target twice in one super-step, which surfaces as a spurious
+    ///   double-write failure on single-write channels);
+    /// - at most one conditional edge per source node;
+    /// - no source node mixes static and conditional edges.
     ///
     /// Conditional router targets and [`Send`] node names are validated at
     /// execution time (they are data-dependent by design).
@@ -287,6 +307,15 @@ impl GraphBuilder {
             return Err(AgentGraphError::Graph(
                 "cannot compile an empty graph: register at least one node".into(),
             ));
+        }
+
+        for name in self.nodes.keys() {
+            if name == END || name.starts_with("__") {
+                return Err(AgentGraphError::Graph(format!(
+                    "node name `{name}` is reserved (`{END}` and `__`-prefixed names \
+                     form the engine's sentinel namespace)"
+                )));
+            }
         }
 
         let entry_point = self.entry_point.ok_or_else(|| {
@@ -298,6 +327,10 @@ impl GraphBuilder {
             )));
         }
 
+        let mut direct_edges: HashSet<(&str, &str)> = HashSet::new();
+        let mut direct_sources: HashSet<&str> = HashSet::new();
+        let mut conditional_sources: HashSet<&str> = HashSet::new();
+
         for edge in &self.edges {
             let from = edge.from();
             if !self.nodes.contains_key(from) {
@@ -305,13 +338,37 @@ impl GraphBuilder {
                     "edge source `{from}` does not reference a known node"
                 )));
             }
-            if let Edge::Direct { to, .. } = edge {
-                if !self.nodes.contains_key(to) {
-                    return Err(AgentGraphError::Graph(format!(
-                        "edge target `{to}` (from `{from}`) does not reference a known node"
-                    )));
+            match edge {
+                Edge::Direct { to, .. } => {
+                    if !self.nodes.contains_key(to) {
+                        return Err(AgentGraphError::Graph(format!(
+                            "edge target `{to}` (from `{from}`) does not reference a known node"
+                        )));
+                    }
+                    if !direct_edges.insert((from, to.as_str())) {
+                        return Err(AgentGraphError::Graph(format!(
+                            "duplicate edge `{from} -> {to}`: the target would be \
+                             activated twice in one super-step"
+                        )));
+                    }
+                    direct_sources.insert(from);
+                }
+                Edge::Conditional { .. } => {
+                    if !conditional_sources.insert(from) {
+                        return Err(AgentGraphError::Graph(format!(
+                            "node `{from}` has multiple conditional edges; only one \
+                             router per source node is allowed"
+                        )));
+                    }
                 }
             }
+        }
+
+        if let Some(from) = direct_sources.intersection(&conditional_sources).next() {
+            return Err(AgentGraphError::Graph(format!(
+                "node `{from}` has both static and conditional edges; routing would \
+                 be ambiguous — use one kind per source node"
+            )));
         }
 
         Ok(Graph {
@@ -371,8 +428,8 @@ mod tests {
         assert!(b.compile().is_err());
     }
 
-    #[test]
-    fn compile_accepts_valid_graph() {
+    #[tokio::test]
+    async fn compile_accepts_valid_graph() {
         let mut b = GraphBuilder::new();
         b.add_node("agent", ok_node);
         b.add_node("tools", ok_node);
@@ -400,11 +457,56 @@ mod tests {
         let edges = graph.outgoing_edges("agent");
         let route = match edges[0] {
             Edge::Conditional { router, .. } => {
-                let r = router(State::from_value(json!({"done": true})).unwrap());
-                futures::executor::block_on(r)
+                router(State::from_value(json!({"done": true})).unwrap()).await
             }
             _ => panic!("expected conditional edge"),
         };
         assert_eq!(route.unwrap(), Route::End);
+    }
+
+    #[test]
+    fn compile_rejects_duplicate_direct_edges() {
+        let mut b = GraphBuilder::new();
+        b.add_node("a", ok_node);
+        b.add_node("b", ok_node);
+        b.set_entry_point("a");
+        b.add_edge("a", "b");
+        b.add_edge("a", "b");
+        let err = b.compile().unwrap_err();
+        assert!(matches!(err, AgentGraphError::Graph(_)));
+    }
+
+    #[test]
+    fn compile_rejects_duplicate_conditional_edges() {
+        let mut b = GraphBuilder::new();
+        b.add_node("a", ok_node);
+        b.set_entry_point("a");
+        b.add_conditional_edges("a", |_s| async { Ok(Route::End) });
+        b.add_conditional_edges("a", |_s| async { Ok(Route::End) });
+        let err = b.compile().unwrap_err();
+        assert!(matches!(err, AgentGraphError::Graph(_)));
+    }
+
+    #[test]
+    fn compile_rejects_mixed_static_and_conditional_edges() {
+        let mut b = GraphBuilder::new();
+        b.add_node("a", ok_node);
+        b.add_node("b", ok_node);
+        b.set_entry_point("a");
+        b.add_edge("a", "b");
+        b.add_conditional_edges("a", |_s| async { Ok(Route::End) });
+        let err = b.compile().unwrap_err();
+        assert!(matches!(err, AgentGraphError::Graph(_)));
+    }
+
+    #[test]
+    fn compile_rejects_reserved_node_names() {
+        for name in [END, "__internal"] {
+            let mut b = GraphBuilder::new();
+            b.add_node(name, ok_node);
+            b.set_entry_point(name);
+            let err = b.compile().unwrap_err();
+            assert!(matches!(err, AgentGraphError::Graph(_)), "name: {name}");
+        }
     }
 }

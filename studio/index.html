@@ -210,7 +210,7 @@
   <header>
     <div class="brand">agentgraph <span>Studio</span></div>
     <input class="url" id="inp-url" type="text" spellcheck="false" placeholder="http://127.0.0.1:8100">
-    <input class="key" id="inp-key" type="password" spellcheck="false" placeholder="API key (optional)">
+    <input class="key" id="inp-key" type="password" spellcheck="false" placeholder="API key (optional)" title="Stored in plaintext in this browser's localStorage — use a dev-only key.">
     <button class="primary" id="btn-connect">Connect</button>
     <span id="conn-status">not connected</span>
   </header>
@@ -645,7 +645,9 @@ async function runBackground() {
 
 function pollRun(runId) {
   stopPoll();
-  store.pollTimer = setInterval(async () => {
+  // Recursive setTimeout (not setInterval): a slow poll response must
+  // never overlap with the next tick.
+  const tick = async () => {
     try {
       const info = await api("GET", `/runs/${runId}`);
       setRunStatus(info.status, `run ${shortId(runId)} · attempt ${info.attempt}`);
@@ -654,17 +656,21 @@ function pollRun(runId) {
         showRunResult(info);
         refreshState();
         refreshHistory();
+        return;
       }
     } catch (e) {
       stopPoll();
       setRunStatus(null);
       toast(`poll failed: ${e.message}`, "err");
+      return;
     }
-  }, 800);
+    store.pollTimer = setTimeout(tick, 800);
+  };
+  store.pollTimer = setTimeout(tick, 800);
 }
 
 function stopPoll() {
-  if (store.pollTimer) { clearInterval(store.pollTimer); store.pollTimer = null; }
+  if (store.pollTimer) { clearTimeout(store.pollTimer); store.pollTimer = null; }
 }
 
 /* ---------------- run: wait ---------------- */
@@ -738,15 +744,24 @@ async function runStream(payloadOverride) {
       const { done, value } = await reader.read();
       if (done) break;
       buf += decoder.decode(value, { stream: true });
-      let idx;
-      while ((idx = buf.indexOf("\n\n")) !== -1) {
-        const raw = buf.slice(0, idx);
-        buf = buf.slice(idx + 2);
+      let match;
+      // Frames are blank-line delimited; tolerate both LF and CRLF sources.
+      while ((match = buf.match(/\r?\n\r?\n/))) {
+        const raw = buf.slice(0, match.index);
+        buf = buf.slice(match.index + match[0].length);
         const frame = parseSseFrame(raw);
         if (!frame) continue;
         feedEvent(frame.event, frame.data, frame.id);
         if (frame.event === "end") endData = frame.data;
       }
+    }
+    // EOF flush: decode any tail bytes and dispatch a trailing frame that
+    // never got its terminating blank line (both SDK parsers do this).
+    buf += decoder.decode();
+    const tail = parseSseFrame(buf);
+    if (tail) {
+      feedEvent(tail.event, tail.data, tail.id);
+      if (tail.event === "end") endData = tail.data;
     }
   } catch (e) {
     if (e.name !== "AbortError") feedEvent("error", { error: "stream", message: e.message }, "-");
@@ -769,7 +784,8 @@ function abortStream() {
 function parseSseFrame(raw) {
   let event = "message", id = "";
   const dataLines = [];
-  for (const line of raw.split("\n")) {
+  for (let line of raw.split("\n")) {
+    if (line.endsWith("\r")) line = line.slice(0, -1);   // CRLF sources
     if (!line || line.startsWith(":")) continue;          // keep-alive comments
     const colon = line.indexOf(":");
     const field = colon === -1 ? line : line.slice(0, colon);

@@ -48,12 +48,10 @@ pub(crate) struct TenantContext {
 }
 
 impl TenantContext {
-    /// A context for `tenant`.
     pub(crate) fn new(tenant: String) -> Self {
         Self { tenant }
     }
 
-    /// The tenant id.
     pub(crate) fn tenant(&self) -> &str {
         &self.tenant
     }

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """agentgraph Studio dev server — same-origin static host + API proxy.
 
-Why this exists: agentgraph-server sends no CORS headers, so a browser page
-served from file:// or any other origin cannot fetch it directly. This tiny
-stdlib-only server serves studio/index.html AND proxies /api/* to the real
+Why this exists: agentgraph-server v0.3+ sends permissive CORS headers, so
+studio/index.html can be opened straight from disk and talk to the server
+directly — this proxy is *optional*. It remains useful for older servers
+without CORS headers and for setups where same-origin is simply more
+convenient: it serves studio/index.html AND proxies /api/* to the real
 server, making the Studio and the API same-origin — no CORS involved.
 
 Usage:
@@ -31,10 +33,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     # -- static -----------------------------------------------------------
     def do_GET(self):
-        if self.path.startswith("/api/"):
+        path = urllib.parse.urlsplit(self.path).path
+        if path == "/api" or path.startswith("/api/"):
             self._proxy()
         else:
-            if self.path in ("/", ""):
+            if path in ("/", ""):
                 self.path = "/index.html"
             super().do_GET()
 
@@ -50,7 +53,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def _proxy(self):
         upstream = self.path[len("/api"):] or "/"
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self.send_error(400, "malformed Content-Length header")
+            return
         body = self.rfile.read(length) if length else None
 
         conn = http.client.HTTPConnection(self.target_host, self.target_port, timeout=600)

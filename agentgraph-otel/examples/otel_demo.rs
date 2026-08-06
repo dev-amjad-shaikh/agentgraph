@@ -199,13 +199,13 @@ async fn main() -> Result<()> {
     .expect("failed to initialize tracing");
 
     match &endpoint {
-        Some(url) => println!("tracing: stderr logs + OTLP spans -> {url}"),
+        Some(url) => {
+            println!("tracing: stderr logs + OTLP spans -> {url}");
+            println!(
+                "view traces: open http://localhost:16686 (Jaeger), service `agentgraph-otel-demo`"
+            );
+        }
         None => println!("tracing: stderr logs only (set OTEL_DEMO_ENDPOINT for OTLP export)"),
-    }
-    if endpoint.is_some() {
-        println!(
-            "view traces: open http://localhost:16686 (Jaeger), service `agentgraph-otel-demo`"
-        );
     }
 
     println!("\n--- demo 1: 2-node pipeline graph ---");

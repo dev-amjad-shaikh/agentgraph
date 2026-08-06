@@ -275,11 +275,14 @@ async fn sse_stream_emits_frames_in_order() {
     assert_eq!(frames[0].1["graph"], json!("pipeline"));
     assert!(frames[0].1["run_id"].as_str().is_some());
 
-    // updates frames carry per-step partial updates.
+    // updates frames carry per-step POST-reducer values (core deliberately
+    // changed `GraphEvent::StateUpdate.updates` to the merged state read-back:
+    // the full appended list for an `Append` channel, not the raw per-node
+    // partials).
     assert_eq!(frames[1].1["step"], json!(0));
-    assert_eq!(frames[1].1["updates"]["log"], json!("first"));
+    assert_eq!(frames[1].1["updates"]["log"], json!(["first"]));
     assert_eq!(frames[3].1["step"], json!(1));
-    assert_eq!(frames[3].1["updates"]["log"], json!("second"));
+    assert_eq!(frames[3].1["updates"]["log"], json!(["first", "second"]));
 
     // values frames carry the full state at each boundary.
     assert_eq!(frames[2].1["log"], json!(["first"]));

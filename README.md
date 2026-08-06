@@ -62,11 +62,13 @@ Both cover the full surface: threads, background/blocking/streaming runs, checkp
 
 ## Status
 
+Versions below are **platform releases**; crates are versioned independently. The crates table above and [docs/roadmap.md](docs/roadmap.md) carry the per-crate versions; [CHANGELOG.md](CHANGELOG.md) carries the history.
+
 - **v0.5.0 (2026-08-05).** SDKs & tenancy shipped: the zero-dependency Python (stdlib-only) and TypeScript (ESM) client SDKs in [`sdks/`](sdks/) — each with a live-server e2e suite — and multi-tenant auth in `agentgraph-server` v0.4.0 (per-tenant API keys, namespaced isolation of threads/runs/assistants/crons/KV, 404-not-403 cross-tenant semantics, open mode unchanged). Also: live-LLM validation of the ReAct example against real Ollama models ([docs/live-demo-transcript.md](docs/live-demo-transcript.md)) with the calculator arg-coercion fix it exposed.
 - **v0.4.0 (2026-08-05).** Production hardening shipped: sandboxed WASM nodes (`agentgraph` feature `wasm`), checkpoint time travel end-to-end (core `get_by_id` / `fork_thread` / `with_checkpoint_id`; server `POST /threads/{id}/fork` + checkpoint replay on all run endpoints), the Postgres-backed server store (`agentgraph-server` feature `postgres`), the new `agentgraph-otel` crate (OTLP export), the zero-build Studio debug UI ([`studio/`](studio/)), and permissive CORS in `router()` for browser clients. Full picture: [docs/roadmap.md](docs/roadmap.md).
 - **v0.3.0 (2026-08-05).** Interop & distribution shipped: an MCP client module (`agentgraph/src/mcp.rs`), remote nodes + the new `agentgraph-worker` crate (HITL interrupts cross the wire), `agentgraph-server` v0.2 API completion (`GET /runs/{id}`, assistants, crons, KV store), and `tracing` instrumentation in the executor.
 - **v0.2.0 / v0.1.0 (2026-08-05).** Core: Postgres checkpointer (`postgres` cargo feature), token streaming (`ChatModel::chat_stream`, `GraphEvent::Token`, the `messages` stream mode), and a live-agent example join the v0.1 execution core. Server: Phase A shipped — full endpoint inventory in [agentgraph-server/README.md](agentgraph-server/README.md#http-api).
-- All four crates are under active development; see each crate's roadmap section. History: [CHANGELOG.md](CHANGELOG.md).
+- All four crates are under active development; see each crate's roadmap section. Contributing: [CONTRIBUTING.md](CONTRIBUTING.md) (workspace-wide) and [agentgraph/CONTRIBUTING.md](agentgraph/CONTRIBUTING.md) (core crate).
 
 ## Repository layout
 

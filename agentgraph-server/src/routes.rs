@@ -12,9 +12,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{delete, get, post, put};
 use axum::{middleware, Extension, Json, Router};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use futures::Stream;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
@@ -27,33 +27,22 @@ use crate::runs::{
 };
 use crate::server_store::{JsonFileStore, ServerStore};
 use crate::sse;
-use crate::{store, GraphRegistry, ServerConfig};
-
-/// A thread: a conversation/session bound to one registered graph at
-/// creation time (design doc §8, open question 2 — per-thread binding).
-///
-/// Threads are tenant-scoped: the in-memory map is keyed by the **internal**
-/// id (`{tenant}/{thread_id}`; the default tenant stays unprefixed), while
-/// `thread_id` here is always the external id clients see on the wire.
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct ThreadRecord {
-    pub thread_id: String,
-    /// Owning tenant (resolved from the API key at creation time).
-    pub tenant: String,
-    pub graph: String,
-    pub metadata: Value,
-    pub created_at: DateTime<Utc>,
-}
+use crate::threads::ThreadRecord;
+use crate::{store, GraphRegistry, ServerConfig, RESERVED_NAMES};
 
 /// Shared application state.
 pub(crate) struct AppState {
     pub registry: GraphRegistry,
     pub config: ServerConfig,
     pub checkpointer: Arc<dyn Checkpointer>,
-    pub threads: Mutex<HashMap<String, ThreadRecord>>,
     pub run_deps: RunDeps,
-    /// Assistants / crons / KV persistence (JSON files or Postgres).
+    /// Assistants / crons / threads / KV persistence (JSON files or
+    /// Postgres). Thread records live here — not in a route-local map — so
+    /// they survive restarts alongside their checkpoints.
     pub server_store: Arc<dyn ServerStore>,
+    /// Per-thread locks serializing `update_state`'s read-modify-write:
+    /// without one, two concurrent writes could mint the same `step`.
+    pub state_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 /// Build the checkpointer + server-store backends for `config`. The default
@@ -96,9 +85,9 @@ pub(crate) fn router(registry: GraphRegistry, config: ServerConfig) -> Router {
         registry,
         config,
         checkpointer,
-        threads: Mutex::new(HashMap::new()),
         run_deps,
         server_store,
+        state_locks: Mutex::new(HashMap::new()),
     });
     crons::spawn_scheduler(Arc::clone(&state));
 
@@ -120,6 +109,7 @@ pub(crate) fn router(registry: GraphRegistry, config: ServerConfig) -> Router {
             delete(delete_run_checkpoints),
         )
         .route("/runs/{run_id}", get(get_run))
+        .route("/runs/{run_id}/stream", get(get_run_stream))
         .route("/assistants", post(create_assistant).get(list_assistants))
         .route("/assistants/{assistant_id}", get(get_assistant))
         .route("/crons", post(create_cron).get(list_crons))
@@ -161,31 +151,45 @@ async fn require_thread(
     thread_id: &str,
 ) -> Result<ThreadRecord, ApiError> {
     state
-        .threads
-        .lock()
+        .server_store
+        .get_thread(&tenant.scope(thread_id))
         .await
-        .get(&tenant.scope(thread_id))
-        .cloned()
+        .map_err(internal_err)?
         .ok_or_else(|| ApiError::not_found(format!("thread `{thread_id}` not found")))
 }
 
 /// Validate a client-chosen resource id (thread / assistant / cron). Ids
 /// become path segments under the store root and carry a `{tenant}/`
 /// prefix internally, so they must be non-empty, bounded, and free of path
-/// separators; all-dots ids are rejected (parent-directory components).
+/// separators; all-dots ids are rejected (parent-directory components), as
+/// are the reserved layout names in [`RESERVED_NAMES`] — an id of `crons`
+/// would otherwise write checkpoint files into the cron-records directory.
 fn validate_client_id(kind: &str, id: &str) -> Result<(), ApiError> {
     let ok = !id.is_empty()
         && id.len() <= 256
         && !id.contains('/')
         && !id.contains('\\')
-        && !id.chars().all(|c| c == '.');
+        && !id.chars().all(|c| c == '.')
+        && !RESERVED_NAMES.contains(&id);
     if ok {
         Ok(())
     } else {
         Err(ApiError::bad_request(format!(
-            "invalid {kind} `{id}` (must be non-empty, <= 256 chars, no path separators)"
+            "invalid {kind} `{id}` (must be non-empty, <= 256 chars, no path separators, not a reserved name)"
         )))
     }
+}
+
+/// The per-thread lock serializing `update_state` (see
+/// [`AppState::state_locks`]).
+async fn state_lock(state: &AppState, internal_id: &str) -> Arc<Mutex<()>> {
+    state
+        .state_locks
+        .lock()
+        .await
+        .entry(internal_id.to_string())
+        .or_default()
+        .clone()
 }
 
 fn checkpoint_ref(cp: &Checkpoint, tenant: &TenantContext) -> Value {
@@ -267,12 +271,6 @@ async fn create_thread(
     validate_client_id("thread_id", &thread_id)?;
 
     let internal_id = tenant.scope(&thread_id);
-    let mut threads = state.threads.lock().await;
-    if threads.contains_key(&internal_id) {
-        return Err(ApiError::conflict(format!(
-            "thread `{thread_id}` already exists"
-        )));
-    }
     let record = ThreadRecord {
         thread_id: thread_id.clone(),
         tenant: tenant.tenant().to_string(),
@@ -280,7 +278,18 @@ async fn create_thread(
         metadata: payload.metadata.unwrap_or(Value::Null),
         created_at: Utc::now(),
     };
-    threads.insert(internal_id, record.clone());
+    // Check-and-insert in the store (durable, so pre-restart checkpoints
+    // stay reachable through the API).
+    let created = state
+        .server_store
+        .create_thread(&internal_id, &record)
+        .await
+        .map_err(internal_err)?;
+    if !created {
+        return Err(ApiError::conflict(format!(
+            "thread `{thread_id}` already exists"
+        )));
+    }
     Ok((StatusCode::CREATED, Json(record)))
 }
 
@@ -317,13 +326,16 @@ async fn fork_thread(
     validate_client_id("new_thread_id", &new_thread_id)?;
 
     let new_internal_id = tenant.scope(&new_thread_id);
+    if state
+        .server_store
+        .get_thread(&new_internal_id)
+        .await
+        .map_err(internal_err)?
+        .is_some()
     {
-        let threads = state.threads.lock().await;
-        if threads.contains_key(&new_internal_id) {
-            return Err(ApiError::conflict(format!(
-                "thread `{new_thread_id}` already exists"
-            )));
-        }
+        return Err(ApiError::conflict(format!(
+            "thread `{new_thread_id}` already exists"
+        )));
     }
 
     // Fork inside the tenant's checkpoint namespace.
@@ -355,7 +367,19 @@ async fn fork_thread(
         }),
         created_at: Utc::now(),
     };
-    state.threads.lock().await.insert(new_internal_id, fork);
+    // A create that loses a same-id race answers 409 (the existence check
+    // above is only the fast path; the store's check-and-insert is
+    // authoritative).
+    let created = state
+        .server_store
+        .create_thread(&new_internal_id, &fork)
+        .await
+        .map_err(internal_err)?;
+    if !created {
+        return Err(ApiError::conflict(format!(
+            "thread `{new_thread_id}` already exists"
+        )));
+    }
 
     Ok((
         StatusCode::CREATED,
@@ -421,6 +445,12 @@ async fn update_state(
     let internal_id = tenant.scope(&thread_id);
     let new_state = State::from_value(values)
         .map_err(|e| ApiError::bad_request(format!("`values` must be a JSON object: {e}")))?;
+    // Serialize the read-modify-write per thread: two concurrent
+    // `update_state` calls must not mint two checkpoints with the same
+    // `step`. (Held across the checkpointer IO on purpose — this is a
+    // per-thread serializer, not a global lock.)
+    let lock = state_lock(&state, &internal_id).await;
+    let _guard = lock.lock().await;
     let latest = state
         .checkpointer
         .get_latest(&internal_id)
@@ -476,8 +506,17 @@ async fn history(
     checkpoints.reverse(); // newest first
 
     if let Some(before) = &payload.before {
-        if let Some(pos) = checkpoints.iter().position(|cp| &cp.id == before) {
-            checkpoints.drain(..=pos);
+        match checkpoints.iter().position(|cp| &cp.id == before) {
+            Some(pos) => {
+                checkpoints.drain(..=pos);
+            }
+            // A cursor that silently resets to the full history sends
+            // paginating clients into infinite loops — answer 400 instead.
+            None => {
+                return Err(ApiError::bad_request(format!(
+                    "unknown `before` checkpoint `{before}`"
+                )));
+            }
         }
     }
     if let Some(limit) = payload.limit {
@@ -517,6 +556,12 @@ async fn schedule_for_thread(
         }
     }
     if let Some(assistant_id) = &payload.assistant_id {
+        // The id arrives in a JSON body, not a path segment, so it must be
+        // validated here like every other client-chosen id: the default
+        // tenant's `scope()` is the identity function, and an unvalidated
+        // `"tenant/id"` value would resolve (and run) another tenant's
+        // assistant record.
+        validate_client_id("assistant_id", assistant_id)?;
         // Assistants are tenant-scoped: another tenant's assistant id
         // resolves to nothing here → 404.
         let assistant = state
@@ -593,6 +638,11 @@ async fn create_run(
     ))
 }
 
+/// Server-side ceiling for the blocking wait endpoint: a graph that never
+/// terminates must not pin the handler task forever. The run itself keeps
+/// executing — only the wait is bounded.
+const MAX_RUN_WAIT: Duration = Duration::from_secs(3600);
+
 /// `POST /threads/{id}/runs/wait` — blocking run: terminal result as JSON.
 async fn create_run_wait(
     AxumState(state): AxumState<Arc<AppState>>,
@@ -602,35 +652,80 @@ async fn create_run_wait(
 ) -> Result<Json<Value>, ApiError> {
     let scheduled = schedule_for_thread(&state, &tenant, &thread_id, payload).await?;
     let mut terminal = scheduled.terminal;
-    let result = terminal
-        .wait_for(|v| v.is_some())
+    let result = tokio::time::timeout(MAX_RUN_WAIT, terminal.wait_for(|v| v.is_some()))
         .await
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::GATEWAY_TIMEOUT,
+                "timeout",
+                format!(
+                    "run did not reach a terminal state within {}s",
+                    MAX_RUN_WAIT.as_secs()
+                ),
+            )
+        })?
         .map_err(|_| ApiError::internal("run ended without a terminal result".to_string()))?;
     let value = result.clone().expect("wait_for predicate guarantees Some");
     Ok(Json(value))
 }
 
-/// `POST /threads/{id}/runs/stream` — run with SSE streaming.
+/// Shared SSE response assembly for the two streaming endpoints.
+fn sse_response(
+    replay: Vec<runs::SseFrame>,
+    broadcast: tokio::sync::broadcast::Receiver<runs::SseFrame>,
+    skip_through_seq: u64,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    Sse::new(sse::frame_stream(replay, broadcast, skip_through_seq)).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    )
+}
+
+/// `POST /threads/{id}/runs/stream` — run with SSE streaming. A fresh run
+/// starts a new frame sequence, so `Last-Event-ID` is deliberately ignored
+/// here (a stale value from a previous run would silently drop the new
+/// run's first frames); replay lives on `GET /runs/{id}/stream`.
 async fn create_run_stream(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(tenant): Extension<TenantContext>,
     Path(thread_id): Path<String>,
-    headers: HeaderMap,
     Json(payload): Json<RunPayload>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let scheduled = schedule_for_thread(&state, &tenant, &thread_id, payload).await?;
+    Ok(sse_response(scheduled.replay, scheduled.broadcast, 0))
+}
+
+/// `GET /runs/{id}/stream` — attach to an existing run's SSE stream:
+/// replays the event log (honoring `Last-Event-ID`, so a reconnecting
+/// client skips frames it has already seen) and then follows live frames.
+/// Cross-tenant runs answer 404, like `GET /runs/{id}`.
+async fn get_run_stream(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let (replay, broadcast, internal_thread_id) = state
+        .run_deps
+        .manager
+        .stream_parts(&run_id)
+        .await
+        .ok_or_else(|| ApiError::not_found(format!("run `{run_id}` not found")))?;
+    if !tenant.owns(&internal_thread_id) {
+        return Err(ApiError::not_found(format!("run `{run_id}` not found")));
+    }
     let last_seen =
         sse::parse_last_event_id(headers.get("last-event-id").and_then(|v| v.to_str().ok()));
-    let scheduled = schedule_for_thread(&state, &tenant, &thread_id, payload).await?;
-    let stream = sse::frame_stream(scheduled.replay, scheduled.broadcast, last_seen);
-    Ok(Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
-    ))
+    Ok(sse_response(replay, broadcast, last_seen))
 }
 
 /// `DELETE /threads/{id}/runs/{run_id}` — rollback: delete the checkpoints a
 /// finished run created, re-anchoring the thread to the pre-run checkpoint.
+///
+/// The `Checkpointer` trait has no delete operation, so removal goes
+/// through the JSON-file layout directly; on the Postgres backend the
+/// endpoint answers 409 rather than silently deleting nothing.
 async fn delete_run_checkpoints(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(tenant): Extension<TenantContext>,
@@ -657,13 +752,44 @@ async fn delete_run_checkpoints(
             "run is still active; rollback applies to finished runs".to_string(),
         ));
     }
+    if state.config.database_url.is_some() {
+        return Err(ApiError::conflict(
+            "rollback is not supported with the Postgres checkpointer".to_string(),
+        ));
+    }
 
-    let ids = info
-        .checkpoint_ids
-        .lock()
-        .expect("checkpoint ids lock poisoned")
-        .clone();
     let internal_id = tenant.scope(&thread_id);
+    // Mutual exclusion with scheduling: a queued or newly-started run
+    // could be executing from the very checkpoints this endpoint deletes.
+    if state.run_deps.manager.thread_busy(&internal_id).await {
+        return Err(ApiError::conflict(
+            "thread has an active or queued run; rollback applies to idle threads".to_string(),
+        ));
+    }
+
+    let ids = runs::lock_recover(&info.checkpoint_ids).clone();
+    // Rollback is only well-defined when the run's checkpoints are the
+    // tail of the current history: deleting mid-history checkpoints would
+    // punch holes while the endpoint claims to re-anchor the thread to
+    // the pre-run checkpoint.
+    let history = state
+        .checkpointer
+        .list(&internal_id)
+        .await
+        .map_err(internal_err)?;
+    let is_suffix = history.len() >= ids.len()
+        && history[history.len() - ids.len()..]
+            .iter()
+            .map(|cp| cp.id.as_str())
+            .eq(ids.iter().map(String::as_str));
+    if !is_suffix {
+        return Err(ApiError::conflict(
+            "the run's checkpoints are not the latest on this thread; \
+             rollback would punch holes mid-history"
+                .to_string(),
+        ));
+    }
+
     let dir = state.config.store_path.join(&internal_id);
     let mut deleted = 0usize;
     for id in &ids {
@@ -680,7 +806,9 @@ async fn delete_run_checkpoints(
         }
     }
 
-    // Re-anchor the latest pointer to the newest remaining checkpoint.
+    // Re-anchor the latest pointer to the newest remaining checkpoint,
+    // with the same atomic temp+rename discipline the checkpointer itself
+    // uses (a crash mid-write must not leave a truncated pointer).
     let remaining = state
         .checkpointer
         .list(&internal_id)
@@ -688,12 +816,16 @@ async fn delete_run_checkpoints(
         .map_err(internal_err)?;
     let latest_path = dir.join("latest");
     match remaining.last() {
-        Some(cp) => tokio::fs::write(&latest_path, cp.id.as_bytes())
+        Some(cp) => atomic_write(&latest_path, cp.id.as_bytes())
             .await
             .map_err(internal_err)?,
-        None => {
-            let _ = tokio::fs::remove_file(&latest_path).await;
-        }
+        None => match tokio::fs::remove_file(&latest_path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(path = %latest_path.display(), %e, "failed to remove latest pointer")
+            }
+        },
     }
 
     Ok(Json(json!({
@@ -702,6 +834,14 @@ async fn delete_run_checkpoints(
         "deleted_checkpoints": deleted,
         "remaining_checkpoints": remaining.len(),
     })))
+}
+
+/// Write `bytes` to `path` atomically (temp file + rename), mirroring the
+/// checkpointer's durability discipline for its `latest` pointer.
+async fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    tokio::fs::write(&tmp, bytes).await?;
+    tokio::fs::rename(&tmp, path).await
 }
 
 // --------------------------------------------------------------------- //
@@ -909,8 +1049,9 @@ async fn create_cron(
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     validate_client_id("cron_id", &cron_id)?;
 
-    // Persist under the tenant's internal id; the wire shows the external
-    // id. The scheduler derives the owning tenant back from the prefix.
+    // Persist under the tenant's internal id (same scoping as assistants);
+    // the wire shows the external id and the scheduler derives the owning
+    // tenant back from the prefix.
     let record = CronRecord {
         cron_id: tenant.scope(&cron_id),
         graph: payload.graph,

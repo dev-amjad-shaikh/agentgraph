@@ -1,7 +1,7 @@
 //! MCP (Model Context Protocol) client support.
 //!
 //! This module lets `agentgraph` agents call tools hosted by **any MCP
-//! server** — the ecosystem escape hatch. It provides:
+//! server**. It provides:
 //!
 //! - JSON-RPC 2.0 framing types ([`JsonRpcRequest`], [`JsonRpcResponse`],
 //!   [`JsonRpcNotification`], [`JsonRpcError`]) with `serde` support.
@@ -54,13 +54,21 @@ use crate::tool::Tool;
 
 /// The MCP protocol revision this client requests during `initialize`.
 ///
-/// `2024-11-05` is the most widely implemented revision; servers that do not
-/// support it respond with a revision they do support, which this client
-/// accepts.
+/// `2024-11-05` is the most widely implemented revision. The revision the
+/// server answers with is **recorded, not validated**: this client performs
+/// no compatibility negotiation beyond sending this value.
 pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// Default per-request timeout.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum size of a single inbound frame (bytes), for both framings.
+///
+/// The peer is untrusted: without a cap, a hostile or buggy server could
+/// declare `Content-Length: 4_000_000_000` (or stream one unterminated line)
+/// and turn it into a multi-GiB host allocation. Oversized frames are
+/// rejected *before* any length-driven allocation happens.
+pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 /// Build an [`AgentGraphError::Tool`] with an `mcp:` context prefix.
 fn tool_err(msg: impl Into<String>) -> AgentGraphError {
@@ -189,6 +197,10 @@ where
 }
 
 /// Read one framed JSON message. Returns `Ok(None)` on clean EOF.
+///
+/// Bounded by [`MAX_FRAME_BYTES`]: an oversized `Content-Length` header or
+/// an over-long unterminated line is an `InvalidData` error, never an
+/// allocation.
 async fn read_framed<R>(reader: &mut BufReader<R>, framing: Framing) -> io::Result<Option<Value>>
 where
     R: AsyncRead + Unpin,
@@ -198,9 +210,22 @@ where
             let mut line = String::new();
             loop {
                 line.clear();
-                let n = reader.read_line(&mut line).await?;
+                // Read through a `take` adapter so a peer that never
+                // terminates its line cannot grow the buffer past the cap.
+                let n = (&mut *reader)
+                    .take(MAX_FRAME_BYTES as u64 + 1)
+                    .read_line(&mut line)
+                    .await?;
                 if n == 0 {
                     return Ok(None); // EOF
+                }
+                if line.len() > MAX_FRAME_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "newline-delimited frame exceeds the {MAX_FRAME_BYTES}-byte frame cap"
+                        ),
+                    ));
                 }
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
@@ -233,6 +258,13 @@ where
             let len = content_length.ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
             })?;
+            if len > MAX_FRAME_BYTES {
+                // Reject before trusting the peer's length with an allocation.
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Content-Length {len} exceeds the {MAX_FRAME_BYTES}-byte frame cap"),
+                ));
+            }
             let mut body = vec![0u8; len];
             reader.read_exact(&mut body).await?;
             let value = serde_json::from_slice(&body)
@@ -347,7 +379,21 @@ async fn reader_loop<R>(
                 }
             }
             Ok(None) => break, // clean EOF
-            Err(_) => break,   // malformed frame or IO error — give up
+            Err(e) => {
+                // Newline framing is self-resyncing: a malformed or oversized
+                // frame costs one line, not the whole session. IO errors and
+                // Content-Length desync are fatal — the stream can no longer
+                // be trusted, so pending waiters are woken below.
+                if framing == Framing::NewlineDelimited && e.kind() == io::ErrorKind::InvalidData {
+                    tracing::warn!(
+                        error = %e,
+                        "mcp: dropping malformed frame; resyncing on the next line"
+                    );
+                    continue;
+                }
+                tracing::warn!(error = %e, "mcp: reader task terminating on fatal read error");
+                break;
+            }
         }
     }
     // Wake every waiter: dropping the senders makes the receivers fail.
@@ -585,10 +631,20 @@ impl McpClient {
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_owned(),
-                    input_schema: t
-                        .get("inputSchema")
-                        .cloned()
-                        .unwrap_or_else(|| json!({"type": "object"})),
+                    input_schema: match t.get("inputSchema") {
+                        Some(schema) => schema.clone(),
+                        None => {
+                            // The spec requires inputSchema; synthesize a
+                            // permissive schema rather than drop the tool,
+                            // but make the fabrication visible.
+                            tracing::warn!(
+                                tool = name,
+                                "mcp: `tools/list` entry omitted `inputSchema`; \
+                                 defaulting to a permissive object schema"
+                            );
+                            json!({"type": "object"})
+                        }
+                    },
                 })
             })
             .collect()
@@ -993,6 +1049,77 @@ mod tests {
             .expect("tools/call over Content-Length framing");
         assert_eq!(value, json!("hello from echo"));
         client.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn content_length_cap_rejects_giant_frame_before_allocating() {
+        // A peer-declared 4 GB frame must be rejected, not allocated.
+        let bytes = b"Content-Length: 4000000000\r\n\r\n";
+        let mut reader = BufReader::new(&bytes[..]);
+        let err = read_framed(&mut reader, Framing::ContentLength)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("frame cap"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn newline_cap_bounds_unterminated_lines() {
+        // No newline anywhere: the buffer must stop at the cap.
+        let bytes = vec![b'a'; MAX_FRAME_BYTES + 8];
+        let mut reader = BufReader::new(&bytes[..]);
+        let err = read_framed(&mut reader, Framing::NewlineDelimited)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("frame cap"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn malformed_newline_frame_is_dropped_and_session_survives() {
+        let (client_stream, mut server) = duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            // A garbage line first: must not brick the client session.
+            server
+                .write_all(b"this is not json at all\n")
+                .await
+                .expect("write garbage");
+            let (read, mut write) = tokio::io::split(server);
+            let mut reader = BufReader::new(read);
+            // Then a normal initialize handshake.
+            let msg = read_framed(&mut reader, Framing::NewlineDelimited)
+                .await
+                .expect("read initialize")
+                .expect("initialize frame");
+            let id = msg.get("id").cloned();
+            write_framed(
+                &mut write,
+                Framing::NewlineDelimited,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": MCP_PROTOCOL_VERSION,
+                        "capabilities": {},
+                        "serverInfo": {"name": "resync-mock", "version": "0"},
+                    }
+                }),
+            )
+            .await
+            .expect("write initialize result");
+            // Drain the initialized notification so the pipe stays open.
+            let _ = read_framed(&mut reader, Framing::NewlineDelimited).await;
+        });
+
+        let (read, write) = tokio::io::split(client_stream);
+        let client = McpClient::connect(read, write);
+        let info = client
+            .initialize()
+            .await
+            .expect("initialize must survive a leading malformed frame");
+        assert_eq!(info.server_name, "resync-mock");
+        client.shutdown().await.expect("shutdown");
+        server_task.await.expect("server task");
     }
 
     #[tokio::test]

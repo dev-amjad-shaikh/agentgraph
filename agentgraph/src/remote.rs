@@ -32,8 +32,9 @@
 //! ## Reliability
 //!
 //! [`RemoteNode`] applies a per-attempt timeout plus configurable retries
-//! with exponential backoff. Only *transport-class* failures are retried
-//! (connect errors, timeouts, HTTP 5xx). Worker-reported errors and
+//! with capped, jittered exponential backoff. Only *transport-class*
+//! failures are retried (connect errors, timeouts, HTTP 5xx / 408 / 429; a
+//! `Retry-After` header floors the delay). Worker-reported errors and
 //! interrupts are never retried — the worker already made a definitive
 //! decision, and node logic is only contractually idempotent across
 //! *executor-level* re-execution, not silent client replays.
@@ -46,6 +47,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{AgentGraphError, Result};
+use crate::llm::{backoff_delay, truncate_body};
 use crate::node::{Command, Node, NodeContext, NodeOutput};
 use crate::state::State;
 
@@ -62,8 +64,8 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default number of retries *after* the initial attempt.
 pub const DEFAULT_MAX_RETRIES: u32 = 2;
 
-/// Default base delay for exponential backoff (attempt *n* waits
-/// `base * 2^n` before retry *n+1*).
+/// Default base delay for exponential backoff (attempt *n* waits roughly
+/// `base * 2^n`, exponent capped and jittered, before retry *n+1*).
 pub const DEFAULT_BASE_BACKOFF: Duration = Duration::from_millis(100);
 
 /// A node invocation sent to a worker (`POST {base_url}/execute`).
@@ -210,9 +212,13 @@ impl NodeTaskResponse {
 /// Internal classification of a failed HTTP attempt.
 #[derive(Debug)]
 enum AttemptError {
-    /// Transport-class failure eligible for retry (connect, timeout, 5xx).
-    Retryable(AgentGraphError),
-    /// Definitive failure; never retried (4xx, decode errors, ...).
+    /// Transport-class failure eligible for retry (connect, timeout, 5xx,
+    /// 408, 429), with an optional server-provided `Retry-After` floor.
+    Retryable {
+        error: AgentGraphError,
+        retry_after: Option<Duration>,
+    },
+    /// Definitive failure; never retried (other 4xx, decode errors, ...).
     Fatal(AgentGraphError),
 }
 
@@ -220,6 +226,16 @@ enum AttemptError {
 ///
 /// Registered in a graph exactly like a local node — this is the whole point
 /// of the design: *one `Node` trait, remote impls behind the same trait*.
+///
+/// **Error semantics across the wire.** A worker-side failure arrives as a
+/// plain message string and flattens to [`AgentGraphError::Node`] — a hard,
+/// non-retryable failure. Even when the remote failure originated in the
+/// worker's LLM or tool layer, that retryability does not survive the wire:
+/// the executor's retry classification ([`AgentGraphError::Llm`] /
+/// [`AgentGraphError::Tool`] are the transient classes) only applies to
+/// errors raised by *local* nodes, and [`AgentGraphError::Node`] is never in
+/// it. This client's own retries cover transport-class failures only (see
+/// the module-level reliability notes).
 ///
 /// ```ignore
 /// let node = RemoteNode::new("doubler", "http://127.0.0.1:8200")
@@ -281,7 +297,8 @@ impl RemoteNode {
         self
     }
 
-    /// Override the base backoff delay (attempt *n* waits `base * 2^n`).
+    /// Override the base backoff delay (attempt *n* waits roughly
+    /// `base * 2^n`, exponent capped and jittered).
     pub fn with_backoff(mut self, base_backoff: Duration) -> Self {
         self.base_backoff = base_backoff;
         self
@@ -298,6 +315,10 @@ impl RemoteNode {
     }
 
     fn build_client(timeout: Duration) -> reqwest::Client {
+        // Invariant: the builder only sets a timeout — no TLS roots, proxy,
+        // or redirect config — and the rustls backend needs no platform
+        // initialization, so construction cannot realistically fail. Kept
+        // infallible to preserve `RemoteNode::new`'s non-`Result` signature.
         reqwest::Client::builder()
             .timeout(timeout)
             .build()
@@ -306,7 +327,8 @@ impl RemoteNode {
 
     /// One HTTP attempt. `Ok` means the worker replied with a well-formed
     /// [`NodeTaskResponse`] (which may still carry `error`/`interrupt`);
-    /// `Err` is classified for retry.
+    /// `Err` is classified for retry. Error bodies are truncated
+    /// ([`crate::llm::truncate_body`]) so a verbose worker cannot bloat logs.
     async fn try_once(
         &self,
         task: &NodeTask,
@@ -323,26 +345,43 @@ impl RemoteNode {
                     self.node_name, self.execute_url
                 ));
                 if e.is_timeout() || e.is_connect() {
-                    AttemptError::Retryable(err)
+                    AttemptError::Retryable {
+                        error: err,
+                        retry_after: None,
+                    }
                 } else {
                     AttemptError::Fatal(err)
                 }
             })?;
 
         let status = response.status();
-        if status.is_server_error() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(AttemptError::Retryable(AgentGraphError::Node(format!(
-                "remote node `{}`: worker at {} returned {status}: {body}",
-                self.node_name, self.execute_url
-            ))));
-        }
         if !status.is_success() {
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .map(Duration::from_secs);
             let body = response.text().await.unwrap_or_default();
-            return Err(AttemptError::Fatal(AgentGraphError::Node(format!(
-                "remote node `{}`: worker at {} returned {status}: {body}",
-                self.node_name, self.execute_url
-            ))));
+            let err = AgentGraphError::Node(format!(
+                "remote node `{}`: worker at {} returned {status}: {}",
+                self.node_name,
+                self.execute_url,
+                truncate_body(&body)
+            ));
+            // 5xx and 408/429 are transient by convention (same policy as
+            // the LLM client); other 4xx are definitive.
+            let retryable = status.is_server_error()
+                || status == reqwest::StatusCode::REQUEST_TIMEOUT
+                || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+            return Err(if retryable {
+                AttemptError::Retryable {
+                    error: err,
+                    retry_after,
+                }
+            } else {
+                AttemptError::Fatal(err)
+            });
         }
 
         response.json::<NodeTaskResponse>().await.map_err(|e| {
@@ -373,21 +412,32 @@ impl Node for RemoteNode {
             match self.try_once(&task).await {
                 Ok(response) => return response.into_result(),
                 Err(AttemptError::Fatal(e)) => return Err(e),
-                Err(AttemptError::Retryable(e)) if attempt < self.max_retries => {
-                    let delay = self.base_backoff * 2u32.saturating_pow(attempt);
+                Err(AttemptError::Retryable { error, retry_after })
+                    if attempt < self.max_retries =>
+                {
+                    // Capped exponent + jitter (crate::llm::backoff_delay):
+                    // uncapped growth turns with_retries(20) into a ~14-hour
+                    // sleep, and lockstep retries stampede a recovering
+                    // worker.
+                    let mut delay = backoff_delay(self.base_backoff, attempt);
+                    if let Some(floor) = retry_after {
+                        // A worker that says Retry-After knows better than
+                        // our backoff guess.
+                        delay = delay.max(floor);
+                    }
                     tracing::warn!(
                         node = %self.node_name,
                         url = %self.execute_url,
                         attempt = attempt + 1,
                         max_retries = self.max_retries,
                         backoff_ms = delay.as_millis() as u64,
-                        error = %e,
+                        error = %error,
                         "remote node attempt failed; retrying"
                     );
                     tokio::time::sleep(delay).await;
                     attempt += 1;
                 }
-                Err(AttemptError::Retryable(e)) => return Err(e),
+                Err(AttemptError::Retryable { error, .. }) => return Err(error),
             }
         }
     }
@@ -821,6 +871,51 @@ mod tests {
         let out = Node::run(&node, resumed).await.unwrap();
         assert_eq!(out.updates.get("approved"), Some(&json!(true)));
         assert_eq!(server.attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn remote_node_retries_on_429_then_succeeds() {
+        let server = start_mock(|n, _body| {
+            if n < 2 {
+                MockBehavior::Respond {
+                    status: 429,
+                    body: r#"{"error":"rate limited"}"#.to_string(),
+                }
+            } else {
+                MockBehavior::Respond {
+                    status: 200,
+                    body: serde_json::to_string(&NodeTaskResponse::ok(NodeOutput::update(
+                        "x",
+                        json!("through"),
+                    )))
+                    .unwrap(),
+                }
+            }
+        });
+
+        let node = RemoteNode::new("limited", format!("http://{}", server.addr))
+            .with_retries(2)
+            .with_backoff(Duration::from_millis(1));
+        let out = Node::run(&node, test_ctx()).await.unwrap();
+        assert_eq!(out.updates.get("x"), Some(&json!("through")));
+        assert_eq!(server.attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn remote_node_does_not_retry_fatal_4xx() {
+        let server = start_mock(|_n, _body| MockBehavior::Respond {
+            status: 400,
+            body: r#"{"error":"malformed task"}"#.to_string(),
+        });
+
+        let node = RemoteNode::new("bad", format!("http://{}", server.addr))
+            .with_retries(5)
+            .with_backoff(Duration::from_millis(1));
+        let err = Node::run(&node, test_ctx()).await.unwrap_err();
+        assert!(matches!(err, AgentGraphError::Node(_)));
+        assert!(err.to_string().contains("400"));
+        // Definitive failure: no retries despite with_retries(5).
+        assert_eq!(server.attempts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

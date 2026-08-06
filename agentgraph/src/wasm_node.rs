@@ -264,6 +264,22 @@ impl WasmNode {
         let out_ptr = ((packed as u64) >> 32) as u32 as usize;
         let out_len = (packed as u64 & 0xFFFF_FFFF) as u32 as usize;
 
+        // The packed ptr/len are guest-controlled: validate them against the
+        // actual memory size *before* allocating the output buffer on the
+        // host. The memory-growth cap limits the guest's memory, not this
+        // host-side allocation — without this check a malicious guest gets a
+        // cheap multi-GiB host memory amplification.
+        let memory_size = memory.data_size(&store);
+        let end = out_ptr.checked_add(out_len).ok_or_else(|| {
+            node_err("guest returned an out_ptr + out_len that overflows usize".into())
+        })?;
+        if end > memory_size {
+            return Err(node_err(format!(
+                "guest returned output range [{out_ptr}, {end}) beyond its \
+                 {memory_size}-byte memory"
+            )));
+        }
+
         let mut buf = vec![0u8; out_len];
         memory
             .read(&store, out_ptr, &mut buf)
@@ -429,6 +445,44 @@ mod tests {
             AgentGraphError::Node(msg) => assert!(msg.contains("trapped")),
             other => panic!("expected Node trap error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn guest_controlled_out_len_is_validated_before_host_allocation() {
+        // run returns ptr 0 / len ~4 GiB: must error, never allocate.
+        let wat = r#"(module
+  (memory (export "memory") 1)
+  (func (export "alloc") (param i32) (result i32) (i32.const 0))
+  (func (export "run") (param i32 i32) (result i64)
+    (i64.const 4294967295)))"#;
+        let node = WasmNode::from_bytes("guest-dos", wat).unwrap();
+
+        let err = node.run(test_ctx()).await.unwrap_err();
+        match err {
+            AgentGraphError::Node(msg) => assert!(msg.contains("beyond"), "got: {msg}"),
+            other => panic!("expected Node error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_growth_beyond_cap_is_denied() {
+        // run probes the limiter: if memory.grow by 10 pages succeeds it
+        // traps (unreachable); only a *denied* grow (-1) lets it return the
+        // static output. Success therefore proves the cap was enforced.
+        let wat = static_output_wat(r#"{"updates":{"ok":true}}"#).replace(
+            "(func (export \"run\") (param i32 i32) (result i64)\n",
+            "(func (export \"run\") (param i32 i32) (result i64)\n    (if (i32.ne (memory.grow (i32.const 10)) (i32.const -1)) (then unreachable))\n",
+        );
+        let node = WasmNode::from_bytes("guest-grow", wat)
+            .unwrap()
+            // Exactly one 64 KiB page: the initial page fits, any grow is over.
+            .with_limits(SandboxLimits {
+                fuel: 10_000_000,
+                max_memory_bytes: 64 * 1024,
+            });
+
+        let out = node.run(test_ctx()).await.unwrap();
+        assert_eq!(out.updates.get("ok"), Some(&json!(true)));
     }
 
     #[test]

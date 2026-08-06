@@ -57,21 +57,37 @@ INSERT INTO agentgraph_checkpoints
     (thread_id, checkpoint_id, step, state, next_nodes, created_at)
 VALUES ($1, $2, $3, $4, $5, $6)";
 
-/// The most recent checkpoint for a thread. Recency is defined by super-step
-/// (insertion order), with `created_at` as a deterministic tie-break.
+/// The most recent checkpoint for a thread. Recency is insertion order (the
+/// trait contract), with `created_at` as the insertion proxy — checkpoints
+/// are minted fresh when stored — and `checkpoint_id` as a deterministic
+/// tie-break. `step` deliberately plays no role: replay on the same thread
+/// appends checkpoints whose step is at or below the head, and resume must
+/// continue that newest timeline.
 const GET_LATEST_SQL: &str = "\
 SELECT thread_id, checkpoint_id, step, state, next_nodes, created_at
 FROM agentgraph_checkpoints
 WHERE thread_id = $1
-ORDER BY step DESC, created_at DESC
+ORDER BY created_at DESC, checkpoint_id DESC
 LIMIT 1";
 
-/// All checkpoints for a thread, oldest first (time-travel listing).
+/// All checkpoints for a thread, oldest first (time-travel listing). The
+/// `(created_at, checkpoint_id)` tie-break makes the order total: replay on
+/// the same thread legitimately appends rows sharing a `step`, and
+/// `fork_thread` truncates by list position, so same-step rows must not
+/// order nondeterministically.
 const LIST_SQL: &str = "\
 SELECT thread_id, checkpoint_id, step, state, next_nodes, created_at
 FROM agentgraph_checkpoints
 WHERE thread_id = $1
-ORDER BY step ASC";
+ORDER BY step ASC, created_at ASC, checkpoint_id ASC";
+
+/// One checkpoint by primary key. Overrides the trait default, which would
+/// fetch and decode the thread's entire history and then linear-search;
+/// time-travel replay hits this on every run.
+const GET_BY_ID_SQL: &str = "\
+SELECT thread_id, checkpoint_id, step, state, next_nodes, created_at
+FROM agentgraph_checkpoints
+WHERE thread_id = $1 AND checkpoint_id = $2";
 
 /// Transaction-scoped advisory lock key used by
 /// [`PostgresCheckpointer::migrate`] to serialize concurrent migrations.
@@ -227,7 +243,9 @@ impl PostgresCheckpointer {
         Ok(())
     }
 
-    /// The underlying connection pool.
+    /// The underlying connection pool, exposed so callers can run their own
+    /// maintenance statements (retention sweeps, test cleanup) over the same
+    /// pool.
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
@@ -269,6 +287,17 @@ impl Checkpointer for PostgresCheckpointer {
         rows.iter()
             .map(|r| CheckpointRow::from_pg_row(r).and_then(CheckpointRow::into_checkpoint))
             .collect()
+    }
+
+    async fn get_by_id(&self, thread_id: &str, checkpoint_id: &str) -> Result<Option<Checkpoint>> {
+        let row = sqlx::query(GET_BY_ID_SQL)
+            .bind(thread_id)
+            .bind(checkpoint_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| map_sqlx_error("get checkpoint by id", e))?;
+        row.map(|r| CheckpointRow::from_pg_row(&r).and_then(CheckpointRow::into_checkpoint))
+            .transpose()
     }
 }
 
@@ -316,22 +345,34 @@ mod tests {
     }
 
     #[test]
-    fn get_latest_sql_orders_by_step_desc_then_created_at_desc() {
+    fn get_latest_sql_uses_insertion_order_recency() {
         assert!(GET_LATEST_SQL.contains("WHERE thread_id = $1"));
-        assert!(GET_LATEST_SQL.contains("ORDER BY step DESC, created_at DESC"));
+        // Recency = insertion order (the trait contract): `created_at` is the
+        // insertion proxy; `step` must NOT appear in the ordering, so replay
+        // appending lower-step checkpoints still resumes the newest timeline.
+        assert!(GET_LATEST_SQL.contains("ORDER BY created_at DESC, checkpoint_id DESC"));
+        assert!(!GET_LATEST_SQL.contains("step DESC"));
         assert!(GET_LATEST_SQL.contains("LIMIT 1"));
     }
 
     #[test]
-    fn list_sql_orders_by_step_asc() {
+    fn list_sql_orders_by_step_with_total_tie_break() {
         assert!(LIST_SQL.contains("WHERE thread_id = $1"));
-        assert!(LIST_SQL.contains("ORDER BY step ASC"));
+        // Same-step duplicates (same-thread replay) must order
+        // deterministically: fork_thread truncates by list position.
+        assert!(LIST_SQL.contains("ORDER BY step ASC, created_at ASC, checkpoint_id ASC"));
         assert!(!LIST_SQL.contains("LIMIT"));
     }
 
     #[test]
+    fn get_by_id_sql_is_a_primary_key_point_lookup() {
+        assert!(GET_BY_ID_SQL.contains("WHERE thread_id = $1 AND checkpoint_id = $2"));
+        assert!(GET_BY_ID_SQL.starts_with("SELECT"));
+    }
+
+    #[test]
     fn statements_use_bound_parameters_only() {
-        for sql in [INSERT_SQL, GET_LATEST_SQL, LIST_SQL] {
+        for sql in [INSERT_SQL, GET_LATEST_SQL, LIST_SQL, GET_BY_ID_SQL] {
             assert!(sql.contains("$1"), "statement must bind parameters: {sql}");
         }
     }
@@ -403,7 +444,7 @@ mod tests {
         store.put(cp0.clone()).await.unwrap();
         store.put(cp1.clone()).await.unwrap();
 
-        // Latest = highest step.
+        // Latest = most recent put (insertion-order recency).
         let latest = store.get_latest(&thread).await.unwrap().unwrap();
         assert_eq!(latest.id, cp1.id);
 

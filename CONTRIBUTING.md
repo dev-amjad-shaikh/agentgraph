@@ -1,0 +1,47 @@
+# Contributing to the agentgraph platform
+
+Thanks for helping build the agentgraph platform. This repository is a monorepo of independently versioned crates plus client SDKs; each component has its own build and test loop.
+
+## Components
+
+| Component | What it is | Where to start |
+|---|---|---|
+| [`agentgraph/`](agentgraph/) | Core execution engine | [agentgraph/CONTRIBUTING.md](agentgraph/CONTRIBUTING.md): module map, ownership rules, PR checklist |
+| [`agentgraph-server/`](agentgraph-server/) | axum HTTP/SSE server crate | [README](agentgraph-server/README.md); same PR rules as core |
+| [`agentgraph-worker/`](agentgraph-worker/) | Worker SDK for remote nodes | [README](agentgraph-worker/README.md); same PR rules as core |
+| [`agentgraph-otel/`](agentgraph-otel/) | OpenTelemetry export | [README](agentgraph-otel/README.md); same PR rules as core |
+| [`sdks/python/`](sdks/python/), [`sdks/typescript/`](sdks/typescript/) | Zero-dependency client SDKs | each SDK's README describes its e2e suite |
+| [`studio/`](studio/) | Zero-build debug UI | plain HTML/JS, no build step; see [docs/studio.md](docs/studio.md) |
+
+## Checks
+
+Each crate builds independently (there is no workspace-level `Cargo.toml`). In the crate you touched, run the standard trio on stable Rust:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+The SDK e2e suites boot the real `server_demo` binary as a subprocess:
+
+```bash
+cargo build --manifest-path agentgraph-server/Cargo.toml --example server_demo
+python3 -m unittest discover -s sdks/python/tests
+node --test sdks/typescript/test/
+```
+
+## Ground rules
+
+- **One concern per PR.** Changes to super-step, reducer, or interrupt/resume semantics need an issue and design discussion first; these are the project's core promises.
+- **Tests ship with behavior changes.** Unit tests live in-module under `#[cfg(test)]`; server and SDK changes extend the integration/e2e suites.
+- **Docs must match the real API.** Code samples in prose are reviewed against source; if you change a public signature, grep the READMEs and `docs/` for it.
+- **Crates are versioned independently.** Bump the version in the crate you changed and record the change in the root [CHANGELOG.md](CHANGELOG.md). The platform-release numbers in the root README map to per-crate versions via [docs/roadmap.md](docs/roadmap.md).
+
+## Code of conduct
+
+This project follows the [Rust Code of Conduct](https://www.rust-lang.org/policies/code-of-conduct). Be kind, be constructive, assume good faith.
+
+## License
+
+By contributing, you agree that your contributions are dual-licensed under MIT OR Apache-2.0, matching the project.

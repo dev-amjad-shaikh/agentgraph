@@ -36,7 +36,7 @@ use opentelemetry::trace::TracerProvider;
 use opentelemetry_otlp::{SpanExporter, WithExportConfig};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
-use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter, Registry};
 
@@ -57,6 +57,14 @@ pub enum OTelError {
     /// configuration failure, ...).
     #[error("failed to build the OTLP span exporter: {0}")]
     ExporterBuild(String),
+    /// An explicit [`OTelConfig::log_filter`] directive failed to parse.
+    #[error("invalid log filter directive `{directive}`: {reason}")]
+    FilterParse {
+        /// The offending directive string.
+        directive: String,
+        /// The parser's explanation.
+        reason: String,
+    },
 }
 
 /// Convenient result alias for this crate.
@@ -72,21 +80,27 @@ pub struct OTelConfig {
     /// `http://localhost:4318/v1/traces`. When `None`, no OTLP exporter is
     /// installed and only the local `fmt` layer runs.
     pub otlp_endpoint: Option<String>,
-    /// Log/span filter directive (the `EnvFilter` syntax, e.g.
-    /// `"info,agentgraph=trace"`). When `None`, the `RUST_LOG` environment
-    /// variable is honored, falling back to [`DEFAULT_FILTER`].
+    /// Log filter directive for the stderr `fmt` layer (the `EnvFilter`
+    /// syntax, e.g. `"info,agentgraph=trace"`). When `None`, the `RUST_LOG`
+    /// environment variable is honored, falling back to [`DEFAULT_FILTER`].
+    ///
+    /// The filter gates **local logging only**; OTLP span export is
+    /// unfiltered so a restrictive `RUST_LOG` (e.g. `warn`) never starves the
+    /// collector of traces.
     pub log_filter: Option<String>,
 }
 
 impl OTelConfig {
     /// Resolve the effective [`EnvFilter`]: explicit `log_filter` first,
     /// then `RUST_LOG`, then [`DEFAULT_FILTER`].
-    fn env_filter(&self) -> EnvFilter {
+    fn env_filter(&self) -> Result<EnvFilter> {
         match &self.log_filter {
-            Some(directive) => EnvFilter::new(directive),
-            None => {
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER))
-            }
+            Some(directive) => EnvFilter::try_new(directive).map_err(|e| OTelError::FilterParse {
+                directive: directive.clone(),
+                reason: e.to_string(),
+            }),
+            None => Ok(EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER))),
         }
     }
 }
@@ -103,6 +117,10 @@ impl OTelGuard {
     /// Flush and shut down the tracer provider. Calling this more than once
     /// is a no-op after the first call; dropping the guard after an explicit
     /// shutdown is also safe.
+    ///
+    /// Blocking: waits for the batch processor's final export (up to the
+    /// exporter timeout), so call it during process teardown rather than on
+    /// a hot async path.
     pub fn shutdown(&mut self) {
         if let Some(provider) = self.provider.take() {
             // A shutdown error only means spans may be lost on the way out;
@@ -122,38 +140,53 @@ impl Drop for OTelGuard {
 
 /// Install the global tracing subscriber.
 ///
-/// The subscriber is `Registry + EnvFilter + fmt layer (+ OTLP span layer
-/// when `config.otlp_endpoint` is `Some`)`. Because the subscriber is global,
-/// this function may only succeed **once per process**; a second call
-/// returns [`OTelError::SubscriberAlreadyInstalled`] and leaves the existing
-/// subscriber untouched.
+/// The subscriber is a filtered `fmt` layer on stderr (gated by the resolved
+/// [`EnvFilter`]) plus an unfiltered OTLP span layer when
+/// `config.otlp_endpoint` is `Some`. Filtering is per-layer: the log filter
+/// never throttles span export to the collector. Because the subscriber is
+/// global, this function may only succeed **once per process**; a second
+/// call returns [`OTelError::SubscriberAlreadyInstalled`] and leaves both
+/// the existing subscriber and the global OTel tracer provider untouched.
 ///
 /// The OTLP exporter uses a batch span processor running on its own
 /// dedicated thread, so `init` works both inside and outside a Tokio
 /// runtime.
 pub fn init(config: OTelConfig) -> Result<OTelGuard> {
-    let filter = config.env_filter();
-    let fmt_layer = fmt::layer().with_writer(std::io::stderr);
+    let filter = config.env_filter()?;
+    let fmt_layer = fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(filter);
 
     match &config.otlp_endpoint {
         Some(endpoint) => {
             let provider = build_tracer_provider(&config.service_name, endpoint)?;
-            global::set_tracer_provider(provider.clone());
             let tracer = provider.tracer("agentgraph-otel");
             let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
-            Registry::default()
-                .with(filter)
+            let installed = Registry::default()
                 .with(fmt_layer)
                 .with(otel_layer)
-                .try_init()
-                .map_err(|_| OTelError::SubscriberAlreadyInstalled)?;
-            Ok(OTelGuard {
-                provider: Some(provider),
-            })
+                .try_init();
+            match installed {
+                Ok(()) => {
+                    // Publish the provider globally only after the subscriber
+                    // is actually installed; the layer itself holds the
+                    // tracer and does not need the global provider.
+                    global::set_tracer_provider(provider.clone());
+                    Ok(OTelGuard {
+                        provider: Some(provider),
+                    })
+                }
+                Err(_) => {
+                    // A failed re-init must not leak: shut the fresh provider
+                    // down so its exporter and batch-processor threads are
+                    // flushed and joined rather than detached.
+                    let _ = provider.shutdown();
+                    Err(OTelError::SubscriberAlreadyInstalled)
+                }
+            }
         }
         None => {
             Registry::default()
-                .with(filter)
                 .with(fmt_layer)
                 .try_init()
                 .map_err(|_| OTelError::SubscriberAlreadyInstalled)?;
@@ -204,7 +237,22 @@ mod tests {
             otlp_endpoint: None,
             log_filter: Some("agentgraph=trace".into()),
         };
-        assert_eq!(config.env_filter().to_string(), "agentgraph=trace");
+        assert_eq!(config.env_filter().unwrap().to_string(), "agentgraph=trace");
+    }
+
+    #[test]
+    fn invalid_explicit_log_filter_is_an_error_not_a_panic() {
+        let config = OTelConfig {
+            service_name: "svc".into(),
+            otlp_endpoint: None,
+            log_filter: Some("info,,,bogus===".into()),
+        };
+        match config.env_filter() {
+            Err(OTelError::FilterParse { directive, .. }) => {
+                assert_eq!(directive, "info,,,bogus===");
+            }
+            other => panic!("expected FilterParse, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -213,7 +261,7 @@ mod tests {
         // RUST_LOG the filter honors it instead of DEFAULT_FILTER. Either
         // way the result must be a valid, non-empty directive set.
         let config = OTelConfig::default();
-        let filter = config.env_filter().to_string();
+        let filter = config.env_filter().unwrap().to_string();
         assert!(!filter.is_empty());
         if std::env::var_os("RUST_LOG").is_none() {
             // EnvFilter normalizes directive ordering in its Display impl,

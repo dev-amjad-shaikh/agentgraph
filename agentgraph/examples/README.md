@@ -13,7 +13,7 @@ cargo run --example <name>
 | `react_agent` | `cargo run --example react_agent` | The prebuilt ReAct agent (`create_react_agent`) with a **scripted mock model** — the full agent ⇄ tools loop (parallel tool calls, tool results, final answer) plus the `GraphEvent` stream, with zero network access. |
 | `parallel_fanout` | `cargo run --example parallel_fanout` | Dynamic fan-out / fan-in (map-reduce) via the `Send` API: a router emits one `Send` per item at runtime, workers run in parallel in a single super-step, and `Reducer::Append` merges results behind the barrier before a `summarize` node. |
 | `human_in_loop` | `cargo run --example human_in_loop` | Interrupt / resume with durable checkpoints: an `approve` node suspends the run via `NodeContext::interrupt`, a checkpoint is persisted to JSON files, and the run resumes from the same `thread_id` with the human's decision. |
-| `live_agent` | `cargo run --example live_agent` | **The hero live demo** — a real ReAct agent against any OpenAI-compatible endpoint (Ollama, OpenAI, vLLM, LM Studio) with three real tools (`get_current_time`, `calculator`, `word_count`) and a live pretty-printed `GraphEvent` stream. Graceful exit 0 with setup instructions when no endpoint is reachable (CI-safe). |
+| `live_agent` | `cargo run --example live_agent` | A live ReAct agent against any OpenAI-compatible endpoint (Ollama, OpenAI, vLLM, LM Studio) with three real tools (`get_current_time`, `calculator`, `word_count`) and a pretty-printed `GraphEvent` stream including live token deltas (via `create_react_agent_streaming`). Graceful exit 0 with setup instructions when no endpoint is reachable (CI-safe). |
 
 The first three examples are fully offline and deterministic; only
 `live_agent` needs a running model server.
