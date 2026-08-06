@@ -143,11 +143,18 @@ impl GraphRegistry {
 /// Server configuration.
 ///
 /// Checkpointing is rooted at `store_path` via
-/// [`agentgraph::checkpoint::JsonFileCheckpointer`]; auth is a single static
-/// API key checked against the `X-Api-Key` header when set. With the
-/// `postgres` feature, [`ServerConfig::with_postgres`] switches **both** the
-/// run checkpointer (core's `PostgresCheckpointer`) and the server store
-/// (assistants / crons / KV) to Postgres.
+/// [`agentgraph::checkpoint::JsonFileCheckpointer`]. Auth maps static API
+/// keys (checked against the `X-Api-Key` header) to tenants: the legacy
+/// single [`ServerConfig::with_api_key`] maps its key to the `default`
+/// tenant, while [`ServerConfig::with_tenant_key`] adds `(tenant, key)`
+/// pairs for multi-tenant deployments. With no keys configured the server
+/// runs in open (dev) mode — no header required, everything lives in the
+/// `default` tenant. Every tenant-scoped resource (threads + checkpoints,
+/// assistants, crons, KV namespaces) is isolated per tenant; cross-tenant
+/// access answers `404`. With the `postgres` feature,
+/// [`ServerConfig::with_postgres`] switches **both** the run checkpointer
+/// (core's `PostgresCheckpointer`) and the server store (assistants /
+/// crons / KV) to Postgres.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// Address to bind when using [`serve`] (default `0.0.0.0:8080`).
@@ -172,9 +179,16 @@ pub struct ServerConfig {
     /// (default 1). There is always at most one *active* run per thread.
     pub max_concurrent_runs_per_thread: usize,
 
-    /// Static API key required via the `X-Api-Key` header. `None` (the
-    /// default) is dev mode: no authentication.
+    /// Static API key required via the `X-Api-Key` header, mapped to the
+    /// `default` tenant (legacy single-key mode). `None` (the default) with
+    /// an empty [`ServerConfig::api_keys`] is dev mode: no authentication.
     pub api_key: Option<String>,
+
+    /// Additional `(api_key, tenant)` pairs for multi-tenant deployments
+    /// (see [`ServerConfig::with_tenant_key`]). Each key maps to exactly one
+    /// tenant; every tenant's threads, assistants, crons, and KV namespaces
+    /// are isolated from all others (cross-tenant access answers `404`).
+    pub api_keys: Vec<(String, String)>,
 
     /// Per-run SSE event-log capacity (frames retained for replay, default
     /// 1000).
@@ -189,6 +203,7 @@ impl Default for ServerConfig {
             database_url: None,
             max_concurrent_runs_per_thread: 1,
             api_key: None,
+            api_keys: Vec::new(),
             event_log_capacity: 1000,
         }
     }
@@ -205,10 +220,60 @@ impl ServerConfig {
         }
     }
 
-    /// Builder-style: require an API key on every request.
+    /// Builder-style: require an API key on every request. The key maps to
+    /// the `default` tenant (legacy single-tenant mode).
     pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
         self
+    }
+
+    /// Builder-style: map an API key to a tenant (multi-tenant mode). Every
+    /// request presenting `key` via `X-Api-Key` runs as `tenant`, fully
+    /// isolated from all other tenants. Tenant ids must match
+    /// `[A-Za-z0-9._-]` (1–64 chars) — they become a path segment in the
+    /// JSON-file layout and a `{tenant}/` id prefix everywhere else.
+    ///
+    /// # Panics
+    ///
+    /// Panics on an empty key or an invalid tenant id (configuration is a
+    /// programmer error, caught at startup).
+    pub fn with_tenant_key(mut self, tenant: impl Into<String>, key: impl Into<String>) -> Self {
+        let tenant = tenant.into();
+        let key = key.into();
+        let valid = !tenant.is_empty()
+            && tenant.len() <= 64
+            && tenant
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+        assert!(
+            valid,
+            "invalid tenant id `{tenant}` (allowed: [A-Za-z0-9._-], 1..=64 chars)"
+        );
+        assert!(
+            !key.is_empty(),
+            "API key for tenant `{tenant}` must not be empty"
+        );
+        self.api_keys.push((key, tenant));
+        self
+    }
+
+    /// `true` when at least one API key is configured (legacy `api_key` or
+    /// any tenant key), i.e. requests must authenticate.
+    pub fn auth_enabled(&self) -> bool {
+        self.api_key.is_some() || !self.api_keys.is_empty()
+    }
+
+    /// The tenant a presented API key maps to, or `None` for unknown keys.
+    /// Tenant keys are checked first (last registration wins on duplicate
+    /// keys); the legacy `api_key` maps to the `default` tenant.
+    pub fn tenant_for_key(&self, key: &str) -> Option<&str> {
+        if let Some((_, tenant)) = self.api_keys.iter().rev().find(|(k, _)| k == key) {
+            return Some(tenant.as_str());
+        }
+        if self.api_key.as_deref() == Some(key) {
+            return Some("default");
+        }
+        None
     }
 
     /// Builder-style: persist everything in Postgres at `url` (e.g.

@@ -10,7 +10,8 @@ Where the platform has been, what's landing this cycle, and what's next. Crates 
 | Durability & streaming + server Phase A | Postgres checkpointer, token streaming (`messages` mode), live example; axum server: threads, runs, SSE, auth | `agentgraph` v0.2.0, `agentgraph-server` v0.1.0 | ✅ Shipped | 2026-08-05 |
 | **v0.3 — interop & distribution** | MCP client, remote nodes + worker SDK, server API completion, executor tracing | `agentgraph` v0.3.0, `agentgraph-server` v0.2.0, `agentgraph-worker` v0.1.0 | ✅ Shipped | 2026-08-05 |
 | **v0.4 — production hardening** | WASM nodes, time-travel core + server API, Postgres server store, OpenTelemetry export, Studio UI, permissive CORS | `agentgraph` v0.4.0, `agentgraph-server` v0.3.0, `agentgraph-otel` v0.1.0 | ✅ Shipped | 2026-08-05 |
-| Phase D — platform ambitions | Hosted multi-tenant service, WASM target, edge runtimes | TBD | 🌌 Ambitions | — |
+| **v0.5 — SDKs & tenancy** | Python SDK (stdlib-only), TypeScript SDK (zero-dep ESM), multi-tenant auth with full isolation, live-LLM validation + calculator fix | `agentgraph-server` v0.4.0, `sdks/*` v0.1.0 | ✅ Shipped | 2026-08-05 |
+| Phase D — platform ambitions | Hosted multi-tenant service (tenant isolation shipped in v0.5 — the first brick), WASM target, edge runtimes | TBD | 🌌 Ambitions | — |
 
 ## Shipped
 
@@ -41,6 +42,13 @@ Five workstreams landed concurrently this cycle:
 - **OpenTelemetry export** (new `agentgraph-otel` crate) — one-call tracing subscriber setup with optional OTLP span export, completing the v0.3 executor instrumentation story.
 - **Studio** (`studio/`, zero-build single-file UI) — connect bar, graph/thread panels, state + checkpoint-history viewers, all three run modes, interrupt/resume, and fork/replay against the real time-travel endpoints. The server now layers permissive CORS in `router()`, so the Studio can call it cross-origin (restrict it in production). See [docs/studio.md](studio.md).
 
+### Phase: v0.5 — SDKs & tenancy — `agentgraph-server` v0.4.0, `sdks/*` v0.1.0 (2026-08-05)
+
+- **Python SDK** (`sdks/python/`) — zero-dependency, stdlib-only client (`urllib.request` + `json`): the full thread/run/SSE/time-travel/assistant/cron/KV surface, verified by an e2e suite that boots the real `server_demo` binary. This is the "interop over HTTP" story made concrete — the polyglot path the rejected PyO3/napi-rs bindings were traded for.
+- **TypeScript SDK** (`sdks/typescript/`) — zero-dependency ESM client for Node ≥ 18 and browsers (global `fetch`, async-generator `runStream`), with hand-written type declarations and its own live-server e2e suite.
+- **Multi-tenant auth** (`agentgraph-server` v0.4.0) — `ServerConfig::with_tenant_key(tenant, key)` maps API keys to tenants; threads, runs, assistants, crons, and KV namespaces are fully isolated via internal `{tenant}/` id prefixing, cross-tenant access answers 404 (never 403), and open/dev mode stays byte-identical to before. **This is the first brick of the hosted control plane** — see Phase D.
+- **Live-LLM validation + calculator fix** — `examples/live_agent.rs` verified end-to-end against real Ollama models ([transcript](live-demo-transcript.md)); the run exposed (and a follow-up run confirmed the fix for) a calculator arg-parsing defect: quoted numeric args (`"128"`) failed `as_f64()` and silently computed `0 op 0`. The example now coerces numeric strings and alias keys, logs raw args on failure, and carries 5 unit tests.
+
 ## Explicitly rejected
 
 - **napi-rs / PyO3 bindings** — REJECTED: they'd freeze a trait surface that's still moving and split maintenance across three ecosystems; the HTTP/SSE server is the polyglot interop layer instead.
@@ -50,7 +58,7 @@ Five workstreams landed concurrently this cycle:
 
 Directional, not scheduled:
 
-- **Hosted multi-tenant service** — the server crate operated as a managed platform: tenant isolation, durable queues, autoscaling workers.
+- **Hosted multi-tenant service** — the server crate operated as a managed platform: tenant isolation, durable queues, autoscaling workers. **Partially started:** v0.5 shipped the tenant-isolation brick (per-tenant API keys, namespaced storage, 404-on-cross-tenant semantics) in `agentgraph-server` v0.4.0; durable queues and autoscaling remain open.
 - **WASM target** — run graphs themselves in the browser or edge runtimes (sans native checkpointers).
 - **Edge deployment** — single-digit-MB agent services on edge runtimes, leaning on Rust's footprint and the static-binary story.
 

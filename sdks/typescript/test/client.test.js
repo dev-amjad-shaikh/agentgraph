@@ -1,0 +1,484 @@
+/**
+ * agentgraph-client e2e tests — run against the REAL agentgraph-server demo
+ * binary (`cargo build --example server_demo` in agentgraph-server/).
+ *
+ * The suite builds the binary if missing, launches it as a child process
+ * (the demo binds 127.0.0.1:8100), polls /ok, exercises the full client
+ * surface, then kills the child and removes its scratch store directory.
+ *
+ * Run from the repo root:  node --test sdks/typescript/test/
+ */
+
+import { test, before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import { spawn, execSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { mkdir, rm } from 'node:fs/promises';
+import net from 'node:net';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import {
+  AgentGraphClient,
+  AgentGraphError,
+  AgentGraphTimeoutError,
+} from '../src/index.js';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = path.resolve(HERE, '..', '..', '..');
+const BINARY = path.join(
+  REPO_ROOT,
+  'agentgraph-server',
+  'target',
+  'debug',
+  'examples',
+  'server_demo',
+);
+const SERVER_MANIFEST = path.join(REPO_ROOT, 'agentgraph-server', 'Cargo.toml');
+const SCRATCH_DIR = path.join(REPO_ROOT, 'sdks', 'typescript', '.tmp-e2e');
+const BASE_URL = 'http://127.0.0.1:8100';
+const PORT = 8100;
+
+/** @type {import('node:child_process').ChildProcess | null} */
+let child = null;
+/** @type {AgentGraphClient} */
+let client;
+
+function isPortFree(port) {
+  return new Promise((resolve) => {
+    const socket = net.connect({ port, host: '127.0.0.1' });
+    socket.once('connect', () => {
+      socket.destroy();
+      resolve(false);
+    });
+    socket.once('error', () => resolve(true));
+    socket.setTimeout(1000, () => {
+      socket.destroy();
+      resolve(true);
+    });
+  });
+}
+
+async function waitForServer(url, attempts = 75, intervalMs = 200) {
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      const res = await fetch(`${url}/ok`);
+      if (res.ok) return;
+    } catch {
+      /* not up yet */
+    }
+    if (child && child.exitCode !== null) {
+      throw new Error(`server_demo exited early with code ${child.exitCode}`);
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  throw new Error(`server at ${url} did not become ready`);
+}
+
+before(async () => {
+  if (!existsSync(BINARY)) {
+    const cargoPath = `${process.env.HOME}/.cargo/bin:${process.env.PATH}`;
+    execSync(`cargo build --manifest-path "${SERVER_MANIFEST}" --example server_demo`, {
+      cwd: REPO_ROOT,
+      stdio: 'inherit',
+      env: { ...process.env, PATH: cargoPath },
+    });
+  }
+  assert.ok(existsSync(BINARY), `demo binary missing at ${BINARY}`);
+
+  if (!(await isPortFree(PORT))) {
+    throw new Error(
+      `port ${PORT} is already in use — the server_demo binary binds ` +
+        `127.0.0.1:${PORT} unconditionally. Free the port and re-run.`,
+    );
+  }
+
+  await rm(SCRATCH_DIR, { recursive: true, force: true });
+  await mkdir(SCRATCH_DIR, { recursive: true });
+
+  child = spawn(BINARY, [], {
+    cwd: SCRATCH_DIR, // demo's ./data/server-demo-checkpoints lands here
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  let stderr = '';
+  child.stderr.on('data', (chunk) => {
+    stderr += chunk;
+    if (stderr.length > 8192) stderr = stderr.slice(-8192);
+  });
+  child.once('exit', (code) => {
+    if (code !== null && code !== 0) {
+      console.error(`server_demo exited with code ${code}:\n${stderr}`);
+    }
+  });
+  // Last-resort cleanup if the test runner is killed mid-run.
+  process.on('exit', () => {
+    if (child && child.exitCode === null) child.kill('SIGKILL');
+  });
+
+  await waitForServer(BASE_URL);
+  client = new AgentGraphClient(BASE_URL);
+}, { timeout: 300_000 });
+
+after(async () => {
+  if (child && child.exitCode === null) {
+    child.kill('SIGTERM');
+    await Promise.race([
+      new Promise((r) => child.once('exit', r)),
+      new Promise((r) => setTimeout(r, 3000)),
+    ]);
+    if (child.exitCode === null) child.kill('SIGKILL');
+  }
+  await rm(SCRATCH_DIR, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------- helpers
+
+/** Fresh pipeline thread per test (one active run per thread on the server). */
+async function pipelineThread() {
+  const { thread_id } = await client.createThread('pipeline');
+  return thread_id;
+}
+
+async function pollRunTerminal(runId, attempts = 50, intervalMs = 100) {
+  for (let i = 0; i < attempts; i += 1) {
+    const status = await client.runStatus(runId);
+    if (!['pending', 'running'].includes(status.status)) return status;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  throw new Error(`run ${runId} did not reach a terminal state`);
+}
+
+// ------------------------------------------------------------------ tests
+
+test('info() reports service metadata and registered graphs', async () => {
+  const info = await client.info();
+  assert.equal(info.service, 'agentgraph-server');
+  assert.ok(info.version, 'version present');
+  assert.equal(info.checkpointer, 'json_file');
+  const names = info.graphs.map((g) => g.name).sort();
+  assert.deepEqual(names, ['pipeline', 'react_agent']);
+  const pipeline = info.graphs.find((g) => g.name === 'pipeline');
+  assert.deepEqual(pipeline.channels, ['log']);
+});
+
+test('createThread() creates a thread bound to a graph, with metadata', async () => {
+  const thread = await client.createThread('pipeline', { metadata: { origin: 'e2e' } });
+  assert.ok(thread.thread_id, 'thread_id present');
+  assert.equal(thread.graph, 'pipeline');
+  assert.equal(thread.metadata.origin, 'e2e');
+});
+
+test('runWait() runs the pipeline graph to a terminal success', async () => {
+  const tid = await pipelineThread();
+  const terminal = await client.runWait(tid, {});
+  assert.equal(terminal.status, 'success');
+  assert.deepEqual(terminal.output.log, ['first', 'second']);
+  assert.ok(terminal.run_id, 'run_id present');
+});
+
+test('getState() and history() expose checkpoints after a run', async () => {
+  const tid = await pipelineThread();
+  await client.runWait(tid, {});
+
+  const state = await client.getState(tid);
+  assert.deepEqual(state.values.log, ['first', 'second']);
+  assert.deepEqual(state.next, []);
+  assert.ok(state.checkpoint.checkpoint_id);
+  assert.equal(state.checkpoint.thread_id, tid);
+
+  const history = await client.history(tid);
+  assert.equal(history.length, 2, 'pipeline run writes two checkpoints');
+  assert.ok(history[0].checkpoint.step > history[1].checkpoint.step, 'newest first');
+
+  const limited = await client.history(tid, { limit: 1 });
+  assert.equal(limited.length, 1);
+  assert.equal(
+    limited[0].checkpoint.checkpoint_id,
+    history[0].checkpoint.checkpoint_id,
+  );
+});
+
+test('updateState() writes a new checkpoint', async () => {
+  const tid = await pipelineThread();
+  await client.runWait(tid, {});
+  await client.updateState(tid, { log: ['manual'] });
+  const state = await client.getState(tid);
+  assert.deepEqual(state.values.log, ['manual']);
+});
+
+test('run() starts a background run; runStatus() polls it to terminal', async () => {
+  const tid = await pipelineThread();
+  const record = await client.run(tid, {});
+  assert.ok(record.run_id, 'run_id present');
+  assert.equal(record.thread_id, tid);
+
+  const terminal = await pollRunTerminal(record.run_id);
+  assert.equal(terminal.status, 'success');
+  assert.equal(terminal.run_id, record.run_id);
+  assert.equal(terminal.graph, 'pipeline');
+  assert.deepEqual(terminal.output.log, ['first', 'second']);
+});
+
+test('runStream() yields metadata, updates/values, and end frames', async () => {
+  const tid = await pipelineThread();
+  const frames = [];
+  for await (const frame of client.runStream(tid, {})) {
+    frames.push(frame);
+  }
+
+  assert.ok(frames.length >= 3, `expected several frames, got ${frames.length}`);
+  assert.equal(frames[0].event, 'metadata', 'first frame is run metadata');
+  assert.ok(frames[0].data.run_id, 'metadata carries run_id');
+  assert.equal(frames[0].data.thread_id, tid);
+
+  const events = frames.map((f) => f.event);
+  assert.ok(events.includes('updates'), 'updates frames present');
+  assert.ok(events.includes('values'), 'values frames present');
+  const end = frames.at(-1);
+  assert.equal(end.event, 'end');
+  assert.equal(end.data.status, 'success');
+
+  // Frame ids look like {checkpoint_id}:{step}:{seq} with 1-based seq.
+  const withIds = frames.filter((f) => typeof f.id === 'string' && f.id.includes(':'));
+  assert.ok(withIds.length > 0, 'frames carry ids');
+  const seqs = withIds.map((f) => Number.parseInt(f.id.split(':').at(-1), 10));
+  assert.ok(
+    seqs.every((s, i) => i === 0 || s > seqs[i - 1]),
+    'sequence numbers increase monotonically',
+  );
+});
+
+test('runStream() honors the streamMode option as a payload filter', async () => {
+  const tid = await pipelineThread();
+  const events = [];
+  for await (const frame of client.runStream(tid, {}, { streamMode: ['updates'] })) {
+    events.push(frame.event);
+  }
+  assert.ok(events.includes('updates'));
+  assert.ok(!events.includes('values'), 'values frames filtered out');
+  assert.equal(events.at(-1), 'end');
+});
+
+test('fork() + checkpoint replay re-runs the graph tail on the fork', async () => {
+  const tid = await pipelineThread();
+  await client.runWait(tid, {});
+
+  const history = await client.history(tid);
+  const earliest = history.at(-1); // step 0: log=["first"], next=["second"]
+  assert.deepEqual(earliest.values.log, ['first']);
+
+  const fork = await client.fork(tid, { checkpointId: earliest.checkpoint.checkpoint_id });
+  assert.ok(fork.thread_id);
+  assert.equal(fork.checkpoints_copied, 1);
+
+  const forkState = await client.getState(fork.thread_id);
+  assert.deepEqual(forkState.values.log, ['first']);
+  assert.deepEqual(forkState.next, ['second']);
+
+  const replay = await client.runWait(fork.thread_id, {
+    checkpoint: { checkpoint_id: earliest.checkpoint.checkpoint_id },
+  });
+  assert.equal(replay.status, 'success');
+  assert.deepEqual(replay.output.log, ['first', 'second']);
+});
+
+test('kv store: put/get/list/delete round trip with 404 semantics', async () => {
+  const ns = 'e2e-kv';
+  const created = await client.kvPut(ns, 'b-key', { n: 1 });
+  assert.equal(created.namespace, ns);
+  assert.equal(created.key, 'b-key');
+  assert.deepEqual(created.value, { n: 1 });
+
+  await client.kvPut(ns, 'a-key', 'alpha');
+
+  const replaced = await client.kvPut(ns, 'b-key', { n: 2 });
+  assert.deepEqual(replaced.value, { n: 2 });
+  assert.equal(replaced.created_at, created.created_at, 'created_at preserved on replace');
+
+  const got = await client.kvGet(ns, 'b-key');
+  assert.deepEqual(got.value, { n: 2 });
+
+  const items = await client.kvList(ns);
+  assert.deepEqual(
+    items.map((i) => i.key),
+    ['a-key', 'b-key'],
+    'namespace listing is sorted by key',
+  );
+
+  await client.kvDelete(ns, 'b-key');
+  await assert.rejects(
+    () => client.kvGet(ns, 'b-key'),
+    (err) => err instanceof AgentGraphError && err.status === 404,
+  );
+
+  // Cleanup.
+  await client.kvDelete(ns, 'a-key');
+  assert.deepEqual(await client.kvList('never-written'), []);
+});
+
+test('assistants: create/list/get, and runWait by assistant_id', async () => {
+  const assistant = await client.createAssistant({
+    name: 'e2e-react',
+    graph: 'react_agent',
+    config: { recursion_limit: 10 },
+    metadata: { suite: 'e2e' },
+  });
+  assert.ok(assistant.assistant_id);
+
+  const listed = await client.listAssistants();
+  assert.ok(listed.some((a) => a.assistant_id === assistant.assistant_id));
+
+  const fetched = await client.getAssistant(assistant.assistant_id);
+  assert.equal(fetched.name, 'e2e-react');
+  assert.equal(fetched.graph, 'react_agent');
+
+  const tid = await client.createThread('react_agent');
+  const terminal = await client.runWait(tid.thread_id, {
+    assistant_id: assistant.assistant_id,
+    input: { messages: [{ role: 'user', content: 'say pong' }] },
+  });
+  assert.equal(terminal.status, 'success');
+});
+
+test('crons: create/list/delete with 404 after delete', async () => {
+  const cron = await client.createCron({
+    graph: 'pipeline',
+    intervalSecs: 3600, // far enough that it never fires during the suite
+    input: {},
+    metadata: { suite: 'e2e' },
+  });
+  const cronId = cron.cron_id ?? cron.id;
+  assert.ok(cronId, 'cron id present');
+
+  const listed = await client.listCrons();
+  assert.ok(listed.some((c) => (c.cron_id ?? c.id) === cronId));
+
+  await client.deleteCron(cronId);
+  await assert.rejects(
+    () => client.deleteCron(cronId),
+    (err) => err instanceof AgentGraphError && err.status === 404,
+  );
+});
+
+test('unknown thread surfaces AgentGraphError with status and body', async () => {
+  await assert.rejects(
+    () => client.getState('no-such-thread'),
+    (err) => {
+      assert.ok(err instanceof AgentGraphError);
+      assert.equal(err.status, 404);
+      assert.ok(err.body !== undefined, 'error body captured');
+      return true;
+    },
+  );
+});
+
+test('client-side timeout rejects with AgentGraphTimeoutError', async () => {
+  // Deterministic: a fetch that only settles when the client's AbortController
+  // fires. (Racing a 1 ms timeout against a localhost server is flaky.)
+  const hangingFetch = (_url, init) =>
+    new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => {
+        const err = new Error('The operation was aborted');
+        err.name = 'AbortError';
+        reject(err);
+      });
+    });
+  const impatient = new AgentGraphClient('http://unit.test', {
+    timeout: 10,
+    fetch: hangingFetch,
+  });
+  await assert.rejects(
+    () => impatient.info(),
+    (err) => err instanceof AgentGraphTimeoutError && err.timeoutMs === 10,
+  );
+});
+
+test('auth: demo server runs in dev mode (no API key configured)', async (t) => {
+  // The demo binary sets no API key, so requests without X-Api-Key must pass.
+  const info = await client.info();
+  assert.equal(info.service, 'agentgraph-server');
+
+  // A 401-without-key assertion only applies when a key IS configured.
+  // Detect auth enforcement by probing with a bogus key: in dev mode the
+  // server ignores it; with auth configured a wrong key yields 401.
+  const probe = await fetch(`${BASE_URL}/info`, { headers: { 'x-api-key': 'bogus' } });
+  if (probe.status === 200) {
+    t.skip('server has no API key configured (dev mode) — 401 case not applicable');
+    return;
+  }
+  assert.equal(probe.status, 401, 'bogus key rejected when auth is configured');
+});
+
+// ------------------------------------------- SSE parser unit tests (no I/O)
+
+test('SSE parser: multi-line data, comments, CRLF, Last-Event-ID header', async () => {
+  const captured = { url: null, init: null };
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(': keepalive\r\n\r\n'));
+      controller.enqueue(
+        encoder.encode('event: metadata\r\nid: -:0:1\r\ndata: {"run_id":"r1"}\r\n\r\n'),
+      );
+      controller.enqueue(encoder.encode('event: updates\nid: cp1:0:2\n'));
+      controller.enqueue(encoder.encode('data: {"step":0,\ndata: "updates":{"first":{}}}\n\n'));
+      controller.enqueue(encoder.encode('event: end\ndata: not-json\n\n'));
+      controller.close();
+    },
+  });
+  const fakeFetch = async (url, init) => {
+    captured.url = url;
+    captured.init = init;
+    return new Response(stream, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    });
+  };
+
+  const fake = new AgentGraphClient('http://unit.test', { fetch: fakeFetch });
+  const frames = [];
+  for await (const frame of fake.runStream('t1', { input: {} }, { lastEventId: 'cp0:0:1' })) {
+    frames.push(frame);
+  }
+
+  // Last-Event-ID resume header is sent verbatim.
+  assert.equal(captured.init.headers['last-event-id'], 'cp0:0:1');
+  assert.equal(captured.init.method, 'POST');
+  assert.match(captured.url, /\/threads\/t1\/runs\/stream$/);
+
+  assert.equal(frames.length, 3);
+  assert.deepEqual(frames[0], {
+    event: 'metadata',
+    data: { run_id: 'r1' },
+    id: '-:0:1',
+  });
+  // Multi-line data is joined with '\n' and JSON-parsed as one payload.
+  assert.equal(frames[1].event, 'updates');
+  assert.equal(frames[1].id, 'cp1:0:2');
+  assert.deepEqual(frames[1].data, { step: 0, updates: { first: {} } });
+  // Non-JSON payloads pass through as raw strings.
+  assert.deepEqual(frames[2], { event: 'end', data: 'not-json' });
+});
+
+test('SSE parser: api key and extra headers are sent on requests', async () => {
+  const captured = { init: null };
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('event: end\ndata: {"status":"success"}\n\n'));
+      controller.close();
+    },
+  });
+  const fakeFetch = async (_url, init) => {
+    captured.init = init;
+    return new Response(stream, { status: 200 });
+  };
+  const authed = new AgentGraphClient('http://unit.test', {
+    apiKey: 'secret-key',
+    fetch: fakeFetch,
+  });
+  const frames = [];
+  for await (const frame of authed.runStream('t1')) frames.push(frame);
+  assert.equal(captured.init.headers['x-api-key'], 'secret-key');
+  assert.equal(frames.length, 1);
+  assert.equal(frames[0].data.status, 'success');
+});

@@ -36,17 +36,13 @@ pub(crate) fn dir(store_root: &Path) -> PathBuf {
 }
 
 /// Load all persisted assistants, skipping (with a warning) any file that
-/// fails to parse.
+/// fails to parse. Tenant-scoped assistants live one directory deeper
+/// (`assistants/{tenant}/{assistant_id}.json`), so the walk is recursive.
 pub(crate) fn load(store_root: &Path) -> HashMap<String, AssistantRecord> {
     let mut out = HashMap::new();
-    let Ok(entries) = std::fs::read_dir(dir(store_root)) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
+    let mut files = Vec::new();
+    collect_json_files(&dir(store_root), &mut files);
+    for path in files {
         let parsed = std::fs::read_to_string(&path)
             .ok()
             .and_then(|raw| serde_json::from_str::<AssistantRecord>(&raw).ok());
@@ -62,10 +58,30 @@ pub(crate) fn load(store_root: &Path) -> HashMap<String, AssistantRecord> {
     out
 }
 
-/// Persist one assistant record (create or overwrite).
+/// Recursively collect `*.json` files under `root` (tenant subdirectories
+/// hold that tenant's records).
+fn collect_json_files(root: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_json_files(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            out.push(path);
+        }
+    }
+}
+
+/// Persist one assistant record (create or overwrite). The id may carry a
+/// `{tenant}/` prefix, so the parent directory is created, not just the
+/// flat assistants dir.
 pub(crate) async fn persist(store_root: &Path, record: &AssistantRecord) -> std::io::Result<()> {
-    let dir = dir(store_root);
-    tokio::fs::create_dir_all(&dir).await?;
+    let path = dir(store_root).join(format!("{}.json", record.assistant_id));
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
     let raw = serde_json::to_vec_pretty(record).expect("assistant serialization is infallible");
-    tokio::fs::write(dir.join(format!("{}.json", record.assistant_id)), raw).await
+    tokio::fs::write(path, raw).await
 }

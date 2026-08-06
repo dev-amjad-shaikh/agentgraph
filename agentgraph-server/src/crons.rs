@@ -120,17 +120,13 @@ pub(crate) fn dir(store_root: &Path) -> PathBuf {
 }
 
 /// Load all persisted crons, skipping (with a warning) any file that fails
-/// to parse.
+/// to parse. Tenant-scoped crons live one directory deeper
+/// (`crons/{tenant}/{cron_id}.json`), so the walk is recursive.
 pub(crate) fn load(store_root: &Path) -> HashMap<String, CronRecord> {
     let mut out = HashMap::new();
-    let Ok(entries) = std::fs::read_dir(dir(store_root)) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
+    let mut files = Vec::new();
+    collect_json_files(&dir(store_root), &mut files);
+    for path in files {
         let parsed = std::fs::read_to_string(&path)
             .ok()
             .and_then(|raw| serde_json::from_str::<CronRecord>(&raw).ok());
@@ -146,12 +142,32 @@ pub(crate) fn load(store_root: &Path) -> HashMap<String, CronRecord> {
     out
 }
 
-/// Persist one cron record (create or overwrite).
+/// Recursively collect `*.json` files under `root` (tenant subdirectories
+/// hold that tenant's records).
+fn collect_json_files(root: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_json_files(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            out.push(path);
+        }
+    }
+}
+
+/// Persist one cron record (create or overwrite). The id may carry a
+/// `{tenant}/` prefix, so the parent directory is created, not just the
+/// flat crons dir.
 pub(crate) async fn persist(store_root: &Path, record: &CronRecord) -> std::io::Result<()> {
-    let dir = dir(store_root);
-    tokio::fs::create_dir_all(&dir).await?;
+    let path = dir(store_root).join(format!("{}.json", record.cron_id));
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
     let raw = serde_json::to_vec_pretty(record).expect("cron serialization is infallible");
-    tokio::fs::write(dir.join(format!("{}.json", record.cron_id)), raw).await
+    tokio::fs::write(path, raw).await
 }
 
 /// Spawn the background scheduler task. Lives for the app's lifetime; the
@@ -199,16 +215,25 @@ pub(crate) fn spawn_scheduler(state: Arc<AppState>) {
 
 /// One firing: create a fresh thread, schedule the cron's run on it, update
 /// bookkeeping, and honor `on_run_completed`.
+///
+/// The scheduler lists crons across **all** tenants; each cron's id carries
+/// its `{tenant}/` prefix, so the firing is scoped back into the owning
+/// tenant: the fresh thread lives under the tenant's internal id namespace
+/// and its record reports the external (unprefixed) cron id.
 async fn fire(state: Arc<AppState>, cron: CronRecord) {
+    let tenant = crate::auth::tenant_of_internal(&cron.cron_id);
+    let external_cron_id = crate::auth::strip_owned(tenant, &cron.cron_id).unwrap_or(&cron.cron_id);
     let thread_id = uuid::Uuid::new_v4().to_string();
+    let internal_thread_id = crate::auth::scope_id(tenant, &thread_id);
     {
         let mut threads = state.threads.lock().await;
         threads.insert(
-            thread_id.clone(),
+            internal_thread_id.clone(),
             ThreadRecord {
                 thread_id: thread_id.clone(),
+                tenant: tenant.to_string(),
                 graph: cron.graph.clone(),
-                metadata: json!({"cron_id": cron.cron_id, "trigger": "cron"}),
+                metadata: json!({"cron_id": external_cron_id, "trigger": "cron"}),
                 created_at: Utc::now(),
             },
         );
@@ -216,12 +241,13 @@ async fn fire(state: Arc<AppState>, cron: CronRecord) {
 
     let payload = RunPayload {
         input: cron.input.clone(),
-        metadata: Some(json!({"cron_id": cron.cron_id})),
+        metadata: Some(json!({"cron_id": external_cron_id})),
         ..RunPayload::default()
     };
     let fired_at = Utc::now();
     let scheduled = runs::schedule(
         &state.run_deps,
+        &internal_thread_id,
         &thread_id,
         &cron.graph,
         payload,

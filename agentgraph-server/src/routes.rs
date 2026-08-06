@@ -11,7 +11,7 @@ use axum::extract::{Path, State as AxumState};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{delete, get, post, put};
-use axum::{middleware, Json, Router};
+use axum::{middleware, Extension, Json, Router};
 use chrono::{DateTime, Utc};
 use futures::Stream;
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use crate::assistants::AssistantRecord;
+use crate::auth::TenantContext;
 use crate::crons::{self, CronRecord, OnRunCompleted};
 use crate::error::ApiError;
 use crate::runs::{
@@ -30,9 +31,15 @@ use crate::{store, GraphRegistry, ServerConfig};
 
 /// A thread: a conversation/session bound to one registered graph at
 /// creation time (design doc §8, open question 2 — per-thread binding).
+///
+/// Threads are tenant-scoped: the in-memory map is keyed by the **internal**
+/// id (`{tenant}/{thread_id}`; the default tenant stays unprefixed), while
+/// `thread_id` here is always the external id clients see on the wire.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ThreadRecord {
     pub thread_id: String,
+    /// Owning tenant (resolved from the API key at creation time).
+    pub tenant: String,
     pub graph: String,
     pub metadata: Value,
     pub created_at: DateTime<Utc>,
@@ -144,20 +151,49 @@ fn internal_err<E: std::fmt::Display>(e: E) -> ApiError {
     ApiError::internal(e.to_string())
 }
 
-async fn require_thread(state: &AppState, thread_id: &str) -> Result<ThreadRecord, ApiError> {
+/// Fetch the caller's thread record by external id. Lookup happens under
+/// the tenant's internal id namespace, so another tenant's thread simply
+/// does not exist here — cross-tenant access answers 404 (never 403, to
+/// avoid leaking the thread's existence).
+async fn require_thread(
+    state: &AppState,
+    tenant: &TenantContext,
+    thread_id: &str,
+) -> Result<ThreadRecord, ApiError> {
     state
         .threads
         .lock()
         .await
-        .get(thread_id)
+        .get(&tenant.scope(thread_id))
         .cloned()
         .ok_or_else(|| ApiError::not_found(format!("thread `{thread_id}` not found")))
 }
 
-fn checkpoint_ref(cp: &Checkpoint) -> Value {
+/// Validate a client-chosen resource id (thread / assistant / cron). Ids
+/// become path segments under the store root and carry a `{tenant}/`
+/// prefix internally, so they must be non-empty, bounded, and free of path
+/// separators; all-dots ids are rejected (parent-directory components).
+fn validate_client_id(kind: &str, id: &str) -> Result<(), ApiError> {
+    let ok = !id.is_empty()
+        && id.len() <= 256
+        && !id.contains('/')
+        && !id.contains('\\')
+        && !id.chars().all(|c| c == '.');
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(format!(
+            "invalid {kind} `{id}` (must be non-empty, <= 256 chars, no path separators)"
+        )))
+    }
+}
+
+fn checkpoint_ref(cp: &Checkpoint, tenant: &TenantContext) -> Value {
     json!({
         "checkpoint_id": cp.id,
-        "thread_id": cp.thread_id,
+        // Checkpoints persist the internal (tenant-scoped) thread id; the
+        // wire always shows the external one.
+        "thread_id": tenant.unscope(&cp.thread_id).unwrap_or(&cp.thread_id),
         "step": cp.step,
         "created_at": cp.created_at,
     })
@@ -215,6 +251,7 @@ struct CreateThreadPayload {
 
 async fn create_thread(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
     Json(payload): Json<CreateThreadPayload>,
 ) -> Result<(StatusCode, Json<ThreadRecord>), ApiError> {
     if !state.registry.contains(&payload.graph) {
@@ -227,20 +264,23 @@ async fn create_thread(
         .thread_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    validate_client_id("thread_id", &thread_id)?;
 
+    let internal_id = tenant.scope(&thread_id);
     let mut threads = state.threads.lock().await;
-    if threads.contains_key(&thread_id) {
+    if threads.contains_key(&internal_id) {
         return Err(ApiError::conflict(format!(
             "thread `{thread_id}` already exists"
         )));
     }
     let record = ThreadRecord {
         thread_id: thread_id.clone(),
+        tenant: tenant.tenant().to_string(),
         graph: payload.graph,
         metadata: payload.metadata.unwrap_or(Value::Null),
         created_at: Utc::now(),
     };
-    threads.insert(thread_id, record.clone());
+    threads.insert(internal_id, record.clone());
     Ok((StatusCode::CREATED, Json(record)))
 }
 
@@ -265,27 +305,35 @@ struct ForkThreadPayload {
 /// replay it with `"checkpoint": {"checkpoint_id": …}` on run-create.
 async fn fork_thread(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
     Path(thread_id): Path<String>,
     Json(payload): Json<ForkThreadPayload>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let record = require_thread(&state, &thread_id).await?;
+    let record = require_thread(&state, &tenant, &thread_id).await?;
     let new_thread_id = payload
         .new_thread_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    validate_client_id("new_thread_id", &new_thread_id)?;
 
+    let new_internal_id = tenant.scope(&new_thread_id);
     {
         let threads = state.threads.lock().await;
-        if threads.contains_key(&new_thread_id) {
+        if threads.contains_key(&new_internal_id) {
             return Err(ApiError::conflict(format!(
                 "thread `{new_thread_id}` already exists"
             )));
         }
     }
 
+    // Fork inside the tenant's checkpoint namespace.
     let copied = state
         .checkpointer
-        .fork_thread(&thread_id, &new_thread_id, payload.checkpoint_id.as_deref())
+        .fork_thread(
+            &tenant.scope(&thread_id),
+            &new_internal_id,
+            payload.checkpoint_id.as_deref(),
+        )
         .await
         .map_err(|e| {
             let message = e.to_string();
@@ -299,6 +347,7 @@ async fn fork_thread(
 
     let fork = ThreadRecord {
         thread_id: new_thread_id.clone(),
+        tenant: tenant.tenant().to_string(),
         graph: record.graph,
         metadata: json!({
             "forked_from": thread_id,
@@ -306,11 +355,7 @@ async fn fork_thread(
         }),
         created_at: Utc::now(),
     };
-    state
-        .threads
-        .lock()
-        .await
-        .insert(new_thread_id.clone(), fork);
+    state.threads.lock().await.insert(new_internal_id, fork);
 
     Ok((
         StatusCode::CREATED,
@@ -327,12 +372,13 @@ async fn fork_thread(
 
 async fn get_state(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
     Path(thread_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    require_thread(&state, &thread_id).await?;
+    require_thread(&state, &tenant, &thread_id).await?;
     let latest = state
         .checkpointer
-        .get_latest(&thread_id)
+        .get_latest(&tenant.scope(&thread_id))
         .await
         .map_err(internal_err)?;
     Ok(Json(match latest {
@@ -340,7 +386,7 @@ async fn get_state(
         Some(cp) => json!({
             "values": cp.state.to_value(),
             "next": cp.next_nodes,
-            "checkpoint": checkpoint_ref(&cp),
+            "checkpoint": checkpoint_ref(&cp, &tenant),
         }),
     }))
 }
@@ -360,10 +406,11 @@ struct UpdateStatePayload {
 
 async fn update_state(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
     Path(thread_id): Path<String>,
     Json(payload): Json<UpdateStatePayload>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    require_thread(&state, &thread_id).await?;
+    require_thread(&state, &tenant, &thread_id).await?;
     let UpdateStatePayload {
         values,
         as_node,
@@ -371,18 +418,24 @@ async fn update_state(
     } = payload;
     let _ = as_node;
 
+    let internal_id = tenant.scope(&thread_id);
     let new_state = State::from_value(values)
         .map_err(|e| ApiError::bad_request(format!("`values` must be a JSON object: {e}")))?;
     let latest = state
         .checkpointer
-        .get_latest(&thread_id)
+        .get_latest(&internal_id)
         .await
         .map_err(internal_err)?;
     let (step, prev_next) = latest
         .map(|cp| (cp.step + 1, cp.next_nodes))
         .unwrap_or((0, Vec::new()));
 
-    let cp = Checkpoint::new(&thread_id, step, new_state, next_nodes.unwrap_or(prev_next));
+    let cp = Checkpoint::new(
+        &internal_id,
+        step,
+        new_state,
+        next_nodes.unwrap_or(prev_next),
+    );
     state
         .checkpointer
         .put(cp.clone())
@@ -394,7 +447,7 @@ async fn update_state(
         Json(json!({
             "values": cp.state.to_value(),
             "next": cp.next_nodes,
-            "checkpoint": checkpoint_ref(&cp),
+            "checkpoint": checkpoint_ref(&cp, &tenant),
         })),
     ))
 }
@@ -410,13 +463,14 @@ struct HistoryPayload {
 
 async fn history(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
     Path(thread_id): Path<String>,
     Json(payload): Json<HistoryPayload>,
 ) -> Result<Json<Value>, ApiError> {
-    require_thread(&state, &thread_id).await?;
+    require_thread(&state, &tenant, &thread_id).await?;
     let mut checkpoints = state
         .checkpointer
-        .list(&thread_id)
+        .list(&tenant.scope(&thread_id))
         .await
         .map_err(internal_err)?;
     checkpoints.reverse(); // newest first
@@ -436,7 +490,7 @@ async fn history(
             json!({
                 "values": cp.state.to_value(),
                 "next": cp.next_nodes,
-                "checkpoint": checkpoint_ref(cp),
+                "checkpoint": checkpoint_ref(cp, &tenant),
             })
         })
         .collect();
@@ -449,10 +503,12 @@ async fn history(
 
 async fn schedule_for_thread(
     state: &Arc<AppState>,
+    tenant: &TenantContext,
     thread_id: &str,
     mut payload: RunPayload,
 ) -> Result<runs::Scheduled, ApiError> {
-    let record = require_thread(state, thread_id).await?;
+    let record = require_thread(state, tenant, thread_id).await?;
+    let internal_id = tenant.scope(thread_id);
     if let Some(input) = &payload.input {
         if !input.is_object() {
             return Err(ApiError::bad_request(
@@ -461,9 +517,11 @@ async fn schedule_for_thread(
         }
     }
     if let Some(assistant_id) = &payload.assistant_id {
+        // Assistants are tenant-scoped: another tenant's assistant id
+        // resolves to nothing here → 404.
         let assistant = state
             .server_store
-            .get_assistant(assistant_id)
+            .get_assistant(&tenant.scope(assistant_id))
             .await
             .map_err(internal_err)?
             .ok_or_else(|| ApiError::not_found(format!("assistant `{assistant_id}` not found")))?;
@@ -494,7 +552,7 @@ async fn schedule_for_thread(
         // replay would fail deep inside the executor — answer 404 up front.
         let found = state
             .checkpointer
-            .get_by_id(thread_id, &checkpoint.checkpoint_id)
+            .get_by_id(&internal_id, &checkpoint.checkpoint_id)
             .await
             .map_err(internal_err)?;
         if found.is_none() {
@@ -506,16 +564,25 @@ async fn schedule_for_thread(
     }
     let strategy = MultitaskStrategy::parse(payload.multitask_strategy.as_deref())
         .map_err(ApiError::bad_request)?;
-    runs::schedule(&state.run_deps, thread_id, &record.graph, payload, strategy).await
+    runs::schedule(
+        &state.run_deps,
+        &internal_id,
+        thread_id,
+        &record.graph,
+        payload,
+        strategy,
+    )
+    .await
 }
 
 /// `POST /threads/{id}/runs` — background run: `202 + run_id`.
 async fn create_run(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
     Path(thread_id): Path<String>,
     Json(payload): Json<RunPayload>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let scheduled = schedule_for_thread(&state, &thread_id, payload).await?;
+    let scheduled = schedule_for_thread(&state, &tenant, &thread_id, payload).await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(json!({
@@ -529,10 +596,11 @@ async fn create_run(
 /// `POST /threads/{id}/runs/wait` — blocking run: terminal result as JSON.
 async fn create_run_wait(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
     Path(thread_id): Path<String>,
     Json(payload): Json<RunPayload>,
 ) -> Result<Json<Value>, ApiError> {
-    let scheduled = schedule_for_thread(&state, &thread_id, payload).await?;
+    let scheduled = schedule_for_thread(&state, &tenant, &thread_id, payload).await?;
     let mut terminal = scheduled.terminal;
     let result = terminal
         .wait_for(|v| v.is_some())
@@ -545,13 +613,14 @@ async fn create_run_wait(
 /// `POST /threads/{id}/runs/stream` — run with SSE streaming.
 async fn create_run_stream(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
     Path(thread_id): Path<String>,
     headers: HeaderMap,
     Json(payload): Json<RunPayload>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let last_seen =
         sse::parse_last_event_id(headers.get("last-event-id").and_then(|v| v.to_str().ok()));
-    let scheduled = schedule_for_thread(&state, &thread_id, payload).await?;
+    let scheduled = schedule_for_thread(&state, &tenant, &thread_id, payload).await?;
     let stream = sse::frame_stream(scheduled.replay, scheduled.broadcast, last_seen);
     Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
@@ -564,16 +633,21 @@ async fn create_run_stream(
 /// finished run created, re-anchoring the thread to the pre-run checkpoint.
 async fn delete_run_checkpoints(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
     Path((thread_id, run_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    require_thread(&state, &thread_id).await?;
+    require_thread(&state, &tenant, &thread_id).await?;
     let info = state
         .run_deps
         .manager
         .info(&run_id)
         .await
         .ok_or_else(|| ApiError::not_found(format!("run `{run_id}` not found")))?;
-    if info.thread_id != thread_id {
+    // Cross-tenant runs are invisible (404, not 403).
+    if !tenant.owns(&info.thread_id) {
+        return Err(ApiError::not_found(format!("run `{run_id}` not found")));
+    }
+    if info.wire_thread_id != thread_id {
         return Err(ApiError::bad_request(format!(
             "run `{run_id}` does not belong to thread `{thread_id}`"
         )));
@@ -589,7 +663,8 @@ async fn delete_run_checkpoints(
         .lock()
         .expect("checkpoint ids lock poisoned")
         .clone();
-    let dir = state.config.store_path.join(&thread_id);
+    let internal_id = tenant.scope(&thread_id);
+    let dir = state.config.store_path.join(&internal_id);
     let mut deleted = 0usize;
     for id in &ids {
         let path = dir.join(format!("{id}.json"));
@@ -608,7 +683,7 @@ async fn delete_run_checkpoints(
     // Re-anchor the latest pointer to the newest remaining checkpoint.
     let remaining = state
         .checkpointer
-        .list(&thread_id)
+        .list(&internal_id)
         .await
         .map_err(internal_err)?;
     let latest_path = dir.join("latest");
@@ -635,8 +710,11 @@ async fn delete_run_checkpoints(
 
 /// `GET /runs/{run_id}` — poll a run's lifecycle status; once terminal, the
 /// response carries the run's `output` / `error` / `interrupt` fields.
+/// Runs are tenant-scoped through their thread: a run whose thread belongs
+/// to another tenant answers 404.
 async fn get_run(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
     Path(run_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let info = state
@@ -645,9 +723,12 @@ async fn get_run(
         .info(&run_id)
         .await
         .ok_or_else(|| ApiError::not_found(format!("run `{run_id}` not found")))?;
+    if !tenant.owns(&info.thread_id) {
+        return Err(ApiError::not_found(format!("run `{run_id}` not found")));
+    }
     let mut body = json!({
         "run_id": run_id,
-        "thread_id": info.thread_id,
+        "thread_id": info.wire_thread_id,
         "graph": info.graph,
         "attempt": info.attempt,
         "status": info.status.as_str(),
@@ -685,6 +766,7 @@ struct CreateAssistantPayload {
 
 async fn create_assistant(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
     Json(payload): Json<CreateAssistantPayload>,
 ) -> Result<(StatusCode, Json<AssistantRecord>), ApiError> {
     if payload.name.trim().is_empty() {
@@ -702,9 +784,11 @@ async fn create_assistant(
         .assistant_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    validate_client_id("assistant_id", &assistant_id)?;
 
+    // Persist under the tenant's internal id; the wire shows the external id.
     let record = AssistantRecord {
-        assistant_id: assistant_id.clone(),
+        assistant_id: tenant.scope(&assistant_id),
         name: payload.name,
         graph: payload.graph,
         config: payload.config.unwrap_or(Value::Null),
@@ -721,17 +805,29 @@ async fn create_assistant(
             "assistant `{assistant_id}` already exists"
         )));
     }
-    Ok((StatusCode::CREATED, Json(record)))
+    let mut wire = record;
+    wire.assistant_id = assistant_id;
+    Ok((StatusCode::CREATED, Json(wire)))
 }
 
 async fn list_assistants(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
 ) -> Result<Json<Value>, ApiError> {
-    let mut records = state
+    let records = state
         .server_store
         .list_assistants()
         .await
         .map_err(internal_err)?;
+    // Only this tenant's assistants, reported with their external ids.
+    let mut records: Vec<AssistantRecord> = records
+        .into_iter()
+        .filter_map(|mut record| {
+            let external = tenant.unscope(&record.assistant_id)?.to_string();
+            record.assistant_id = external;
+            Some(record)
+        })
+        .collect();
     records.sort_by(|a, b| {
         a.created_at
             .cmp(&b.created_at)
@@ -742,14 +838,18 @@ async fn list_assistants(
 
 async fn get_assistant(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
     Path(assistant_id): Path<String>,
 ) -> Result<Json<AssistantRecord>, ApiError> {
     state
         .server_store
-        .get_assistant(&assistant_id)
+        .get_assistant(&tenant.scope(&assistant_id))
         .await
         .map_err(internal_err)?
-        .map(Json)
+        .map(|mut record| {
+            record.assistant_id = assistant_id.clone();
+            Json(record)
+        })
         .ok_or_else(|| ApiError::not_found(format!("assistant `{assistant_id}` not found")))
 }
 
@@ -783,6 +883,7 @@ struct CreateCronPayload {
 
 async fn create_cron(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
     Json(payload): Json<CreateCronPayload>,
 ) -> Result<(StatusCode, Json<CronRecord>), ApiError> {
     if !state.registry.contains(&payload.graph) {
@@ -806,9 +907,12 @@ async fn create_cron(
         .cron_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    validate_client_id("cron_id", &cron_id)?;
 
+    // Persist under the tenant's internal id; the wire shows the external
+    // id. The scheduler derives the owning tenant back from the prefix.
     let record = CronRecord {
-        cron_id: cron_id.clone(),
+        cron_id: tenant.scope(&cron_id),
         graph: payload.graph,
         interval_secs: payload.interval_secs,
         cron_expr: payload.cron_expr,
@@ -829,15 +933,29 @@ async fn create_cron(
             "cron `{cron_id}` already exists"
         )));
     }
-    Ok((StatusCode::CREATED, Json(record)))
+    let mut wire = record;
+    wire.cron_id = cron_id;
+    Ok((StatusCode::CREATED, Json(wire)))
 }
 
-async fn list_crons(AxumState(state): AxumState<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
-    let mut records = state
+async fn list_crons(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
+) -> Result<Json<Value>, ApiError> {
+    let records = state
         .server_store
         .list_crons()
         .await
         .map_err(internal_err)?;
+    // Only this tenant's crons, reported with their external ids.
+    let mut records: Vec<CronRecord> = records
+        .into_iter()
+        .filter_map(|mut record| {
+            let external = tenant.unscope(&record.cron_id)?.to_string();
+            record.cron_id = external;
+            Some(record)
+        })
+        .collect();
     records.sort_by(|a, b| {
         a.created_at
             .cmp(&b.created_at)
@@ -848,11 +966,12 @@ async fn list_crons(AxumState(state): AxumState<Arc<AppState>>) -> Result<Json<V
 
 async fn delete_cron(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
     Path(cron_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     if state
         .server_store
-        .delete_cron(&cron_id)
+        .delete_cron(&tenant.scope(&cron_id))
         .await
         .map_err(internal_err)?
     {
@@ -868,16 +987,20 @@ async fn delete_cron(
 
 async fn put_store_item(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
     Path((namespace, key)): Path<(String, String)>,
     Json(value): Json<Value>,
 ) -> Result<(StatusCode, Json<store::StoreItem>), ApiError> {
     store::validate_segment("namespace", &namespace)?;
     store::validate_segment("key", &key)?;
-    let (item, created) = state
+    // KV namespaces are tenant-scoped: the internal namespace carries the
+    // `{tenant}/` prefix, the wire item reports the external namespace.
+    let (mut item, created) = state
         .server_store
-        .kv_put(&namespace, &key, value)
+        .kv_put(&tenant.scope(&namespace), &key, value)
         .await
         .map_err(internal_err)?;
+    item.namespace = namespace;
     let status = if created {
         StatusCode::CREATED
     } else {
@@ -888,28 +1011,33 @@ async fn put_store_item(
 
 async fn get_store_item(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
     Path((namespace, key)): Path<(String, String)>,
 ) -> Result<Json<store::StoreItem>, ApiError> {
     store::validate_segment("namespace", &namespace)?;
     store::validate_segment("key", &key)?;
     state
         .server_store
-        .kv_get(&namespace, &key)
+        .kv_get(&tenant.scope(&namespace), &key)
         .await
         .map_err(internal_err)?
-        .map(Json)
+        .map(|mut item| {
+            item.namespace = namespace.clone();
+            Json(item)
+        })
         .ok_or_else(|| ApiError::not_found(format!("no store item at `{namespace}/{key}`")))
 }
 
 async fn delete_store_item(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
     Path((namespace, key)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
     store::validate_segment("namespace", &namespace)?;
     store::validate_segment("key", &key)?;
     if state
         .server_store
-        .kv_delete(&namespace, &key)
+        .kv_delete(&tenant.scope(&namespace), &key)
         .await
         .map_err(internal_err)?
     {
@@ -925,13 +1053,21 @@ async fn delete_store_item(
 
 async fn list_store_namespace(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
     Path(namespace): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     store::validate_segment("namespace", &namespace)?;
     let items = state
         .server_store
-        .kv_list(&namespace)
+        .kv_list(&tenant.scope(&namespace))
         .await
         .map_err(internal_err)?;
+    let items: Vec<store::StoreItem> = items
+        .into_iter()
+        .map(|mut item| {
+            item.namespace = namespace.clone();
+            item
+        })
+        .collect();
     Ok(Json(json!(items)))
 }

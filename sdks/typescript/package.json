@@ -1,0 +1,35 @@
+{
+  "name": "agentgraph-client",
+  "version": "0.1.0",
+  "description": "Zero-dependency JS/TS client for agentgraph-server (HTTP + SSE). Works in Node.js >= 18 and browsers.",
+  "type": "module",
+  "main": "./src/index.js",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.js",
+      "default": "./src/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "keywords": [
+    "agentgraph",
+    "agent",
+    "llm",
+    "graph",
+    "sse",
+    "agent-protocol"
+  ],
+  "license": "MIT OR Apache-2.0"
+}

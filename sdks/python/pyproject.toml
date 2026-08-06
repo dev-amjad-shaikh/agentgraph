@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentgraph-client"
+version = "0.1.0"
+description = "Zero-dependency, stdlib-only Python client for agentgraph-server (threads, runs, SSE streaming, time travel, assistants, crons, KV store)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT OR Apache-2.0" }
+keywords = ["agentgraph", "agents", "langgraph", "sse", "llm", "orchestration"]
+authors = [{ name = "agentgraph contributors" }]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Software Development :: Libraries",
+]
+# Deliberately empty: this SDK is stdlib-only by design.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/agentgraph/agentgraph"
+Documentation = "https://github.com/agentgraph/agentgraph/tree/main/sdks/python"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agentgraph_client"]
+
+[tool.hatch.build.targets.sdist]
+include = ["agentgraph_client", "README.md", "tests"]

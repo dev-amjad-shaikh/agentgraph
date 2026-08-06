@@ -2,6 +2,20 @@
 
 All notable changes to the agentgraph platform. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); crates are versioned independently (`agentgraph`, `agentgraph-server`, `agentgraph-otel`, `agentgraph-worker`).
 
+## [0.5.0] — 2026-08-05
+
+### Added
+
+- **Python SDK** *(sdks/python, v0.1.0)* — a zero-dependency, stdlib-only client for `agentgraph-server` (`urllib.request` + `json`, nothing to `pip install`): threads, runs (background / blocking / SSE-streaming with a hand-rolled SSE parser), checkpoint history, time travel (fork + replay), assistants, crons, and the KV store. Python 3.8+. Covered by an 18-test e2e suite (17 pass + 1 skip) that boots the real `server_demo` binary as a subprocess.
+- **TypeScript SDK** *(sdks/typescript, v0.1.0)* — a zero-dependency ESM client for Node.js ≥ 18 and modern browsers (global `fetch` / `ReadableStream` / `AbortController`), with hand-written `.d.ts` declarations: the full HTTP + SSE surface including an async-generator `runStream`. Covered by a 17-test e2e suite (16 pass + 1 skip) against the real server.
+- **Multi-tenant auth** *(agentgraph-server v0.4.0)* — API keys map to tenants via `ServerConfig::with_tenant_key(tenant, key)` (legacy `with_api_key` = the `default` tenant). Threads + checkpoints, runs, assistants, crons, and KV namespaces are fully isolated through internal `{tenant}/` id prefixing (no schema changes; the unprefixed default tenant keeps existing deployments' flat layout). Cross-tenant access answers `404`, never `403`; the cron scheduler is tenancy-aware. Open (no-key) mode is byte-identical to pre-multi-tenancy behavior — both SDK suites pass against it unchanged. 9 dedicated integration tests (`tests/multi_tenant.rs`).
+- **Live-LLM validation** — `docs/live-demo-transcript.md` captures real end-to-end ReAct runs of `examples/live_agent.rs` against Ollama (`qwen2.5:0.5b`, `llama3.2`): graph loop, tool dispatch, and event stream all verified against a live model.
+- **Blog follow-up** — `blog/we-shipped-the-whole-engine.md` (+ `.docx`): the v0.1→v0.4 platform story.
+
+### Fixed
+
+- **Calculator tool args in the live example** *(agentgraph, examples/live_agent.rs)* — Ollama's tool-call emulation delivers numeric arguments quoted (`{"a": "128", "b": "46"}`); `Value::as_f64()` returned `None` and `unwrap_or(0.0)` silently computed `0 op 0 = 0` in every live run. The calculator now coerces numbers **and** numeric strings (`coerce_f64`), tolerates common alias keys (`operation`/`operator`, `lhs`/`rhs`, `x`/`y`, …), and logs the raw args payload when coercion still fails. Audited `llm.rs` streamed tool-call accumulation (per-index `push_str` concat) — correct as designed; the defect was example-side argument parsing. 5 new unit tests (`cargo test --example live_agent`), plus a post-fix live run appended to the transcript (`128 multiply 46 = 5888` ✅).
+
 ## [0.4.0] — 2026-08-05
 
 ### Added

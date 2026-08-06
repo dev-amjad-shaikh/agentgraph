@@ -235,7 +235,12 @@ impl FrameSink {
 
 /// Everything the executor task needs, snapshotted from a [`RunHandle`].
 pub(crate) struct RunSnapshot {
+    /// Internal (tenant-scoped) thread id: used for the checkpointer, the
+    /// executor config, and RunManager bookkeeping.
     pub thread_id: String,
+    /// External thread id as the client knows it — the only form that may
+    /// appear on the wire (SSE frames, terminal JSON).
+    pub wire_thread_id: String,
     pub graph: String,
     pub attempt: usize,
     pub payload: RunPayload,
@@ -245,7 +250,11 @@ pub(crate) struct RunSnapshot {
 
 /// Public-ish view of a run (used by the rollback and status endpoints).
 pub(crate) struct RunInfo {
+    /// Internal (tenant-scoped) thread id — handlers check tenant ownership
+    /// against it before revealing anything about the run.
     pub thread_id: String,
+    /// External thread id for wire responses.
+    pub wire_thread_id: String,
     pub graph: String,
     pub attempt: usize,
     pub status: RunStatus,
@@ -258,8 +267,10 @@ pub(crate) struct RunInfo {
 pub struct RunHandle {
     /// Run id (UUID v4).
     pub run_id: String,
-    /// Thread this run executes against.
+    /// Internal (tenant-scoped) thread id this run executes against.
     pub thread_id: String,
+    /// External thread id reported on the wire.
+    pub wire_thread_id: String,
     /// Registered graph name.
     pub graph: String,
     /// 1-based attempt counter for the thread.
@@ -371,6 +382,7 @@ impl RunManager {
         let inner = self.inner.lock().await;
         inner.runs.get(run_id).map(|h| RunSnapshot {
             thread_id: h.thread_id.clone(),
+            wire_thread_id: h.wire_thread_id.clone(),
             graph: h.graph.clone(),
             attempt: h.attempt,
             payload: h.payload.clone(),
@@ -384,6 +396,7 @@ impl RunManager {
         let inner = self.inner.lock().await;
         inner.runs.get(run_id).map(|h| RunInfo {
             thread_id: h.thread_id.clone(),
+            wire_thread_id: h.wire_thread_id.clone(),
             graph: h.graph.clone(),
             attempt: h.attempt,
             status: h.status,
@@ -455,9 +468,14 @@ pub(crate) struct Scheduled {
 
 /// Create a run handle, apply the multitask strategy, and spawn execution
 /// immediately when the thread slot is free.
+///
+/// `thread_id` is the internal (tenant-scoped) id used for the checkpointer,
+/// executor, and RunManager bookkeeping; `wire_thread_id` is the external id
+/// reported in SSE frames and terminal JSON.
 pub(crate) async fn schedule(
     deps: &RunDeps,
     thread_id: &str,
+    wire_thread_id: &str,
     graph: &str,
     payload: RunPayload,
     strategy: MultitaskStrategy,
@@ -468,6 +486,7 @@ pub(crate) async fn schedule(
     let handle = RunHandle {
         run_id: run_id.clone(),
         thread_id: thread_id.to_string(),
+        wire_thread_id: wire_thread_id.to_string(),
         graph: graph.to_string(),
         attempt: 0, // assigned by RunManager::insert
         status: RunStatus::Pending,
@@ -513,7 +532,7 @@ async fn execute(deps: RunDeps, run_id: String) {
         0,
         json!({
             "run_id": run_id,
-            "thread_id": snap.thread_id,
+            "thread_id": snap.wire_thread_id,
             "graph": snap.graph,
             "attempt": snap.attempt,
             "metadata": snap.payload.metadata,
@@ -531,7 +550,7 @@ async fn execute(deps: RunDeps, run_id: String) {
         sink.push("end", 0, json!({"status": "error"}));
         let terminal = json!({
             "run_id": run_id,
-            "thread_id": snap.thread_id,
+            "thread_id": snap.wire_thread_id,
             "status": "error",
             "error": "unknown_graph",
             "message": message,
@@ -589,7 +608,7 @@ async fn execute(deps: RunDeps, run_id: String) {
             sink.push("end", step, json!({"status": "success"}));
             let terminal = json!({
                 "run_id": run_id,
-                "thread_id": snap.thread_id,
+                "thread_id": snap.wire_thread_id,
                 "status": "success",
                 "output": state.to_value(),
             });
@@ -607,7 +626,7 @@ async fn execute(deps: RunDeps, run_id: String) {
             );
             let terminal = json!({
                 "run_id": run_id,
-                "thread_id": snap.thread_id,
+                "thread_id": snap.wire_thread_id,
                 "status": "interrupted",
                 "interrupt": value,
                 "checkpoint_id": checkpoint_id,
@@ -623,7 +642,7 @@ async fn execute(deps: RunDeps, run_id: String) {
             sink.push("end", step, json!({"status": "error"}));
             let terminal = json!({
                 "run_id": run_id,
-                "thread_id": snap.thread_id,
+                "thread_id": snap.wire_thread_id,
                 "status": "error",
                 "error": kind,
                 "message": message,

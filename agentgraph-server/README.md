@@ -2,7 +2,7 @@
 
 **The network face of [`agentgraph`](../agentgraph)** — serve your agent graphs over HTTP + SSE from a single ~20 MB static binary. No interpreter, no Postgres, no Redis. Dual-licensed under MIT OR Apache-2.0.
 
-> **Status: v0.3, under active development.** The crate ships as a *library*: you call `agentgraph_server::serve()` from your own `main.rs`. The endpoint set, streaming semantics, and config surface follow the architecture document in [`docs/agentgraph-server-design.md`](../docs/agentgraph-server-design.md). The core `agentgraph` crate is untouched — it has no HTTP, no axum, no server dependencies, and never learns that a server exists.
+> **Status: v0.4, under active development.** The crate ships as a *library*: you call `agentgraph_server::serve()` from your own `main.rs`. The endpoint set, streaming semantics, and config surface follow the architecture document in [`docs/agentgraph-server-design.md`](../docs/agentgraph-server-design.md). The core `agentgraph` crate is untouched — it has no HTTP, no axum, no server dependencies, and never learns that a server exists.
 
 ## Why one binary instead of three containers
 
@@ -27,7 +27,7 @@ LangGraph's `langgraph.json` exists because Python can import user modules at ru
 ```toml
 [dependencies]
 agentgraph = "0.4"
-agentgraph-server = "0.3"
+agentgraph-server = "0.4"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 tracing-subscriber = "0.3"
@@ -84,7 +84,7 @@ A `GraphRegistry` entry is a name plus the two things the executor needs — a `
 
 ## HTTP API
 
-An Agent-Protocol-compatible subset — wire-compatible with the core run/thread shapes LangGraph Platform uses, without the commercial surface. This table is the v0.3 endpoint inventory; everything listed here is implemented and covered by integration tests.
+An Agent-Protocol-compatible subset — wire-compatible with the core run/thread shapes LangGraph Platform uses, without the commercial surface. This table is the v0.4 endpoint inventory; everything listed here is implemented and covered by integration tests.
 
 | Endpoint | Description |
 |---|---|
@@ -108,7 +108,7 @@ An Agent-Protocol-compatible subset — wire-compatible with the core run/thread
 | `GET /store/{ns}/{key}` / `DELETE /store/{ns}/{key}` | Fetch / delete one item (`404` when absent) |
 | `GET /store/{ns}` | List a namespace's items, sorted by key (empty array for an unwritten namespace) |
 
-Not in v0.3 (roadmap, see below): thread listing/deletion endpoints, `/metrics`, `/graphs`, and the gRPC worker protocol. Thread records live in memory — checkpoints are durable on disk (or in Postgres), but the thread registry itself is rebuilt empty on restart (re-create a thread with the same `thread_id` to re-attach to its persisted checkpoints). Assistants, crons, and store items **are** durable: they persist as JSON files under `store_path` (or in the `server_*` tables with [Postgres persistence](#postgres-persistence-feature-postgres)) and reload on startup.
+Not in v0.4 (roadmap, see below): thread listing/deletion endpoints, `/metrics`, `/graphs`, and the gRPC worker protocol. Thread records live in memory — checkpoints are durable on disk (or in Postgres), but the thread registry itself is rebuilt empty on restart (re-create a thread with the same `thread_id` to re-attach to its persisted checkpoints). Assistants, crons, and store items **are** durable: they persist as JSON files under `store_path` (or in the `server_*` tables with [Postgres persistence](#postgres-persistence-feature-postgres)) and reload on startup.
 
 **Run-create payload** (subset of LangGraph's shape):
 
@@ -206,7 +206,7 @@ The default deployment needs no infrastructure — checkpoints, assistants, cron
 
 ```toml
 [dependencies]
-agentgraph-server = { version = "0.3", features = ["postgres"] }
+agentgraph-server = { version = "0.4", features = ["postgres"] }
 ```
 
 ```rust
@@ -233,6 +233,38 @@ DATABASE_URL=postgres://user:pass@localhost/agentgraph_test \
   cargo test --features postgres --test postgres_store -- --ignored
 ```
 
+## Multi-tenancy: API keys → tenants, with full isolation
+
+Single-key auth (`with_api_key`) covers the one-organization deployment. For a shared deployment serving several organizations, map API keys to tenants:
+
+```rust
+let config = ServerConfig::new("0.0.0.0:8080".parse()?, "./data/checkpoints")
+    .with_tenant_key("acme", "sk-acme-…")     // (tenant, key) pairs
+    .with_tenant_key("globex", "sk-globex-…")
+    .with_api_key("sk-ops-…");                // optional: legacy key = `default` tenant
+```
+
+**Key → tenant model.** Every configured key maps to exactly one tenant. A request's `X-Api-Key` header is resolved to a tenant by the auth middleware (401 for missing/unknown keys) and everything the request touches is scoped to that tenant. With **no keys configured** the server is in open (dev) mode — no header required, all requests run as the `default` tenant, and behavior is byte-identical to pre-multi-tenancy releases.
+
+**Isolation semantics.** Every tenant-scoped resource is namespaced per tenant: threads (including their checkpoint history and run bookkeeping), assistants, crons, and KV namespaces. Concretely, internal ids and namespaces carry a `{tenant}/` prefix at the handler layer, so the storage backends separate naturally with no schema changes:
+
+| Resource | JSON-file layout | Postgres |
+|---|---|---|
+| Threads + checkpoints | `{store_path}/{tenant}/{thread_id}/…` | `agentgraph_checkpoints.thread_id = "{tenant}/{id}"` |
+| Assistants | `{store_path}/assistants/{tenant}/{id}.json` | `server_assistants.assistant_id = "{tenant}/{id}"` |
+| Crons | `{store_path}/crons/{tenant}/{id}.json` | `server_crons.cron_id = "{tenant}/{id}"` |
+| KV store | `{store_path}/store/{tenant}/{ns}/{key}.json` | `server_kv.namespace = "{tenant}/{ns}"` |
+
+The `default` tenant (open mode and the legacy `with_api_key`) is **unprefixed**, so existing deployments keep their flat layout and data — upgrading is a non-event. Tenant ids must match `[A-Za-z0-9._-]` (1–64 chars).
+
+What this buys you:
+
+- **Same external ids can coexist across tenants.** `acme` and `globex` can both have a thread `t1`, an assistant `bot`, and a KV namespace `memories` without collisions — each resolves inside its own namespace.
+- **Cross-tenant access is 404, never 403.** Fetching another tenant's thread, run, assistant, cron, or KV item returns `not_found`, exactly as if the resource didn't exist. A 403 would confirm the resource exists (and that the id is worth attacking); a 404 leaks nothing.
+- **The wire never shows internal prefixes.** Responses always carry the external ids the client supplied; the `{tenant}/` prefix is an internal storage detail.
+- **The cron scheduler is tenancy-aware.** It lists crons across all tenants but fires each one inside its owning tenant's namespace — cron-spawned threads and runs land in the right tenant.
+- **`GET /info` stays tenant-neutral**: it exposes only the service metadata and registered graphs — no tenants, keys, or resource counts.
+
 ## Configuration
 
 Configuration is code, via `ServerConfig` (constructed with `ServerConfig::new(bind_addr, store_path)` plus builder methods, or `ServerConfig::default()`). If you want twelve-factor env-based config in your binary, read the environment in your own `main.rs` and build the `ServerConfig` from it — the crate deliberately does not read process env itself.
@@ -242,7 +274,8 @@ Configuration is code, via `ServerConfig` (constructed with `ServerConfig::new(b
 | `bind_addr` | `0.0.0.0:8080` | Listen address (used by `serve`) |
 | `store_path` | `./data/checkpoints` | `JsonFileCheckpointer` root (`{store_path}/{thread_id}/{checkpoint_id}.json`) and JSON-file platform persistence |
 | `with_postgres(…)` | `None` = JSON files | Postgres URL for **both** checkpoints and the platform store (feature `postgres`; see [Postgres persistence](#postgres-persistence-feature-postgres)) |
-| `with_api_key(…)` | `None` = dev mode, no auth | Static key required via the `X-Api-Key` header |
+| `with_api_key(…)` | `None` = dev mode, no auth | Static key required via the `X-Api-Key` header; maps to the `default` tenant |
+| `with_tenant_key(…)` | — | Map an API key to a tenant for multi-tenant deployments (see [Multi-tenancy](#multi-tenancy-api-keys--tenants-with-full-isolation)) |
 | `with_max_concurrent_runs_per_thread(…)` | `1` | Per-thread enqueue queue depth cap (there is always at most one *active* run per thread) |
 | `with_event_log_capacity(…)` | `1000` | Per-run SSE replay buffer (frames) |
 
@@ -277,7 +310,7 @@ With the server running locally in dev mode (no API key configured):
 curl localhost:8080/ok
 # {"ok":true}
 curl localhost:8080/info
-# {"service":"agentgraph-server","version":"0.3.0","checkpointer":"json_file",
+# {"service":"agentgraph-server","version":"0.4.0","checkpointer":"json_file",
 #  "store_path":"./data/checkpoints",
 #  "graphs":[{"name":"react_agent","channels":["messages"]}]}
 
@@ -359,6 +392,7 @@ With auth configured, add `-H "X-Api-Key: $KEY"` to every call. For a full walkt
 - [x] **Phase C (partial) — platform surface (v0.2).** `GET /runs/{run_id}` status polling, **assistants** (named graph + config aliases, JSON-persisted, `assistant_id` on run-create), **crons** (interval or 5-field cron schedules, durable records, background tokio scheduler firing runs on fresh threads, `on_run_completed: keep|delete`), and the cross-thread **KV store** (`/store/{namespace}/{key}`, JSON-file-backed). *Shipped.*
 - [x] **Phase C (continued) — time travel + Postgres persistence (v0.3).** `POST /threads/{id}/fork` (full- or mid-history forks via core's `Checkpointer::fork_thread`), checkpoint replay on all run endpoints (`"checkpoint": {"checkpoint_id": …}` → `RunConfig::with_checkpoint_id`), and the `postgres` feature: `ServerConfig::with_postgres(url)` switches the run checkpointer to `PostgresCheckpointer` and the assistants/crons/KV surface to auto-migrated `server_assistants` / `server_crons` / `server_kv` tables behind a `ServerStore` trait. *Shipped.*
 - [x] **Phase C (continued) — permissive CORS (v0.3).** `router()` layers `tower_http::cors::CorsLayer::permissive()`, so browser clients (the [Studio](../studio/)) call the API cross-origin; preflights are answered before auth. Restrict for production — see [CORS](#http-api). *Shipped.*
+- [x] **Phase C (continued) — multi-tenancy (v0.4).** API keys map to tenants (`with_tenant_key(tenant, key)`; legacy `with_api_key` = the `default` tenant); threads + checkpoints, runs, assistants, crons, and KV namespaces are fully isolated via internal `{tenant}/` id prefixing, with cross-tenant access answering 404 (never 403). Open mode and the default tenant keep the legacy flat storage layout. See [Multi-tenancy](#multi-tenancy-api-keys--tenants-with-full-isolation). *Shipped.*
 - [ ] **Phase B — gRPC worker protocol (`agentgraph-proto`).** `RemoteNode`: a gRPC client behind the same `Node` trait, delegating node execution to stateless out-of-process workers that long-poll named node-queues. The server keeps checkpoints, super-step scheduling, interrupts, and stream fan-out. Agent nodes are dominated by LLM latency (hundreds of ms to minutes), so a 1–5 ms gRPC hop is <1% overhead — and since `State` is already a JSON map, the wire boundary is lossless. Crash isolation, polyglot workers (a Python worker can host the LangChain ecosystem while Rust owns orchestration), and independent scaling of tool-heavy nodes follow.
 - [ ] **Phase C (remainder).** Durable thread registry, thread listing/deletion endpoints, `/metrics`, and `/graphs`. (`WasmNode` shipped in core `agentgraph` v0.4 behind the `wasm` feature — register a Wasm-backed graph and this crate serves it unchanged.)
 

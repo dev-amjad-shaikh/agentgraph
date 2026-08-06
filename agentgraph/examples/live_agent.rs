@@ -119,14 +119,30 @@ impl Tool for Calculator {
         })
     }
     async fn call(&self, args: Value) -> Result<Value> {
-        let op = args.get("op").and_then(Value::as_str).unwrap_or("add");
-        let a = args.get("a").and_then(Value::as_f64).unwrap_or(0.0);
-        let b = args.get("b").and_then(Value::as_f64).unwrap_or(0.0);
-        let result = match op {
-            "add" => a + b,
-            "subtract" => a - b,
-            "multiply" => a * b,
-            "divide" => {
+        // Small models behind OpenAI-compatible shims (Ollama's tool-call
+        // emulation in particular) are loose with argument shapes: numbers
+        // arrive quoted (`{"a": "128"}`), keys get renamed (`operation`,
+        // `lhs`/`rhs`, `x`/`y`). `Value::as_f64() + unwrap_or(0.0)` used to
+        // swallow all of that into a silent `0 op 0 = 0`, so coerce
+        // defensively and log the raw payload when coercion still fails.
+        let op = get_any(&args, &["op", "operation", "operator"])
+            .and_then(Value::as_str)
+            .unwrap_or("add")
+            .to_ascii_lowercase();
+        let a = get_any(&args, &["a", "lhs", "left", "first_operand", "x"]).and_then(coerce_f64);
+        let b = get_any(&args, &["b", "rhs", "right", "second_operand", "y"]).and_then(coerce_f64);
+        let (a, b) = match (a, b) {
+            (Some(a), Some(b)) => (a, b),
+            (a, b) => {
+                println!("    [tool:calculator] WARN: could not coerce operands; raw args: {args}");
+                (a.unwrap_or(0.0), b.unwrap_or(0.0))
+            }
+        };
+        let result = match op.as_str() {
+            "add" | "plus" | "sum" => a + b,
+            "subtract" | "minus" | "difference" => a - b,
+            "multiply" | "times" | "product" => a * b,
+            "divide" | "quotient" => {
                 if b == 0.0 {
                     return Err(AgentGraphError::Tool("division by zero".into()));
                 }
@@ -137,6 +153,23 @@ impl Tool for Calculator {
         println!("    [tool:calculator] {a} {op} {b} = {result}");
         Ok(json!(result))
     }
+}
+
+/// Coerce a JSON value to `f64`, accepting real numbers *and* numeric
+/// strings (`"128"`, `" 46.5 "`) — Ollama-style tool-call emulation quotes
+/// numbers surprisingly often.
+fn coerce_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// Fetch the first present key from `args` among `keys` (primary name first,
+/// then common aliases small models invent).
+fn get_any<'a>(args: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+    keys.iter().find_map(|k| args.get(*k))
 }
 
 // ---------------------------------------------------------------------------
@@ -319,4 +352,84 @@ fn print_setup_instructions(base_url: &str, error: &AgentGraphError) {
     println!("    point AGENTGRAPH_BASE_URL at the server's /v1 path and set");
     println!("    AGENTGRAPH_MODEL to the served model name.\n");
     println!("(exiting 0 so CI stays green without a live model)");
+}
+
+// ---------------------------------------------------------------------------
+// Tests for the calculator's defensive argument coercion (the 2026-08-05
+// live-transcript bug: Ollama quoted numeric args and `as_f64()` swallowed
+// them into a silent `0 op 0`).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coerce_f64_accepts_numbers_and_numeric_strings() {
+        assert_eq!(coerce_f64(&json!(128)), Some(128.0));
+        assert_eq!(coerce_f64(&json!(46.5)), Some(46.5));
+        assert_eq!(coerce_f64(&json!("128")), Some(128.0));
+        assert_eq!(coerce_f64(&json!(" 46.5 ")), Some(46.5));
+        assert_eq!(coerce_f64(&json!("-3")), Some(-3.0));
+        assert_eq!(coerce_f64(&json!("abc")), None);
+        assert_eq!(coerce_f64(&json!("")), None);
+        assert_eq!(coerce_f64(&json!(true)), None);
+        assert_eq!(coerce_f64(&Value::Null), None);
+        assert_eq!(coerce_f64(&json!({"nested": 1})), None);
+    }
+
+    #[test]
+    fn get_any_falls_back_to_alias_keys() {
+        let args = json!({"operation": "multiply", "lhs": 6, "rhs": 7});
+        assert_eq!(
+            get_any(&args, &["op", "operation", "operator"]).and_then(Value::as_str),
+            Some("multiply")
+        );
+        assert_eq!(
+            get_any(&args, &["a", "lhs", "left", "first_operand", "x"]).and_then(coerce_f64),
+            Some(6.0)
+        );
+        assert_eq!(
+            get_any(&args, &["b", "rhs", "right", "second_operand", "y"]).and_then(coerce_f64),
+            Some(7.0)
+        );
+        // Primary key wins when both primary and alias are present.
+        let both = json!({"a": 1, "x": 2});
+        assert_eq!(
+            get_any(&both, &["a", "lhs", "left", "first_operand", "x"]).and_then(coerce_f64),
+            Some(1.0)
+        );
+        assert!(get_any(&json!({}), &["a", "x"]).is_none());
+    }
+
+    #[tokio::test]
+    async fn calculator_handles_ollama_quoted_number_args() {
+        // The exact shape observed in the wild: op as string, operands quoted.
+        let out = Calculator
+            .call(json!({"op": "multiply", "a": "128", "b": "46"}))
+            .await
+            .unwrap();
+        assert_eq!(out, json!(5888.0));
+    }
+
+    #[tokio::test]
+    async fn calculator_handles_alias_keys_and_mixed_types() {
+        let out = Calculator
+            .call(json!({"operation": "add", "lhs": "1.5", "rhs": 2}))
+            .await
+            .unwrap();
+        assert_eq!(out, json!(3.5));
+    }
+
+    #[tokio::test]
+    async fn calculator_still_rejects_unknown_ops_and_divide_by_zero() {
+        assert!(Calculator
+            .call(json!({"op": "modulo", "a": 1, "b": 2}))
+            .await
+            .is_err());
+        assert!(Calculator
+            .call(json!({"op": "divide", "a": 1, "b": 0}))
+            .await
+            .is_err());
+    }
 }
