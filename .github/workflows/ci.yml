@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [agentgraph, agentgraph-server, agentgraph-worker, agentgraph-otel]
+        crate: [rusty-core, rusty-server, rusty-worker, rusty-otel]
     steps:
       - uses: actions/checkout@v4
 
@@ -53,7 +53,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [agentgraph, agentgraph-server, agentgraph-worker, agentgraph-otel]
+        crate: [rusty-core, rusty-server, rusty-worker, rusty-otel]
     steps:
       - uses: actions/checkout@v4
 
@@ -83,10 +83,10 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: agentgraph-server
+          key: rusty-server
 
       - name: Build server demo binary
-        working-directory: agentgraph-server
+        working-directory: rusty-server
         run: cargo build --example server_demo
 
       - name: Set up Python

@@ -1,6 +1,6 @@
-# agentgraph Studio
+# Rusty Studio
 
-A **zero-build, single-file debug UI** for [`agentgraph-server`](../agentgraph-server). One HTML file, vanilla
+A **zero-build, single-file debug UI** for [`rusty-server`](../rusty-server). One HTML file, vanilla
 JS + CSS, no npm, no framework, no bundler — open it and point it at a running server.
 
 ```
@@ -40,7 +40,7 @@ studio/
   - **Replay & run from a checkpoint** — starts a background run whose payload carries
     `"checkpoint": {"checkpoint_id": …}`; the executor replays the thread from that checkpoint (its state
     and next-node set) instead of the latest, appending fresh history on top. Prefer replaying on a fork.
-  - **Older-server fallback** — if a fork call 404s with a non-JSON body (an `agentgraph-server` older
+  - **Older-server fallback** — if a fork call 404s with a non-JSON body (an `rusty-server` older
     than v0.3 has no `/fork` route), the Studio falls back to its original client-side composition
     (new thread + `POST /threads/{new}/state`) and says so in the toast.
   - **Interrupt / resume helper** — when any run ends `interrupted`, the interrupt payload is shown with a
@@ -71,7 +71,7 @@ Open `http://127.0.0.1:8000/` and connect with base URL **`/api`** (the proxy fo
 cd studio && python3 -m http.server 8000     # → http://localhost:8000/index.html
 ```
 
-Then connect to `http://127.0.0.1:8100`. Since `agentgraph-server` (v0.3 and later) sends permissive CORS headers
+Then connect to `http://127.0.0.1:8100`. Since `rusty-server` (v0.3 and later) sends permissive CORS headers
 (see below), plain cross-origin calls from any static host just work.
 
 ### Option C — double-click `index.html` (file://)
@@ -81,11 +81,11 @@ those cross-origin calls as well.
 
 ## CORS
 
-`agentgraph-server` v0.3+ layers `tower_http::cors::CorsLayer::permissive()` in `router()` as the
+`rusty-server` v0.3+ layers `tower_http::cors::CorsLayer::permissive()` in `router()` as the
 outermost middleware: every response carries `access-control-allow-origin: *`, and OPTIONS preflights are
 answered before the API-key middleware runs. Any page — `file://`, `localhost:8000`, a LAN hostname — can
 call the API directly. **Production deployments should restrict this** (the permissive layer is a dev
-convenience): see the CORS note in [agentgraph-server/README.md](../agentgraph-server/README.md#http-api).
+convenience): see the CORS note in [rusty-server/README.md](../rusty-server/README.md#http-api).
 
 If Connect still fails with a *network* error, the usual causes are: the server isn't running, the base URL
 is wrong (scheme/host/port), or you're talking to a pre-v0.3 server build. `studio/serve.py` (Option A)
@@ -132,7 +132,7 @@ no network) and `react_agent` (channel `messages`, scripted model + echo tool, n
   and the live feed starts fresh (state/history re-fetch on select).
 - **Static verification only.** The page was syntax-checked (see below) but not exercised in a real browser
   in this workspace; visual/behavioral bugs are possible. The API shapes it targets were read from
-  `agentgraph-server/src/routes.rs` + `src/runs.rs`, not guessed.
+  `rusty-server/src/routes.rs` + `src/runs.rs`, not guessed.
 - The server is **single-process** with an in-memory run registry: background-run polling (`GET
   /runs/{run_id}`) 404s for runs created before a server restart.
 
@@ -141,7 +141,7 @@ no network) and `react_agent` (channel `messages`, scripted model + echo tool, n
 - `node --check` on the extracted `<script>` block — syntax OK.
 - `python3 -m py_compile studio/serve.py` — syntax OK.
 - All endpoint paths, payload fields, response shapes, SSE frame kinds, and status strings cross-checked
-  against `agentgraph-server/src/routes.rs`, `src/runs.rs`, `src/sse.rs`, and `examples/server_demo.rs`;
+  against `rusty-server/src/routes.rs`, `src/runs.rs`, `src/sse.rs`, and `examples/server_demo.rs`;
   fork/replay and the CORS preflight are covered by server integration tests (`tests/time_travel.rs`,
   `tests/cors.rs`).
 - No browser is available in this environment, so no live end-to-end test was run — the honest next step is

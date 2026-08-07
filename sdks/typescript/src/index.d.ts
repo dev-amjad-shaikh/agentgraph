@@ -1,7 +1,7 @@
 /**
- * agentgraph-client — TypeScript declarations.
+ * @rusty-runtime/client — TypeScript declarations.
  *
- * Zero-dependency JS/TS client for agentgraph-server (HTTP + SSE).
+ * Zero-dependency JS/TS client for rusty-server (HTTP + SSE).
  * Works in Node.js >= 18 and modern browsers.
  */
 
@@ -15,7 +15,7 @@ export type JsonValue =
   | { [key: string]: JsonValue };
 
 /** Client constructor options. */
-export interface AgentGraphClientOptions {
+export interface RustyClientOptions {
   /** Static API key sent as the `X-Api-Key` header. */
   apiKey?: string;
   /**
@@ -30,7 +30,7 @@ export interface AgentGraphClientOptions {
 }
 
 /** Error thrown for non-2xx responses and network-level failures. */
-export class AgentGraphError extends Error {
+export class RustyError extends Error {
   /** HTTP status code, or 0 when no response was received. */
   status: number;
   /** Parsed response body (JSON value or raw text), if any. */
@@ -41,11 +41,11 @@ export class AgentGraphError extends Error {
     message: string,
     init?: { status?: number; body?: unknown; url?: string; cause?: unknown },
   );
-  static fromResponse(response: Response, url: string): Promise<AgentGraphError>;
+  static fromResponse(response: Response, url: string): Promise<RustyError>;
 }
 
 /** Thrown when a request exceeds the client or per-call timeout. */
-export class AgentGraphTimeoutError extends AgentGraphError {
+export class RustyTimeoutError extends RustyError {
   timeoutMs: number;
   constructor(url: string, timeoutMs: number);
 }
@@ -200,13 +200,13 @@ export interface RequestOptions {
   signal?: AbortSignal;
 }
 
-/** Options for {@link AgentGraphClient.runWait}. */
+/** Options for {@link RustyClient.runWait}. */
 export interface RunWaitOptions extends RequestOptions {
   /** Timeout override (ms) — raise for long-running graphs. */
   timeout?: number;
 }
 
-/** Options for {@link AgentGraphClient.runStream}. */
+/** Options for {@link RustyClient.runStream}. */
 export interface RunStreamOptions {
   /** Resume position sent as the `Last-Event-ID` header. */
   lastEventId?: string | number;
@@ -220,14 +220,14 @@ export interface RunStreamOptions {
   signal?: AbortSignal;
 }
 
-/** Options for {@link AgentGraphClient.createThread}. */
+/** Options for {@link RustyClient.createThread}. */
 export interface CreateThreadOptions extends RequestOptions {
   metadata?: Record<string, JsonValue>;
   /** Explicit thread id (server-generated UUID when omitted). */
   threadId?: string;
 }
 
-/** Options for {@link AgentGraphClient.updateState}. */
+/** Options for {@link RustyClient.updateState}. */
 export interface UpdateStateOptions extends RequestOptions {
   /** Attribute the update to this node. */
   asNode?: string;
@@ -235,14 +235,14 @@ export interface UpdateStateOptions extends RequestOptions {
   nextNodes?: string[];
 }
 
-/** Options for {@link AgentGraphClient.history}. */
+/** Options for {@link RustyClient.history}. */
 export interface HistoryOptions extends RequestOptions {
   limit?: number;
   /** Only return checkpoints before this checkpoint id. */
   before?: string;
 }
 
-/** Options for {@link AgentGraphClient.fork}. */
+/** Options for {@link RustyClient.fork}. */
 export interface ForkOptions extends RequestOptions {
   /** Explicit id for the fork (server-generated UUID when omitted). */
   newThreadId?: string;
@@ -250,7 +250,7 @@ export interface ForkOptions extends RequestOptions {
   checkpointId?: string;
 }
 
-/** Input for {@link AgentGraphClient.createAssistant}. */
+/** Input for {@link RustyClient.createAssistant}. */
 export interface CreateAssistantInput {
   name: string;
   graph: string;
@@ -259,7 +259,7 @@ export interface CreateAssistantInput {
   assistantId?: string;
 }
 
-/** Input for {@link AgentGraphClient.createCron}. Exactly one schedule kind. */
+/** Input for {@link RustyClient.createCron}. Exactly one schedule kind. */
 export interface CreateCronInput {
   graph: string;
   /** Fixed interval in seconds (>= 1). */
@@ -272,8 +272,8 @@ export interface CreateCronInput {
   onRunCompleted?: 'keep' | 'delete';
 }
 
-export declare class AgentGraphClient {
-  constructor(baseUrl: string, options?: AgentGraphClientOptions);
+export declare class RustyClient {
+  constructor(baseUrl: string, options?: RustyClientOptions);
 
   /** The normalized server base URL. */
   readonly baseUrl: string;
@@ -374,4 +374,4 @@ export declare function parseSseStream(
   signal?: AbortSignal,
 ): AsyncGenerator<StreamFrame, void, void>;
 
-export default AgentGraphClient;
+export default RustyClient;

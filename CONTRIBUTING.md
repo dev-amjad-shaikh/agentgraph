@@ -1,17 +1,17 @@
-# Contributing to the agentgraph platform
+# Contributing to the Rusty platform
 
-Thanks for helping build the agentgraph platform. This repository is a monorepo of independently versioned crates plus client SDKs; each component has its own build and test loop.
+Thanks for helping build the Rusty platform. This repository is a monorepo of independently versioned crates plus client SDKs; each component has its own build and test loop.
 
 ## Components
 
 | Component | What it is | Where to start |
 |---|---|---|
-| [`agentgraph/`](agentgraph/) | Core execution engine | [agentgraph/CONTRIBUTING.md](agentgraph/CONTRIBUTING.md): module map, ownership rules, PR checklist |
-| [`agentgraph-server/`](agentgraph-server/) | axum HTTP/SSE server crate | [README](agentgraph-server/README.md); same PR rules as core |
-| [`agentgraph-worker/`](agentgraph-worker/) | Worker SDK for remote nodes | [README](agentgraph-worker/README.md); same PR rules as core |
-| [`agentgraph-otel/`](agentgraph-otel/) | OpenTelemetry export | [README](agentgraph-otel/README.md); same PR rules as core |
-| [`sdks/python/`](sdks/python/), [`sdks/typescript/`](sdks/typescript/) | Zero-dependency client SDKs | each SDK's README describes its e2e suite |
-| [`studio/`](studio/) | Zero-build debug UI | plain HTML/JS, no build step; see [docs/studio.md](docs/studio.md) |
+| [`rusty-core/`](rusty-core/) | Rusty Core — the execution engine (crate `rusty-agent-runtime`) | [rusty-core/CONTRIBUTING.md](rusty-core/CONTRIBUTING.md): module map, ownership rules, PR checklist |
+| [`rusty-server/`](rusty-server/) | Rusty Server — axum HTTP/SSE server crate and the `rusty` binary | [README](rusty-server/README.md); same PR rules as core |
+| [`rusty-worker/`](rusty-worker/) | Rusty Worker — worker SDK for remote nodes | [README](rusty-worker/README.md); same PR rules as core |
+| [`rusty-otel/`](rusty-otel/) | OpenTelemetry export | [README](rusty-otel/README.md); same PR rules as core |
+| [`sdks/python/`](sdks/python/), [`sdks/typescript/`](sdks/typescript/) | Rusty SDK — zero-dependency client SDKs (`rusty-agent-runtime` on PyPI, `@rusty-runtime/client` on npm) | each SDK's README describes its e2e suite |
+| [`studio/`](studio/) | Rusty Studio — zero-build debug UI | plain HTML/JS, no build step; see [docs/studio.md](docs/studio.md) |
 
 ## Checks
 
@@ -26,7 +26,7 @@ cargo test
 The SDK e2e suites boot the real `server_demo` binary as a subprocess:
 
 ```bash
-cargo build --manifest-path agentgraph-server/Cargo.toml --example server_demo
+cargo build --manifest-path rusty-server/Cargo.toml --example server_demo
 python3 -m unittest discover -s sdks/python/tests
 node --test sdks/typescript/test/
 ```

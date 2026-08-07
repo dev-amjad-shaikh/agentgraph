@@ -1,12 +1,16 @@
-# agentgraph-client (Python)
+# Rusty SDK — Python client
 
-**Zero-dependency, stdlib-only Python SDK for [`agentgraph-server`](../../agentgraph-server).** Threads, runs (background / blocking / SSE-streaming), checkpoint history, time travel (fork + replay), assistants, crons, and the cross-thread KV store — over plain HTTP + SSE with nothing but `urllib.request` and `json`. Python 3.8+, no `pip install` of anything else, ever.
+**Zero-dependency, stdlib-only Python SDK for [`rusty-server`](../../rusty-server).** Threads, runs (background / blocking / SSE-streaming), checkpoint history, time travel (fork + replay), assistants, crons, and the cross-thread KV store — over plain HTTP + SSE with nothing but `urllib.request` and `json`. Python 3.8+, no `pip install` of anything else, ever.
 
 ## Philosophy
 
-This SDK is the **"interop over HTTP"** story: the Rust server owns orchestration, checkpoints, and streaming; any language that can speak HTTP and parse SSE can drive it. Python is the language most likely to already be on the machine, so this client deliberately uses **only the standard library** — no `requests`, no `httpx`, no `sseclient`. Drop the `agentgraph_client/` package into any project (or any `python3 -c` one-liner) and it works. The trade-off is explicit: you get a hand-rolled SSE parser and blocking I/O instead of a fancy async stack — which is exactly what you want for scripts, CI, notebooks, and LangChain-adjacent glue code.
+This SDK is the **"interop over HTTP"** story: the Rust server owns orchestration, checkpoints, and streaming; any language that can speak HTTP and parse SSE can drive it. Python is the language most likely to already be on the machine, so this client deliberately uses **only the standard library** — no `requests`, no `httpx`, no `sseclient`. Drop the `rusty_client/` package into any project (or any `python3 -c` one-liner) and it works. The trade-off is explicit: you get a hand-rolled SSE parser and blocking I/O instead of a fancy async stack — which is exactly what you want for scripts, CI, notebooks, and LangChain-adjacent glue code.
 
 ## Install
+
+```bash
+pip install rusty-agent-runtime
+```
 
 From a local checkout (editable path install):
 
@@ -17,7 +21,7 @@ pip install /path/to/repo/sdks/python
 Or just copy the package — it has no build step and no dependencies:
 
 ```bash
-cp -r sdks/python/agentgraph_client /your/project/
+cp -r sdks/python/rusty_client /your/project/
 ```
 
 ## Quickstart
@@ -25,20 +29,20 @@ cp -r sdks/python/agentgraph_client /your/project/
 Start the demo server (scripted model — no network, no API keys):
 
 ```bash
-cargo run --manifest-path ../../agentgraph-server/Cargo.toml --example server_demo
-# agentgraph-server demo on http://127.0.0.1:8100  (graphs: pipeline, react_agent)
+cargo run --manifest-path ../../rusty-server/Cargo.toml --example server_demo
+# rusty-server demo on http://127.0.0.1:8100  (graphs: pipeline, react_agent)
 ```
 
 Then, mirroring the curl quickstart from the server README:
 
 ```python
-from agentgraph_client import AgentGraphClient
+from rusty_client import RustyClient
 
-client = AgentGraphClient("http://127.0.0.1:8100")   # api_key="..." when auth is on
+client = RustyClient("http://127.0.0.1:8100")   # api_key="..." when auth is on
 
 # Liveness + what's registered
 client.ok()      # True
-client.info()    # {"service": "agentgraph-server", "graphs": [...], ...}
+client.info()    # {"service": "rusty-server", "graphs": [...], ...}
 
 # Create a thread bound to a registered graph
 thread = client.create_thread("pipeline")
@@ -52,7 +56,7 @@ result = client.run_wait(tid)
 for frame in client.run_stream(tid, stream_mode=["updates", "values"]):
     print(frame.event, frame.id, frame.data)
 # metadata -:0:1 {"run_id": ..., "graph": "pipeline", ...}
-# updates  -:0:2 {"step": 0, "updates": {"log": "first"}}
+# updates  -:0:2 {"step": 0, "updates": {"log": ["first"]}}
 # values   <cp>:0:3 {"log": ["first"]}
 # ...
 # end      <cp>:1:6 {"status": "success"}
@@ -89,7 +93,7 @@ client.kv_list("memories")
 client.kv_delete("memories", "user-1")
 ```
 
-With auth configured on the server (`ServerConfig::with_api_key`), pass `AgentGraphClient(url, api_key="...")` — it is sent as the `X-Api-Key` header on every request.
+With auth configured on the server (`ServerConfig::with_api_key`), pass `RustyClient(url, api_key="...")` — it is sent as the `X-Api-Key` header on every request.
 
 ## API reference
 
@@ -121,14 +125,14 @@ With auth configured on the server (`ServerConfig::with_api_key`), pass `AgentGr
 
 ### Errors
 
-Every non-2xx response raises `AgentGraphError` with `.status` (HTTP code, `None` for transport failures) and `.body` (raw response text):
+Every non-2xx response raises `RustyError` with `.status` (HTTP code, `None` for transport failures) and `.body` (raw response text):
 
 ```python
-from agentgraph_client import AgentGraphError
+from rusty_client import RustyError
 
 try:
     client.create_thread("no_such_graph")
-except AgentGraphError as exc:
+except RustyError as exc:
     print(exc.status, exc.body)   # 404 / 400, server's error JSON
 ```
 
@@ -137,7 +141,7 @@ except AgentGraphError as exc:
 The suite is a true end-to-end test: it builds (if needed) and launches the real `server_demo` binary as a subprocess, waits for `/ok`, exercises every endpoint family against it, and kills the process afterwards.
 
 ```bash
-python3 -m unittest discover -s sdks/python/tests -v
+python -m pytest sdks/python/tests -q
 ```
 
 Note: `server_demo` registers no interrupting graph, so the interrupt/resume round trip is a documented skip in the suite; the client's resume path is `run_wait(tid, command={"resume": value})`.

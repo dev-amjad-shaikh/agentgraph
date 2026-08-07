@@ -16,8 +16,8 @@ below with annotations.
 | Ollama | Homebrew install, `/opt/homebrew/bin/ollama`, v0.21.2; `ollama serve` started as a child process per run and killed afterwards |
 | Models tried | `qwen2.5:0.5b` (pulled this session, 397 MB, ~10 s at ~58 MB/s), `llama3.2:latest` (already local, 2.0 GB, 3B) |
 | Also local (unused) | `qwen2.5:7b-instruct` (4.7 GB), `nomic-embed-text` (274 MB) |
-| Crate | `agentgraph` (dev profile, pre-built: `Finished in 0.22s`) |
-| Command | `AGENTGRAPH_MODEL=<model> cargo run --example live_agent` |
+| Crate | `rusty-agent-runtime` (dir `rusty-core/`; dev profile, pre-built: `Finished in 0.22s`) |
+| Command | `RUSTY_MODEL=<model> cargo run --example live_agent` |
 | Run config | `RunConfig::new("live-demo")`, `max_steps = 12` |
 | Prompt (hardcoded in example) | "What time is it right now in UTC? Then multiply 128 by 46, and count the words in 'the quick brown fox jumps over the lazy dog'." |
 
@@ -235,17 +235,17 @@ for i in $(seq 1 15); do curl -s -m 2 http://localhost:11434/api/tags >/dev/null
 ollama pull llama3.2        # or: ollama pull qwen2.5:0.5b  (~400 MB)
 
 # 3. Run the live demo:
-cd agentgraph
+cd rusty-core
 export PATH="$HOME/.cargo/bin:$PATH"
-AGENTGRAPH_MODEL=llama3.2:latest cargo run --example live_agent
+RUSTY_MODEL=llama3.2:latest cargo run --example live_agent
 
 # 4. Clean up:
 kill $SERVE_PID
 ```
 
-Environment knobs honored by the example: `AGENTGRAPH_BASE_URL` (default
-`http://localhost:11434/v1`), `AGENTGRAPH_API_KEY` (any string for Ollama),
-`AGENTGRAPH_MODEL` (must support tool calling). The example never panics: if no
+Environment knobs honored by the example: `RUSTY_BASE_URL` (default
+`http://localhost:11434/v1`), `RUSTY_API_KEY` (any string for Ollama),
+`RUSTY_MODEL` (must support tool calling). The example never panics: if no
 endpoint answers it prints setup instructions and exits 0, so it is CI-safe.
 
 ---
@@ -269,7 +269,7 @@ was audited and is correct (per-index `push_str` concat, covered by
 argument parsing. Five new unit tests in the example lock the coercion behavior in
 (`cargo test --example live_agent`).
 
-**Command:** `AGENTGRAPH_MODEL=llama3.2:latest cargo run --example live_agent`
+**Command:** `RUSTY_MODEL=llama3.2:latest cargo run --example live_agent`
 (cold start — daemon and model booted fresh for this run; ~25 s wall clock).
 
 ```text

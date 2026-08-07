@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""agentgraph Studio dev server — same-origin static host + API proxy.
+"""Rusty Studio dev server — same-origin static host + API proxy.
 
-Why this exists: agentgraph-server v0.3+ sends permissive CORS headers, so
+Why this exists: rusty-server v0.3+ sends permissive CORS headers, so
 studio/index.html can be opened straight from disk and talk to the server
 directly — this proxy is *optional*. It remains useful for older servers
 without CORS headers and for setups where same-origin is simply more
@@ -110,7 +110,7 @@ def main():
     Handler.target_port = parsed.port or 80
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    print(f"agentgraph Studio  →  http://127.0.0.1:{args.port}/")
+    print(f"Rusty Studio       →  http://127.0.0.1:{args.port}/")
     print(f"proxying /api/*    →  {args.target}")
     print(f"connect with base URL:  /api")
     try:

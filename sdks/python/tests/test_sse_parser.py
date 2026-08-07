@@ -1,4 +1,4 @@
-"""No-I/O unit tests for agentgraph_client's hand-rolled SSE parser and
+"""No-I/O unit tests for rusty_client's hand-rolled SSE parser and
 transport-error translation.
 
 These mirror the JS SDK's parser fixtures (sdks/typescript/test/
@@ -18,8 +18,8 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "sdks" / "python"))
 
-from agentgraph_client import AgentGraphClient, AgentGraphError, SSEEvent  # noqa: E402
-from agentgraph_client.client import _iter_sse  # noqa: E402
+from rusty_client import RustyClient, RustyError, SSEEvent  # noqa: E402
+from rusty_client.client import _iter_sse  # noqa: E402
 
 
 class FakeSseResponse:
@@ -150,9 +150,9 @@ class TestIterSse(unittest.TestCase):
         gen.close()  # consumer abandons the stream early
         self.assertTrue(resp.closed, "response closed on generator.close()")
 
-    def test_read_timeout_translated_to_agentgraph_error(self) -> None:
+    def test_read_timeout_translated_to_rusty_error(self) -> None:
         resp = TimeoutSseResponse()
-        with self.assertRaises(AgentGraphError) as ctx:
+        with self.assertRaises(RustyError) as ctx:
             list(_iter_sse(resp))
         self.assertIsNone(ctx.exception.status)
         self.assertTrue(resp.closed, "response closed even on read failure")
@@ -163,10 +163,10 @@ class TestTransportWrapping(unittest.TestCase):
     connect-time translation (the module's documented contract)."""
 
     def test_body_read_timeout_wrapped(self) -> None:
-        client = AgentGraphClient("http://unit.test")
+        client = RustyClient("http://unit.test")
         resp = FakeJsonResponse(read_error=socket.timeout("timed out"))
         with mock.patch.object(client, "_open", return_value=resp):
-            with self.assertRaises(AgentGraphError) as ctx:
+            with self.assertRaises(RustyError) as ctx:
                 client.info()
         self.assertIsNone(ctx.exception.status)
         self.assertTrue(resp.closed)
@@ -174,10 +174,10 @@ class TestTransportWrapping(unittest.TestCase):
     def test_invalid_json_reports_status_via_getcode(self) -> None:
         # Regression: the JSON-decode-error branch must not rely on the
         # addinfourl.status attribute, which only exists on Python 3.9+.
-        client = AgentGraphClient("http://unit.test")
+        client = RustyClient("http://unit.test")
         resp = FakeJsonResponse(payload=b"<html>not json</html>")
         with mock.patch.object(client, "_open", return_value=resp):
-            with self.assertRaises(AgentGraphError) as ctx:
+            with self.assertRaises(RustyError) as ctx:
                 client.info()
         self.assertEqual(ctx.exception.status, 200)
         self.assertEqual(ctx.exception.body, "<html>not json</html>")
@@ -186,7 +186,7 @@ class TestTransportWrapping(unittest.TestCase):
 class TestTimeoutResolution(unittest.TestCase):
     """timeout=None falls back to the client default; 0 disables."""
 
-    def _capture(self, client: AgentGraphClient, timeout=None) -> float:
+    def _capture(self, client: RustyClient, timeout=None) -> float:
         captured = {}
 
         def fake_urlopen(req, timeout=None):
@@ -198,15 +198,15 @@ class TestTimeoutResolution(unittest.TestCase):
         return captured["timeout"]
 
     def test_default_applies_when_unset(self) -> None:
-        client = AgentGraphClient("http://unit.test", timeout=30)
+        client = RustyClient("http://unit.test", timeout=30)
         self.assertEqual(self._capture(client), 30)
 
     def test_explicit_timeout_wins(self) -> None:
-        client = AgentGraphClient("http://unit.test", timeout=30)
+        client = RustyClient("http://unit.test", timeout=30)
         self.assertEqual(self._capture(client, timeout=5), 5)
 
     def test_zero_disables(self) -> None:
-        client = AgentGraphClient("http://unit.test", timeout=30)
+        client = RustyClient("http://unit.test", timeout=30)
         self.assertIsNone(self._capture(client, timeout=0))
 
 
@@ -218,7 +218,7 @@ class TestRunStreamHeaders(unittest.TestCase):
             captured.update(method=method, path=path, headers=headers)
             return FakeSseResponse(b'event: end\ndata: {"status":"success"}\n\n')
 
-        client = AgentGraphClient("http://unit.test")
+        client = RustyClient("http://unit.test")
         with mock.patch.object(client, "_open", side_effect=fake_open):
             frames = list(client.run_stream("t1", last_event_id="cp0:0:1"))
 

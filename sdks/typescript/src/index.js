@@ -1,22 +1,22 @@
 /**
- * agentgraph-client — zero-dependency JS/TS client for agentgraph-server.
+ * @rusty-runtime/client — zero-dependency JS/TS client for rusty-server.
  *
  * ESM-only. Works in Node.js >= 18 (global `fetch`, `ReadableStream`,
  * `TextDecoder`) and in modern browsers. No runtime dependencies.
  *
- * The API mirrors the agentgraph-server HTTP surface (Agent-Protocol-compatible
+ * The API mirrors the rusty-server HTTP surface (Agent-Protocol-compatible
  * subset): threads, runs (background / blocking / SSE-streamed), checkpoints,
  * fork & replay time travel, assistants, crons, and the cross-thread KV store.
  *
- * @module agentgraph-client
+ * @module @rusty-runtime/client
  */
 
 /**
  * Error thrown for any non-2xx response from the server, for network-level
- * failures, and (via the {@link AgentGraphTimeoutError} subclass) for
+ * failures, and (via the {@link RustyTimeoutError} subclass) for
  * client-side timeouts.
  */
-export class AgentGraphError extends Error {
+export class RustyError extends Error {
   /**
    * @param {string} message Human-readable message.
    * @param {object} [init]
@@ -27,7 +27,7 @@ export class AgentGraphError extends Error {
    */
   constructor(message, init = {}) {
     super(message, init.cause !== undefined ? { cause: init.cause } : undefined);
-    this.name = 'AgentGraphError';
+    this.name = 'RustyError';
     /** @type {number} HTTP status code, or 0 when no response was received. */
     this.status = init.status ?? 0;
     /** @type {unknown} Parsed response body (JSON value or raw text), if any. */
@@ -37,10 +37,10 @@ export class AgentGraphError extends Error {
   }
 
   /**
-   * Build an AgentGraphError from a non-ok fetch Response, consuming its body.
+   * Build an RustyError from a non-ok fetch Response, consuming its body.
    * @param {Response} response
    * @param {string} url
-   * @returns {Promise<AgentGraphError>}
+   * @returns {Promise<RustyError>}
    */
   static async fromResponse(response, url) {
     let body;
@@ -64,8 +64,8 @@ export class AgentGraphError extends Error {
         : typeof body === 'string' && body
           ? body
           : response.statusText;
-    return new AgentGraphError(
-      `agentgraph-server request failed: ${response.status} ${detail}`.trim(),
+    return new RustyError(
+      `rusty-server request failed: ${response.status} ${detail}`.trim(),
       { status: response.status, body, url },
     );
   }
@@ -75,31 +75,31 @@ export class AgentGraphError extends Error {
  * Thrown when a request exceeds the client's (or per-call) timeout.
  * `status` is 0 and `body` is undefined.
  */
-export class AgentGraphTimeoutError extends AgentGraphError {
+export class RustyTimeoutError extends RustyError {
   /**
    * @param {string} url
    * @param {number} timeoutMs
    */
   constructor(url, timeoutMs) {
-    super(`agentgraph-server request timed out after ${timeoutMs} ms`, { status: 0, url });
-    this.name = 'AgentGraphTimeoutError';
+    super(`rusty-server request timed out after ${timeoutMs} ms`, { status: 0, url });
+    this.name = 'RustyTimeoutError';
     /** @type {number} */
     this.timeoutMs = timeoutMs;
   }
 }
 
 /**
- * Client for an agentgraph-server deployment.
+ * Client for an rusty-server deployment.
  *
  * @example
- * import { AgentGraphClient } from 'agentgraph-client';
+ * import { RustyClient } from '@rusty-runtime/client';
  *
- * const client = new AgentGraphClient('http://localhost:8100');
+ * const client = new RustyClient('http://localhost:8100');
  * const { thread_id } = await client.createThread('pipeline');
  * const terminal = await client.runWait(thread_id, {});
  * console.log(terminal.status, terminal.output);
  */
-export class AgentGraphClient {
+export class RustyClient {
   #baseUrl;
   #apiKey;
   #timeout;
@@ -123,7 +123,7 @@ export class AgentGraphClient {
    */
   constructor(baseUrl, options = {}) {
     if (typeof baseUrl !== 'string' || baseUrl.length === 0) {
-      throw new TypeError('AgentGraphClient: baseUrl must be a non-empty string');
+      throw new TypeError('RustyClient: baseUrl must be a non-empty string');
     }
     this.#baseUrl = baseUrl.replace(/\/+$/, '');
     this.#apiKey = options.apiKey;
@@ -131,7 +131,7 @@ export class AgentGraphClient {
     this.#fetch = options.fetch ?? globalThis.fetch?.bind(globalThis);
     if (typeof this.#fetch !== 'function') {
       throw new Error(
-        'AgentGraphClient: no fetch implementation available. ' +
+        'RustyClient: no fetch implementation available. ' +
           'Use Node.js >= 18, a modern browser, or pass { fetch }.',
       );
     }
@@ -185,7 +185,7 @@ export class AgentGraphClient {
         body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
         signal: controller.signal,
       });
-      if (!response.ok) throw await AgentGraphError.fromResponse(response, url);
+      if (!response.ok) throw await RustyError.fromResponse(response, url);
       if (opts.raw) {
         // For raw (streaming) responses the timeout only covered connection
         // setup; hand the open stream to the caller.
@@ -197,10 +197,10 @@ export class AgentGraphClient {
       const text = await response.text();
       return text ? JSON.parse(text) : null;
     } catch (err) {
-      if (timedOut) throw new AgentGraphTimeoutError(url, timeoutMs);
-      if (err instanceof AgentGraphError) throw err;
+      if (timedOut) throw new RustyTimeoutError(url, timeoutMs);
+      if (err instanceof RustyError) throw err;
       if (err instanceof Error && err.name === 'AbortError') {
-        throw new AgentGraphError('agentgraph-server request aborted', {
+        throw new RustyError('rusty-server request aborted', {
           status: 0,
           url,
           cause: err,
@@ -209,7 +209,7 @@ export class AgentGraphClient {
       if (err instanceof TypeError) {
         // fetch rejects with TypeError for network-level failures (DNS,
         // refused connection, TLS) before any response exists.
-        throw new AgentGraphError(`agentgraph-server network error: ${err.message}`, {
+        throw new RustyError(`rusty-server network error: ${err.message}`, {
           status: 0,
           url,
           cause: err,
@@ -408,7 +408,7 @@ export class AgentGraphClient {
       { body, headers, raw: true, timeout: options.timeout, signal: options.signal },
     );
     if (!response.body) {
-      throw new AgentGraphError('agentgraph-server stream response has no body', {
+      throw new RustyError('rusty-server stream response has no body', {
         status: response.status,
         url: response.url,
       });
@@ -732,4 +732,4 @@ export async function* parseSseStream(body, signal) {
   }
 }
 
-export default AgentGraphClient;
+export default RustyClient;

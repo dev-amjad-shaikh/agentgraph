@@ -1,25 +1,27 @@
-# agentgraph-client
+# Rusty SDK — TypeScript client
 
-Zero-dependency JS/TS client for [`agentgraph-server`](../../agentgraph-server) — the HTTP + SSE face of `agentgraph` graphs. ESM-only, works in **Node.js >= 18** and **modern browsers** (global `fetch`, `ReadableStream`, `TextDecoder`, `AbortController`). Hand-written TypeScript declarations included; full JSDoc in the source.
+Zero-dependency JS/TS client for [`rusty-server`](../../rusty-server) — the HTTP + SSE face of Rusty graphs. ESM-only, works in **Node.js >= 18** and **modern browsers** (global `fetch`, `ReadableStream`, `TextDecoder`, `AbortController`). Hand-written TypeScript declarations included; full JSDoc in the source.
 
 ```bash
-# no dependencies to install — import it directly
+npm install @rusty-runtime/client
+
+# from a checkout: no build step, import it directly
 node --test test/   # e2e suite (builds + launches the real server demo binary)
 ```
 
 ## Quickstart
 
 ```js
-import { AgentGraphClient } from 'agentgraph-client';
+import { RustyClient } from '@rusty-runtime/client';
 
-const client = new AgentGraphClient('http://localhost:8100', {
+const client = new RustyClient('http://localhost:8100', {
   // apiKey: '…',   // sent as X-Api-Key when the server configures one
   // timeout: 30_000, // ms per request (default); 0 disables
 });
 
 // What's registered?
 const info = await client.info();
-// { service: 'agentgraph-server', version: '0.4.0', graphs: [{ name: 'pipeline', channels: ['log'] }, …] }
+// { service: 'rusty-server', version: '0.4.0', graphs: [{ name: 'pipeline', channels: ['log'] }, …] }
 
 // Create a thread bound to a graph and run it to completion
 const { thread_id } = await client.createThread('react_agent');
@@ -57,7 +59,7 @@ for await (const frame of client.runStream(thread_id, { input: { /* … */ } }))
 | `listCrons()` / `deleteCron(id)` | `GET /crons` · `DELETE /crons/{id}` | cron list / delete |
 | `kvGet(ns, key)` / `kvPut(ns, key, value)` / `kvDelete(ns, key)` / `kvList(ns)` | `GET/PUT/DELETE /store/{ns}/{key}` · `GET /store/{ns}` | KV items |
 
-**Run payload** (all methods that take `payload`): `{ input, command: { resume }, config: { recursion_limit }, checkpoint: { checkpoint_id }, metadata, stream_mode, multitask_strategy, assistant_id }` — see the [server README](../../agentgraph-server/README.md#http-api) for semantics (resume for human-in-the-loop, `checkpoint_id` for replay).
+**Run payload** (all methods that take `payload`): `{ input, command: { resume }, config: { recursion_limit }, checkpoint: { checkpoint_id }, metadata, stream_mode, multitask_strategy, assistant_id }` — see the [server README](../../rusty-server/README.md#http-api) for semantics (resume for human-in-the-loop, `checkpoint_id` for replay).
 
 ### Streaming & resume
 
@@ -86,8 +88,8 @@ await client.runWait(forkId, { checkpoint: { checkpoint_id: earliest } }); // re
 
 ## Errors, timeouts, aborts
 
-- Non-2xx responses throw `AgentGraphError` with `.status` (HTTP code) and `.body` (parsed JSON or raw text).
-- Timeouts throw `AgentGraphTimeoutError` (a subclass; `.status === 0`, `.timeoutMs` set). The client timeout is per request via `AbortController`; for `runStream` it covers **establishing** the stream, not its lifetime.
+- Non-2xx responses throw `RustyError` with `.status` (HTTP code) and `.body` (parsed JSON or raw text).
+- Timeouts throw `RustyTimeoutError` (a subclass; `.status === 0`, `.timeoutMs` set). The client timeout is per request via `AbortController`; for `runStream` it covers **establishing** the stream, not its lifetime.
 - Every method accepts `{ signal }` (and `runStream` takes `options.signal`) so you can abort with your own `AbortController`.
 
 ## Node vs browser notes
@@ -95,14 +97,14 @@ await client.runWait(forkId, { checkpoint: { checkpoint_id: earliest } }); // re
 - **Node >= 18**: zero setup — global `fetch` (undici), web `ReadableStream`, and `TextDecoder` are built in. `engines` is pinned to `>=18`.
 - **Browsers**: the server ships permissive CORS (`access-control-allow-origin: *`, preflights answered before auth), so the client works cross-origin out of the box — including from `file://` pages. SSE is consumed via `fetch` + `ReadableStream` (no `EventSource`), which is what makes `POST` streaming and the `Last-Event-ID` resume header possible; use a Chromium/Firefox/Safari version with streaming `fetch` support.
 - **Custom fetch**: pass `{ fetch }` to the constructor for tests, proxies, or polyfills.
-- ESM only (`"type": "module"`). From CommonJS use `await import('agentgraph-client')`.
+- ESM only (`"type": "module"`). From CommonJS use `await import('@rusty-runtime/client')`.
 
 ## Development
 
 ```bash
 # Build the demo server (once) and run the e2e suite against it:
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo build --manifest-path ../../agentgraph-server/Cargo.toml --example server_demo
+cargo build --manifest-path ../../rusty-server/Cargo.toml --example server_demo
 node --test test/
 ```
 

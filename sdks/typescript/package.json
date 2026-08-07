@@ -1,7 +1,7 @@
 {
-  "name": "agentgraph-client",
+  "name": "@rusty-runtime/client",
   "version": "0.1.0",
-  "description": "Zero-dependency JS/TS client for agentgraph-server (HTTP + SSE). Works in Node.js >= 18 and browsers.",
+  "description": "Zero-dependency JS/TS client for rusty-server (HTTP + SSE). Works in Node.js >= 18 and browsers.",
   "type": "module",
   "main": "./src/index.js",
   "types": "./src/index.d.ts",
@@ -24,12 +24,17 @@
     "test": "node --test test/"
   },
   "keywords": [
-    "agentgraph",
+    "rusty",
     "agent",
     "llm",
     "graph",
     "sse",
     "agent-protocol"
   ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dev-amjad-shaikh/rusty",
+    "directory": "sdks/typescript"
+  },
   "license": "MIT OR Apache-2.0"
 }

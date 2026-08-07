@@ -1,6 +1,6 @@
 /**
- * agentgraph-client e2e tests — run against the REAL agentgraph-server demo
- * binary (`cargo build --example server_demo` in agentgraph-server/).
+ * @rusty-runtime/client e2e tests — run against the REAL rusty-server demo
+ * binary (`cargo build --example server_demo` in rusty-server/).
  *
  * The suite builds the binary if missing, launches it as a child process
  * (the demo binds 127.0.0.1:8100), polls /ok, exercises the full client
@@ -19,29 +19,29 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
-  AgentGraphClient,
-  AgentGraphError,
-  AgentGraphTimeoutError,
+  RustyClient,
+  RustyError,
+  RustyTimeoutError,
 } from '../src/index.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..', '..', '..');
 const BINARY = path.join(
   REPO_ROOT,
-  'agentgraph-server',
+  'rusty-server',
   'target',
   'debug',
   'examples',
   'server_demo',
 );
-const SERVER_MANIFEST = path.join(REPO_ROOT, 'agentgraph-server', 'Cargo.toml');
+const SERVER_MANIFEST = path.join(REPO_ROOT, 'rusty-server', 'Cargo.toml');
 const SCRATCH_DIR = path.join(REPO_ROOT, 'sdks', 'typescript', '.tmp-e2e');
 const BASE_URL = 'http://127.0.0.1:8100';
 const PORT = 8100;
 
 /** @type {import('node:child_process').ChildProcess | null} */
 let child = null;
-/** @type {AgentGraphClient} */
+/** @type {RustyClient} */
 let client;
 
 function isPortFree(port) {
@@ -116,7 +116,7 @@ before(async () => {
   });
 
   await waitForServer(BASE_URL);
-  client = new AgentGraphClient(BASE_URL);
+  client = new RustyClient(BASE_URL);
 }, { timeout: 300_000 });
 
 after(async () => {
@@ -152,7 +152,7 @@ async function pollRunTerminal(runId, attempts = 50, intervalMs = 100) {
 
 test('info() reports service metadata and registered graphs', async () => {
   const info = await client.info();
-  assert.equal(info.service, 'agentgraph-server');
+  assert.equal(info.service, 'rusty-server');
   assert.ok(info.version, 'version present');
   assert.equal(info.checkpointer, 'json_file');
   const names = info.graphs.map((g) => g.name).sort();
@@ -308,7 +308,7 @@ test('kv store: put/get/list/delete round trip with 404 semantics', async () => 
   await client.kvDelete(ns, 'b-key');
   await assert.rejects(
     () => client.kvGet(ns, 'b-key'),
-    (err) => err instanceof AgentGraphError && err.status === 404,
+    (err) => err instanceof RustyError && err.status === 404,
   );
 
   // Cleanup.
@@ -356,15 +356,15 @@ test('crons: create/list/delete with 404 after delete', async () => {
   await client.deleteCron(cronId);
   await assert.rejects(
     () => client.deleteCron(cronId),
-    (err) => err instanceof AgentGraphError && err.status === 404,
+    (err) => err instanceof RustyError && err.status === 404,
   );
 });
 
-test('unknown thread surfaces AgentGraphError with status and body', async () => {
+test('unknown thread surfaces RustyError with status and body', async () => {
   await assert.rejects(
     () => client.getState('no-such-thread'),
     (err) => {
-      assert.ok(err instanceof AgentGraphError);
+      assert.ok(err instanceof RustyError);
       assert.equal(err.status, 404);
       assert.ok(err.body !== undefined, 'error body captured');
       return true;
@@ -372,7 +372,7 @@ test('unknown thread surfaces AgentGraphError with status and body', async () =>
   );
 });
 
-test('client-side timeout rejects with AgentGraphTimeoutError', async () => {
+test('client-side timeout rejects with RustyTimeoutError', async () => {
   // Deterministic: a fetch that only settles when the client's AbortController
   // fires. (Racing a 1 ms timeout against a localhost server is flaky.)
   const hangingFetch = (_url, init) =>
@@ -383,20 +383,20 @@ test('client-side timeout rejects with AgentGraphTimeoutError', async () => {
         reject(err);
       });
     });
-  const impatient = new AgentGraphClient('http://unit.test', {
+  const impatient = new RustyClient('http://unit.test', {
     timeout: 10,
     fetch: hangingFetch,
   });
   await assert.rejects(
     () => impatient.info(),
-    (err) => err instanceof AgentGraphTimeoutError && err.timeoutMs === 10,
+    (err) => err instanceof RustyTimeoutError && err.timeoutMs === 10,
   );
 });
 
 test('auth: demo server runs in dev mode (no API key configured)', async (t) => {
   // The demo binary sets no API key, so requests without X-Api-Key must pass.
   const info = await client.info();
-  assert.equal(info.service, 'agentgraph-server');
+  assert.equal(info.service, 'rusty-server');
 
   // A 401-without-key assertion only applies when a key IS configured.
   // Detect auth enforcement by probing with a bogus key: in dev mode the
@@ -435,7 +435,7 @@ test('SSE parser: multi-line data, comments, CRLF, Last-Event-ID header', async 
     });
   };
 
-  const fake = new AgentGraphClient('http://unit.test', { fetch: fakeFetch });
+  const fake = new RustyClient('http://unit.test', { fetch: fakeFetch });
   const frames = [];
   for await (const frame of fake.runStream('t1', { input: {} }, { lastEventId: 'cp0:0:1' })) {
     frames.push(frame);
@@ -472,7 +472,7 @@ test('SSE parser: api key and extra headers are sent on requests', async () => {
     captured.init = init;
     return new Response(stream, { status: 200 });
   };
-  const authed = new AgentGraphClient('http://unit.test', {
+  const authed = new RustyClient('http://unit.test', {
     apiKey: 'secret-key',
     fetch: fakeFetch,
   });
@@ -501,7 +501,7 @@ test('runStream cancels the HTTP body when the consumer breaks early', async () 
       status: 200,
       headers: { 'content-type': 'text/event-stream' },
     });
-  const fake = new AgentGraphClient('http://unit.test', { fetch: fakeFetch });
+  const fake = new RustyClient('http://unit.test', { fetch: fakeFetch });
 
   let first = null;
   for await (const frame of fake.runStream('t1')) {

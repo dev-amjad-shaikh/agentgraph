@@ -1,0 +1,33 @@
+[package]
+name = "rusty-agent-runtime"
+version = "0.4.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "The durable agent runtime built in Rust — core graph engine: typed channels with reducers, Pregel/BSP super-step execution, checkpoints, interrupts, and streaming."
+repository = "https://github.com/dev-amjad-shaikh/rusty"
+keywords = ["agent", "graph", "llm", "orchestration", "langgraph"]
+categories = ["asynchronous", "network-programming"]
+
+# NOTE: Cargo.toml and src/lib.rs are owned EXCLUSIVELY by the scaffold engineer.
+# Do not edit them in implementation PRs; request changes instead.
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+futures = "0.3"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "json", "chrono"], optional = true }
+wasmtime = { version = "47", optional = true }
+
+[features]
+postgres = ["dep:sqlx"]
+wasm = ["dep:wasmtime"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

@@ -11,7 +11,7 @@ __pycache__/
 srv.pid
 
 # Checkpoint / demo data produced by examples
-agentgraph-server/data/
+rusty-server/data/
 data/
 
 # OS

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>agentgraph Studio</title>
+<title>Rusty Studio</title>
 <style>
   :root {
     --bg:        #171512;
@@ -208,7 +208,7 @@
 <body>
 <div id="app">
   <header>
-    <div class="brand">agentgraph <span>Studio</span></div>
+    <div class="brand">Rusty <span>Studio</span></div>
     <input class="url" id="inp-url" type="text" spellcheck="false" placeholder="http://127.0.0.1:8100">
     <input class="key" id="inp-key" type="password" spellcheck="false" placeholder="API key (optional)" title="Stored in plaintext in this browser's localStorage — use a dev-only key.">
     <button class="primary" id="btn-connect">Connect</button>
@@ -328,7 +328,7 @@
 <script>
 "use strict";
 /* ============================================================
- * agentgraph Studio — zero-build debug UI for agentgraph-server.
+ * Rusty Studio — zero-build debug UI for Rusty Server (`rusty-server`).
  * Single file, no framework. State that survives reloads lives in
  * localStorage under the `ags:` prefix.
  * ========================================================== */
@@ -401,7 +401,7 @@ async function api(method, path, body) {
     });
   } catch (e) {
     throw new ApiError(0, { error: "network", message:
-      `${e.message} — network/CORS failure. agentgraph-server v0.3+ sends permissive CORS ` +
+      `${e.message} — network/CORS failure. rusty-server v0.3+ sends permissive CORS ` +
       `headers, so this usually means the server is unreachable or older; see docs/studio.md (“CORS”).` });
   }
   const text = await res.text();

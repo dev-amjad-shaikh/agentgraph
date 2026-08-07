@@ -1,10 +1,12 @@
-# agentgraph
+# Rusty
 
-**agentgraph is a full-Rust agentic platform**: a LangGraph-style execution core, an axum HTTP/SSE server that serves compiled graphs from a single static binary, a worker SDK for remote nodes, an OpenTelemetry export crate, zero-dependency Python and TypeScript client SDKs, and a zero-build debug UI. This document is the anatomy of that platform — what the pieces are, how one run flows through them, and why each mechanism exists. Dual-licensed under MIT OR Apache-2.0. Public repo: [github.com/dev-amjad-shaikh/agentgraph](https://github.com/dev-amjad-shaikh/agentgraph).
+**The durable agent runtime built in Rust.**
+
+**Rusty is a full-Rust agentic platform**: a LangGraph-style execution core (Rusty Core), an axum HTTP/SSE server (Rusty Server) that serves compiled graphs from a single static binary, a worker SDK for remote nodes (Rusty Worker), an OpenTelemetry export crate, zero-dependency Python and TypeScript client SDKs (Rusty SDK), and a zero-build debug UI (Rusty Studio). This document is the anatomy of that platform — what the pieces are, how one run flows through them, and why each mechanism exists. Dual-licensed under MIT OR Apache-2.0. Public repo: [github.com/dev-amjad-shaikh/rusty](https://github.com/dev-amjad-shaikh/rusty).
 
 ```bash
-git clone https://github.com/dev-amjad-shaikh/agentgraph.git
-cd agentgraph/agentgraph-server
+git clone https://github.com/dev-amjad-shaikh/rusty.git
+cd rusty/rusty-server
 cargo run --example server_demo   # serves a scripted ReAct agent on http://127.0.0.1:8100
 # then open studio/index.html in a browser and connect to 127.0.0.1:8100
 ```
@@ -13,48 +15,48 @@ cargo run --example server_demo   # serves a scripted ReAct agent on http://127.
 
 ## 1. Orientation — the platform map
 
-Everything in the repo hangs off one crate. `agentgraph` (the core) has no HTTP and no server dependencies; every other crate is a shell around it or a client of those shells.
+Everything in the repo hangs off one crate. Rusty Core (the `rusty-agent-runtime` crate, in `rusty-core/`) has no HTTP and no server dependencies; every other crate is a shell around it or a client of those shells.
 
 ```mermaid
 flowchart LR
-    subgraph core["agentgraph core — no HTTP"]
+    subgraph core["Rusty Core — no HTTP"]
         E["Executor"] --> S["State + Reducers"]
         E --> G["Graph"]
         E --> C["Checkpointer"]
     end
-    SRV["agentgraph-server<br>axum HTTP + SSE"] --> E
-    E -->|"HTTP, protocol v1"| WRK["agentgraph-worker"]
-    OTL["agentgraph-otel"] -.->|"tracing spans"| E
-    SDK["Python + TS SDKs"] -->|"HTTP + SSE"| SRV
-    STU["Studio debug UI"] -->|"HTTP + SSE"| SRV
+    SRV["Rusty Server<br>axum HTTP + SSE"] --> E
+    E -->|"HTTP, protocol v1"| WRK["Rusty Worker"]
+    OTL["rusty-otel"] -.->|"tracing spans"| E
+    SDK["Rusty SDK — Python + TS clients"] -->|"HTTP + SSE"| SRV
+    STU["Rusty Studio debug UI"] -->|"HTTP + SSE"| SRV
     E -->|"ChatModel"| LLM["OpenAI-compatible LLM endpoint"]
     E -->|"MCP over stdio"| MCP["MCP tool servers"]
 ```
 
 | Crate | Version | Role in the anatomy |
 |---|---|---|
-| [`agentgraph`](agentgraph/) | 0.4.0 | The engine: state channels + reducers, graph builder with `compile()`-time validation, the Pregel/BSP super-step executor, versioned checkpoints (memory / JSON-file / Postgres), interrupts & resume, `Send` fan-out, `ChatModel` + parallel tool execution, the prebuilt ReAct agent, MCP client, remote nodes, sandboxed `WasmNode` (feature `wasm`). |
-| [`agentgraph-server`](agentgraph-server/) | 0.4.0 | The network face: an axum library crate implementing an Agent-Protocol subset — threads, background/blocking/SSE runs, checkpoint history, fork + replay time travel, assistants, crons, KV store, API-key auth with multi-tenancy. You call `agentgraph_server::serve(registry, config)` from your own `main.rs`. |
-| [`agentgraph-worker`](agentgraph-worker/) | 0.1.0 | The worker SDK: serves your node handlers over HTTP so the core's `RemoteNode` can execute graph nodes on remote services. HITL interrupts cross the wire. |
-| [`agentgraph-otel`](agentgraph-otel/) | 0.1.0 | One-call `tracing` subscriber setup for `agentgraph` executors, with optional OTLP span export (OpenTelemetry 0.32, HTTP/protobuf). |
+| [`rusty-agent-runtime`](rusty-core/) | 0.4.0 | The engine: state channels + reducers, graph builder with `compile()`-time validation, the Pregel/BSP super-step executor, versioned checkpoints (memory / JSON-file / Postgres), interrupts & resume, `Send` fan-out, `ChatModel` + parallel tool execution, the prebuilt ReAct agent, MCP client, remote nodes, sandboxed `WasmNode` (feature `wasm`). |
+| [`rusty-server`](rusty-server/) | 0.4.0 | The network face: an axum library crate implementing an Agent-Protocol subset — threads, background/blocking/SSE runs, checkpoint history, fork + replay time travel, assistants, crons, KV store, API-key auth with multi-tenancy. You call `rusty_server::serve(registry, config)` from your own `main.rs`; the crate also ships the `rusty` binary as the CLI entrypoint. |
+| [`rusty-worker`](rusty-worker/) | 0.1.0 | The worker SDK: serves your node handlers over HTTP so the core's `RemoteNode` can execute graph nodes on remote services. HITL interrupts cross the wire. |
+| [`rusty-otel`](rusty-otel/) | 0.1.0 | One-call `tracing` subscriber setup for Rusty Core executors, with optional OTLP span export (OpenTelemetry 0.32, HTTP/protobuf). |
 
-Around the crates: [`sdks/python/`](sdks/python/) and [`sdks/typescript/`](sdks/typescript/) (zero-dependency clients, each verified by an e2e suite that boots the real server binary), and [`studio/`](studio/) (a zero-build, single-file debug UI — connect, run, inspect state and checkpoint history, fork and replay). The server is the polyglot interop layer by design: native bindings (PyO3, napi-rs, C ABI) were considered and rejected — see [docs/roadmap.md](docs/roadmap.md#explicitly-rejected).
+Around the crates: the Rusty SDK — [`sdks/python/`](sdks/python/) (PyPI `rusty-agent-runtime`, imported as `rusty_client`) and [`sdks/typescript/`](sdks/typescript/) (npm `@rusty-runtime/client`), zero-dependency clients, each verified by an e2e suite that boots the real server binary — and [`studio/`](studio/) (Rusty Studio: a zero-build, single-file debug UI — connect, run, inspect state and checkpoint history, fork and replay). The server is the polyglot interop layer by design: native bindings (PyO3, napi-rs, C ABI) were considered and rejected — see [docs/roadmap.md](docs/roadmap.md#explicitly-rejected).
 
 ## 2. The mental model — an agent is a graph over shared state, executed in super-steps
 
 Strip the platform down and four primitives remain. Each exists to kill a specific failure class of agent systems.
 
-**Primitive 1: typed state channels with reducers.** Nodes never call each other and never return whole state. Every state key is a *channel* whose [`Reducer`](agentgraph/src/state.rs:L128) defines how partial updates merge: `Overwrite` (LangGraph's `LastValue`), `Append`, `DeepMerge`, `AddMessages` (ID-aware message upsert). The `StateSpec` is the complete schema — a write to an undeclared channel is an error, and a second write to a single-write channel within one super-step is an error. That single-write rule eliminates an entire bug class: in a parallel graph, two nodes silently clobbering the same key is otherwise the default outcome, and it surfaces only as a corrupted conversation three steps later. Here it is a typed error at the barrier, naming both writers.
+**Primitive 1: typed state channels with reducers.** Nodes never call each other and never return whole state. Every state key is a *channel* whose [`Reducer`](rusty-core/src/state.rs:L128) defines how partial updates merge: `Overwrite` (LangGraph's `LastValue`), `Append`, `DeepMerge`, `AddMessages` (ID-aware message upsert). The `StateSpec` is the complete schema — a write to an undeclared channel is an error, and a second write to a single-write channel within one super-step is an error. That single-write rule eliminates an entire bug class: in a parallel graph, two nodes silently clobbering the same key is otherwise the default outcome, and it surfaces only as a corrupted conversation three steps later. Here it is a typed error at the barrier, naming both writers.
 
-**Primitive 2: nodes.** A node is an async function — any `Fn(NodeContext) -> impl Future<Output = Result<NodeOutput>>` implements the [`Node` trait](agentgraph/src/node.rs:L276) via a blanket impl — that receives an *immutable snapshot* of the state as of the super-step start and returns a *partial* update plus an optional routing [`Command`](agentgraph/src/node.rs:L211). Because the snapshot is cloned per invocation, snapshot isolation is structural, not conventional: two nodes in the same super-step physically cannot observe each other's writes.
+**Primitive 2: nodes.** A node is an async function — any `Fn(NodeContext) -> impl Future<Output = Result<NodeOutput>>` implements the [`Node` trait](rusty-core/src/node.rs:L276) via a blanket impl — that receives an *immutable snapshot* of the state as of the super-step start and returns a *partial* update plus an optional routing [`Command`](rusty-core/src/node.rs:L211). Because the snapshot is cloned per invocation, snapshot isolation is structural, not conventional: two nodes in the same super-step physically cannot observe each other's writes.
 
 **Primitive 3: the super-step loop.** Execution proceeds in discrete super-steps (Google Pregel / bulk-synchronous-parallel): *plan → run the active set in parallel → barrier → merge → route → checkpoint*. The barrier is what makes shared-state parallelism safe, and it makes each step transactional: if any node fails or interrupts, the step's writes are discarded wholesale. A graph cycle — the ReAct loop `agent → tools → agent` — is not call-stack recursion; it is nodes being re-scheduled across super-steps, which is why the runaway-loop guard is a step budget (`max_steps`, default 1000), not a stack limit.
 
-**Primitive 4: versioned checkpoints.** At every super-step boundary the executor persists a [`Checkpoint`](agentgraph/src/checkpoint.rs:L27): step index, full channel state, and the next-node set. One primitive yields four features that are usually four subsystems: durable execution (resume after a crash), human-in-the-loop (suspend, serialize, approve, resume), time travel (load any historical checkpoint, fork alternate timelines), and partial-failure recovery. Checkpoints happen at boundaries, never mid-node — so resume re-executes a node from its start, and node logic must be idempotent. That idempotency contract is the price of durability, and the engine states it plainly rather than hiding it.
+**Primitive 4: versioned checkpoints.** At every super-step boundary the executor persists a [`Checkpoint`](rusty-core/src/checkpoint.rs:L27): step index, full channel state, and the next-node set. One primitive yields four features that are usually four subsystems: durable execution (resume after a crash), human-in-the-loop (suspend, serialize, approve, resume), time travel (load any historical checkpoint, fork alternate timelines), and partial-failure recovery. Checkpoints happen at boundaries, never mid-node — so resume re-executes a node from its start, and node logic must be idempotent. That idempotency contract is the price of durability, and the engine states it plainly rather than hiding it.
 
 ## 3. One run, end to end
 
-A call to [`Executor::run`](agentgraph/src/executor.rs:L366) restores-or-seeds state, then loops [`execute_super_step`](agentgraph/src/executor.rs:L527) until routing yields an empty next set (`Done`), a node interrupts (`Interrupted`), or `max_steps` trips (error).
+A call to [`Executor::run`](rusty-core/src/executor.rs:L366) restores-or-seeds state, then loops [`execute_super_step`](rusty-core/src/executor.rs:L527) until routing yields an empty next set (`Done`), a node interrupts (`Interrupted`), or `max_steps` trips (error).
 
 ```mermaid
 sequenceDiagram
@@ -80,13 +82,13 @@ The rest of this document walks each stage with the real code.
 
 ### 4a. State and channels — the merge is validated before it happens
 
-[`StateSpec::apply_super_step`](agentgraph/src/state.rs:L387) receives every write of one super-step as `(node_name, updates)` pairs. Two properties matter. First, validation is all-or-nothing: every channel is checked — declared, correctly typed for its reducer, within the single-write budget — *before* a single mutation is applied, so a failed step leaves state untouched. Second, fan-in is deterministic: writes arrive from concurrently completing tasks in nondeterministic order, so they are sorted by node name (`collected.sort_by(|a, b| a.0.cmp(&b.0))`, agentgraph/src/state.rs:L400) before merging. Checkpoints derived from the merge are then stable run-to-run.
+[`StateSpec::apply_super_step`](rusty-core/src/state.rs:L387) receives every write of one super-step as `(node_name, updates)` pairs. Two properties matter. First, validation is all-or-nothing: every channel is checked — declared, correctly typed for its reducer, within the single-write budget — *before* a single mutation is applied, so a failed step leaves state untouched. Second, fan-in is deterministic: writes arrive from concurrently completing tasks in nondeterministic order, so they are sorted by node name (`collected.sort_by(|a, b| a.0.cmp(&b.0))`, rusty-core/src/state.rs:L400) before merging. Checkpoints derived from the merge are then stable run-to-run.
 
-The single-write rule, verbatim (agentgraph/src/state.rs:L432):
+The single-write rule, verbatim (rusty-core/src/state.rs:L432):
 
 ```rust
 if *count > 1 && !reducer.allows_multiple_writes() {
-    return Err(AgentGraphError::InvalidUpdate(format!(
+    return Err(RustyError::InvalidUpdate(format!(
         "channel `{channel}` can receive only one value per super-step \
          (reducer: {reducer}); already written by node `{}`, second write from \
          node `{node}`. Use a multi-write reducer (Append/DeepMerge/\
@@ -96,15 +98,15 @@ if *count > 1 && !reducer.allows_multiple_writes() {
 }
 ```
 
-The error message tells you the fix: if you intended fan-in, declare the channel with a multi-write reducer. `AddMessages` deserves a note of its own — it is LangGraph's `add_messages`, an ID-aware upsert over a message array, so a node can correct a message it wrote earlier (by `"id"`) while parallel tool results append alongside it (agentgraph/src/state.rs:L260).
+The error message tells you the fix: if you intended fan-in, declare the channel with a multi-write reducer. `AddMessages` deserves a note of its own — it is LangGraph's `add_messages`, an ID-aware upsert over a message array, so a node can correct a message it wrote earlier (by `"id"`) while parallel tool results append alongside it (rusty-core/src/state.rs:L260).
 
 ### 4b. Graph building — invalid topologies fail at `compile()`, not mid-run
 
-[`GraphBuilder`](agentgraph/src/graph.rs:L210) is deliberately thin: register nodes under names, add static edges (`from → to`, all destinations of multiple edges activate in parallel), add at most one conditional edge per source (an async router reading the post-barrier state), set the entry point. [`compile()`](agentgraph/src/graph.rs:L305) freezes the graph into an immutable, `Arc`-shared `Graph` and rejects, before any node or paid LLM call runs: an empty graph, a missing or dangling entry point, edges referencing unknown nodes, reserved node names (`__end__` and anything `__`-prefixed), duplicate static edges (which would surface later as a spurious double-write failure), multiple conditional edges from one node, and mixed routing (agentgraph/src/graph.rs:L367):
+[`GraphBuilder`](rusty-core/src/graph.rs:L210) is deliberately thin: register nodes under names, add static edges (`from → to`, all destinations of multiple edges activate in parallel), add at most one conditional edge per source (an async router reading the post-barrier state), set the entry point. [`compile()`](rusty-core/src/graph.rs:L305) freezes the graph into an immutable, `Arc`-shared `Graph` and rejects, before any node or paid LLM call runs: an empty graph, a missing or dangling entry point, edges referencing unknown nodes, reserved node names (`__end__` and anything `__`-prefixed), duplicate static edges (which would surface later as a spurious double-write failure), multiple conditional edges from one node, and mixed routing (rusty-core/src/graph.rs:L367):
 
 ```rust
 if let Some(from) = direct_sources.intersection(&conditional_sources).next() {
-    return Err(AgentGraphError::Graph(format!(
+    return Err(RustyError::Graph(format!(
         "node `{from}` has both static and conditional edges; routing would \
          be ambiguous — use one kind per source node"
     )));
@@ -115,14 +117,14 @@ Conditional router targets and `Send` node names are validated at execution time
 
 ### 4c. The super-step loop — plan, spawn, barrier, merge, route, checkpoint
 
-The loop body is [`execute_super_step`](agentgraph/src/executor.rs:L527). Compute is a `tokio::task::JoinSet`: each active node gets its own clone of the start-of-step snapshot (a `Send` fan-out overlays its scoped item onto that private copy first), and is spawned with its own tracing span (agentgraph/src/executor.rs:L595):
+The loop body is [`execute_super_step`](rusty-core/src/executor.rs:L527). Compute is a `tokio::task::JoinSet`: each active node gets its own clone of the start-of-step snapshot (a `Send` fan-out overlays its scoped item onto that private copy first), and is spawned with its own tracing span (rusty-core/src/executor.rs:L595):
 
 ```rust
-let node_span = tracing::info_span!("agentgraph.node", node = %name, step = step);
+let node_span = tracing::info_span!("rusty.node", node = %name, step = step);
 join_set.spawn(async move { (name, node.run(ctx).await) }.instrument(node_span));
 ```
 
-The barrier (agentgraph/src/executor.rs:L609) drains the JoinSet. Three outcomes per node: success (updates and any `Command` are collected), failure (the JoinSet is dropped, aborting stragglers, and the whole step's writes are discarded — the step is transactional), or interrupt (the run suspends; see 4f). Only after the barrier does the merge of 4a run, then routing of 4d, then the boundary checkpoint of 4e. Node failures are classified for observability: LLM and tool errors are the transient, retryable classes; everything else is a hard failure (agentgraph/src/executor.rs:L641). The guard against runaway cycles is checked before each step: after `max_steps` super-steps without termination the run aborts with a `Graph` error naming the likely cause — an infinite cycle or a missing terminating route (agentgraph/src/executor.rs:L472).
+The barrier (rusty-core/src/executor.rs:L609) drains the JoinSet. Three outcomes per node: success (updates and any `Command` are collected), failure (the JoinSet is dropped, aborting stragglers, and the whole step's writes are discarded — the step is transactional), or interrupt (the run suspends; see 4f). Only after the barrier does the merge of 4a run, then routing of 4d, then the boundary checkpoint of 4e. Node failures are classified for observability: LLM and tool errors are the transient, retryable classes; everything else is a hard failure (rusty-core/src/executor.rs:L641). The guard against runaway cycles is checked before each step: after `max_steps` super-steps without termination the run aborts with a `Graph` error naming the likely cause — an infinite cycle or a missing terminating route (rusty-core/src/executor.rs:L472).
 
 ### 4d. Routing — three kinds of "what runs next"
 
@@ -143,7 +145,7 @@ flowchart TB
     G --> I
 ```
 
-The conditional router's vocabulary is three values (agentgraph/src/graph.rs:L49):
+The conditional router's vocabulary is three values (rusty-core/src/graph.rs:L49):
 
 ```rust
 pub enum Route {
@@ -159,11 +161,11 @@ pub enum Route {
 }
 ```
 
-`Route::Send` is the map-reduce primitive: items are generated at runtime, each is mapped through one invocation of a node with that item overlaid as scoped state, and results fan back in through multi-write reducers. A node's own [`Command::goto`](agentgraph/src/node.rs:L228) output overrides the static edge set entirely; unknown targets — from routers, `Send`s, or commands — are executor errors naming the offending node. An empty next set ends the run.
+`Route::Send` is the map-reduce primitive: items are generated at runtime, each is mapped through one invocation of a node with that item overlaid as scoped state, and results fan back in through multi-write reducers. A node's own [`Command::goto`](rusty-core/src/node.rs:L228) output overrides the static edge set entirely; unknown targets — from routers, `Send`s, or commands — are executor errors naming the offending node. An empty next set ends the run.
 
 ### 4e. Durable execution — one checkpoint primitive, four features
 
-The [`Checkpointer` trait](agentgraph/src/checkpoint.rs:L74) is five methods: `put`, `get_latest`, `list`, `get_by_id`, `fork_thread`. Three savers ship: `InMemoryCheckpointer` (dev/test), `JsonFileCheckpointer` (one JSON file per checkpoint under `{dir}/{thread_id}/`, atomic temp-file-then-rename writes, a `latest` pointer file, per-thread put serialization; agentgraph/src/checkpoint.rs:L262), and `PostgresCheckpointer` (feature `postgres`). The executor writes one checkpoint per super-step boundary (agentgraph/src/executor.rs:L809):
+The [`Checkpointer` trait](rusty-core/src/checkpoint.rs:L74) is five methods: `put`, `get_latest`, `list`, `get_by_id`, `fork_thread`. Three savers ship: `InMemoryCheckpointer` (dev/test), `JsonFileCheckpointer` (one JSON file per checkpoint under `{dir}/{thread_id}/`, atomic temp-file-then-rename writes, a `latest` pointer file, per-thread put serialization; rusty-core/src/checkpoint.rs:L262), and `PostgresCheckpointer` (feature `postgres`). The executor writes one checkpoint per super-step boundary (rusty-core/src/executor.rs:L809):
 
 ```rust
 if let Some(checkpointer) = &self.checkpointer {
@@ -174,7 +176,7 @@ if let Some(checkpointer) = &self.checkpointer {
     checkpointer.put(checkpoint).await?;
 ```
 
-Time travel is two operations. `fork_thread(src, dst, at_checkpoint_id)` copies a thread's history — oldest first, full or truncated at a checkpoint — into a new thread id (agentgraph/src/checkpoint.rs:L133). `RunConfig::with_checkpoint_id(id)` then starts a run from that checkpoint's state and next-node set instead of the latest (agentgraph/src/executor.rs:L194). The safe pattern is fork first, replay on the fork: replaying on the original thread appends new history on top of the old timeline, which is legal — `get_latest` defines recency by insertion order, not step number, precisely so a later resume continues the newest timeline (agentgraph/src/checkpoint.rs:L90) — but usually not what you want.
+Time travel is two operations. `fork_thread(src, dst, at_checkpoint_id)` copies a thread's history — oldest first, full or truncated at a checkpoint — into a new thread id (rusty-core/src/checkpoint.rs:L133). `RunConfig::with_checkpoint_id(id)` then starts a run from that checkpoint's state and next-node set instead of the latest (rusty-core/src/executor.rs:L194). The safe pattern is fork first, replay on the fork: replaying on the original thread appends new history on top of the old timeline, which is legal — `get_latest` defines recency by insertion order, not step number, precisely so a later resume continues the newest timeline (rusty-core/src/checkpoint.rs:L90) — but usually not what you want.
 
 ```mermaid
 sequenceDiagram
@@ -193,7 +195,7 @@ sequenceDiagram
 
 ### 4f. Human-in-the-loop — an interrupt is a transaction abort with a receipt
 
-A node suspends the run by returning `Err(ctx.interrupt(payload))` ([`NodeContext::interrupt`](agentgraph/src/node.rs:L134)). The mechanism is the transactional step of 4c with one addition: the suspension is run-wide, so the in-flight step's writes are discarded — including writes from sibling nodes that already completed — still-running siblings are aborted, and the suspension checkpoint re-schedules the *entire active set* of the step, not just the interrupting node. Anything less would silently lose the siblings' discarded work (agentgraph/src/executor.rs:L656, abridged):
+A node suspends the run by returning `Err(ctx.interrupt(payload))` ([`NodeContext::interrupt`](rusty-core/src/node.rs:L134)). The mechanism is the transactional step of 4c with one addition: the suspension is run-wide, so the in-flight step's writes are discarded — including writes from sibling nodes that already completed — still-running siblings are aborted, and the suspension checkpoint re-schedules the *entire active set* of the step, not just the interrupting node. Anything less would silently lose the siblings' discarded work (rusty-core/src/executor.rs:L656, abridged):
 
 ```rust
 if let Some((name, value)) = interrupted {
@@ -205,7 +207,7 @@ if let Some((name, value)) = interrupted {
         Checkpoint::new(config.thread_id.clone(), step, state.clone(), pending);
 ```
 
-The caller receives `ExecutionOutcome::Interrupted { value, state, checkpoint_id }`. To resume: same `thread_id`, [`RunConfig::with_resume(value)`](agentgraph/src/executor.rs:L186). Every node of the suspended set re-executes from its start; the resume value is broadcast to all of them for the first super-step, so a resumable node checks [`ctx.resume_value()`](agentgraph/src/node.rs:L118) first and must be idempotent in everything it did before interrupting.
+The caller receives `ExecutionOutcome::Interrupted { value, state, checkpoint_id }`. To resume: same `thread_id`, [`RunConfig::with_resume(value)`](rusty-core/src/executor.rs:L186). Every node of the suspended set re-executes from its start; the resume value is broadcast to all of them for the first super-step, so a resumable node checks [`ctx.resume_value()`](rusty-core/src/node.rs:L118) first and must be idempotent in everything it did before interrupting.
 
 ```mermaid
 sequenceDiagram
@@ -227,7 +229,7 @@ sequenceDiagram
 
 ### 4g. LLM and tools — the model is one node, the loop is the graph
 
-The LLM layer is a deliberately minimal trait, [`ChatModel`](agentgraph/src/llm.rs:L310): `chat(messages, tool_schemas)` in, one assistant `ChatMessage` (text and/or `tool_calls`) out, with `chat_stream` adding a token-delta callback. One client ships, `OpenAiCompatibleClient`, which works against OpenAI, vLLM, Ollama, LM Studio and compatible gateways, and classifies failures by convention: connect errors, timeouts, HTTP 5xx, 408 and 429 are retryable with capped, jittered exponential backoff (`Retry-After` floors the delay); other 4xx are permanent (agentgraph/src/llm.rs:L522). Tools are the mirror image: a [`Tool` trait](agentgraph/src/tool.rs:L26), a `ToolRegistry` that emits OpenAI-format schemas, and a [`ToolExecutor::execute_batch`](agentgraph/src/tool.rs:L150) that dispatches a batch of tool calls concurrently, preserves call order, and isolates failures — a failing or even panicking tool becomes an `ERROR:` tool message the model can read and recover from, never a batch abort (agentgraph/src/tool.rs:L167):
+The LLM layer is a deliberately minimal trait, [`ChatModel`](rusty-core/src/llm.rs:L310): `chat(messages, tool_schemas)` in, one assistant `ChatMessage` (text and/or `tool_calls`) out, with `chat_stream` adding a token-delta callback. One client ships, `OpenAiCompatibleClient`, which works against OpenAI, vLLM, Ollama, LM Studio and compatible gateways, and classifies failures by convention: connect errors, timeouts, HTTP 5xx, 408 and 429 are retryable with capped, jittered exponential backoff (`Retry-After` floors the delay); other 4xx are permanent (rusty-core/src/llm.rs:L522). Tools are the mirror image: a [`Tool` trait](rusty-core/src/tool.rs:L26), a `ToolRegistry` that emits OpenAI-format schemas, and a [`ToolExecutor::execute_batch`](rusty-core/src/tool.rs:L150) that dispatches a batch of tool calls concurrently, preserves call order, and isolates failures — a failing or even panicking tool becomes an `ERROR:` tool message the model can read and recover from, never a batch abort (rusty-core/src/tool.rs:L167):
 
 ```rust
 match result {
@@ -235,7 +237,7 @@ match result {
     Ok(Err(e)) => ChatMessage::tool_result(&call.id, format!("ERROR: {e}")),
 ```
 
-[`create_react_agent`](agentgraph/src/react.rs:L81) assembles the classic loop as a two-node cyclic graph over a single `messages` channel with the `AddMessages` reducer: an `agent` node that calls the model and appends the assistant message, a `tools` node that dispatches pending tool calls, a conditional edge `agent → tools | End`, and a static edge `tools → agent`. The cycle is super-steps, not recursion — each hop is a full plan/barrier/merge/route/checkpoint pass, so a ReAct agent gets durability and HITL for free. The streaming variant ([`create_react_agent_streaming`](agentgraph/src/react.rs:L99)) forwards token deltas into the run's event channel as `GraphEvent::Token` — the LangGraph `messages` stream mode (agentgraph/src/react.rs:L132):
+[`create_react_agent`](rusty-core/src/react.rs:L81) assembles the classic loop as a two-node cyclic graph over a single `messages` channel with the `AddMessages` reducer: an `agent` node that calls the model and appends the assistant message, a `tools` node that dispatches pending tool calls, a conditional edge `agent → tools | End`, and a static edge `tools → agent`. The cycle is super-steps, not recursion — each hop is a full plan/barrier/merge/route/checkpoint pass, so a ReAct agent gets durability and HITL for free. The streaming variant ([`create_react_agent_streaming`](rusty-core/src/react.rs:L99)) forwards token deltas into the run's event channel as `GraphEvent::Token` — the LangGraph `messages` stream mode (rusty-core/src/react.rs:L132):
 
 ```rust
 model
@@ -280,15 +282,15 @@ flowchart LR
     G["Graph, compiled"] --> N1["Native closure Node"]
     G --> N2["RemoteNode"]
     G --> N3["WasmNode, wasm feature"]
-    N2 -->|"POST /execute, protocol v1"| W["agentgraph-worker handler"]
+    N2 -->|"POST /execute, protocol v1"| W["Rusty Worker handler"]
     N3 -->|"wasmtime — fuel + memory caps"| WA["guest module, no imports"]
     MC["MCP server over stdio"] -->|"McpClient into_tools"| TR["ToolRegistry"]
     TR --> TN["tools node, ToolExecutor"]
 ```
 
-**Native nodes** are async closures, covered above. **Remote nodes** ([`RemoteNode`](agentgraph/src/remote.rs)) serialize the invocation — protocol version, node name, the same immutable super-step snapshot, and the `NodeConfig` — and POST it to a worker's `/execute` endpoint. The reply carries exactly one of `output`, `error`, or `interrupt`; an interrupt surfaces locally as `AgentGraphError::Interrupt`, so a remote node suspends and resumes the run exactly like a local one. Retries are deliberately narrow: only transport-class failures (connect, timeout, 5xx/408/429) are retried, never worker-reported errors — the worker already made a definitive decision (agentgraph/src/remote.rs:L34). The `agentgraph-worker` crate is the SDK that serves the other end.
+**Native nodes** are async closures, covered above. **Remote nodes** ([`RemoteNode`](rusty-core/src/remote.rs)) serialize the invocation — protocol version, node name, the same immutable super-step snapshot, and the `NodeConfig` — and POST it to a worker's `/execute` endpoint. The reply carries exactly one of `output`, `error`, or `interrupt`; an interrupt surfaces locally as `RustyError::Interrupt`, so a remote node suspends and resumes the run exactly like a local one. Retries are deliberately narrow: only transport-class failures (connect, timeout, 5xx/408/429) are retried, never worker-reported errors — the worker already made a definitive decision (rusty-core/src/remote.rs:L34). The `rusty-worker` crate is the SDK that serves the other end.
 
-**WASM nodes** ([`WasmNode`](agentgraph/src/wasm_node.rs), feature `wasm`) run untrusted or community modules via Wasmtime behind a JSON-in/JSON-out ABI. The sandbox is three walls: fuel metering aborts infinite loops with a trap, a `ResourceLimiter` caps memory growth, and the guest instantiates with an empty `Linker` — no WASI, no host functions, no ambient authority (agentgraph/src/wasm_node.rs:L69):
+**WASM nodes** ([`WasmNode`](rusty-core/src/wasm_node.rs), feature `wasm`) run untrusted or community modules via Wasmtime behind a JSON-in/JSON-out ABI. The sandbox is three walls: fuel metering aborts infinite loops with a trap, a `ResourceLimiter` caps memory growth, and the guest instantiates with an empty `Linker` — no WASI, no host functions, no ambient authority (rusty-core/src/wasm_node.rs:L69):
 
 ```rust
 impl Default for SandboxLimits {
@@ -301,11 +303,11 @@ impl Default for SandboxLimits {
 }
 ```
 
-**MCP tools** are not nodes at all: the [`mcp` module](agentgraph/src/mcp.rs) is a JSON-RPC client over stdio (newline-delimited or `Content-Length` framing, per-request timeouts, a 16 MiB frame cap against hostile length prefixes — agentgraph/src/mcp.rs:L71) whose `McpClient::into_tools()` lists a server's tools and returns them as `Arc<dyn Tool>` for direct registration in a `ToolRegistry`. MCP tools therefore flow through the same `ToolExecutor` and the same ReAct graph with zero graph changes.
+**MCP tools** are not nodes at all: the [`mcp` module](rusty-core/src/mcp.rs) is a JSON-RPC client over stdio (newline-delimited or `Content-Length` framing, per-request timeouts, a 16 MiB frame cap against hostile length prefixes — rusty-core/src/mcp.rs:L71) whose `McpClient::into_tools()` lists a server's tools and returns them as `Arc<dyn Tool>` for direct registration in a `ToolRegistry`. MCP tools therefore flow through the same `ToolExecutor` and the same ReAct graph with zero graph changes.
 
 ## 5. The server around the engine
 
-`agentgraph-server` adds nothing to the execution semantics; it exposes them. A run request authenticates, schedules against a per-thread slot, and drives the same `Executor` over the same checkpointer, translating `GraphEvent`s into SSE frames as it goes.
+`rusty-server` adds nothing to the execution semantics; it exposes them. A run request authenticates, schedules against a per-thread slot, and drives the same `Executor` over the same checkpointer, translating `GraphEvent`s into SSE frames as it goes.
 
 ```mermaid
 sequenceDiagram
@@ -335,27 +337,27 @@ The resource model, each row backed by the same primitives:
 | **Crons** | Recurring runs of a graph on an interval or 5-field cron expression. |
 | **KV store** | A namespaced JSON document store (`PUT/GET/DELETE /store/{ns}/{key}`) for application state that is not graph state. |
 
-Concurrency is one rule: at most one *active* run per thread ([`RunManager`](agentgraph-server/src/runs.rs:L338)). A second submission on a busy thread is either rejected with 409 (`multitask_strategy: "reject"`) or appended to a per-thread FIFO that drains as runs finish (the default `enqueue`, depth-capped by `ServerConfig::max_concurrent_runs_per_thread`). SSE frames carry ids of the form `{checkpoint_id}:{step}:{seq}`; the attach endpoint `GET /runs/{id}/stream` honors `Last-Event-ID` by replaying the run's bounded event log from that sequence and then following the live broadcast (agentgraph-server/src/sse.rs:L38). The run-create endpoint deliberately ignores the header — a fresh run starts a fresh frame sequence.
+Concurrency is one rule: at most one *active* run per thread ([`RunManager`](rusty-server/src/runs.rs:L338)). A second submission on a busy thread is either rejected with 409 (`multitask_strategy: "reject"`) or appended to a per-thread FIFO that drains as runs finish (the default `enqueue`, depth-capped by `ServerConfig::max_concurrent_runs_per_thread`). SSE frames carry ids of the form `{checkpoint_id}:{step}:{seq}`; the attach endpoint `GET /runs/{id}/stream` honors `Last-Event-ID` by replaying the run's bounded event log from that sequence and then following the live broadcast (rusty-server/src/sse.rs:L38). The run-create endpoint deliberately ignores the header — a fresh run starts a fresh frame sequence.
 
-**Multi-tenancy** is namespacing, not filtering. `ServerConfig::with_tenant_key(tenant, key)` maps `X-Api-Key` values to tenants; internally every tenant's threads, runs, assistants, crons, and KV entries live under a `{tenant}/` id prefix, so another tenant's resource simply does not exist in your namespace — cross-tenant access answers 404, never 403, to avoid leaking existence (agentgraph-server/src/routes.rs:L144). With no keys configured the server runs in open dev mode, byte-identical behavior, everything in the `default` tenant. With the `postgres` feature, `ServerConfig::with_postgres(url)` moves both the run checkpoints and the whole platform surface into auto-migrated Postgres tables.
+**Multi-tenancy** is namespacing, not filtering. `ServerConfig::with_tenant_key(tenant, key)` maps `X-Api-Key` values to tenants; internally every tenant's threads, runs, assistants, crons, and KV entries live under a `{tenant}/` id prefix, so another tenant's resource simply does not exist in your namespace — cross-tenant access answers 404, never 403, to avoid leaking existence (rusty-server/src/routes.rs:L144). With no keys configured the server runs in open dev mode, byte-identical behavior, everything in the `default` tenant. With the `postgres` feature, `ServerConfig::with_postgres(url)` moves both the run checkpoints and the whole platform surface into auto-migrated Postgres tables.
 
 ## 6. Observability
 
-The executor emits `tracing` telemetry; the library installs no subscriber — the application chooses one. The span taxonomy mirrors the loop (agentgraph/src/executor.rs:L30):
+The executor emits `tracing` telemetry; the library installs no subscriber — the application chooses one. The span taxonomy mirrors the loop (rusty-core/src/executor.rs:L30):
 
-- `agentgraph.run` (INFO) — one per `Executor::run` call; fields `thread_id`, `max_steps`, `resume`, `replay`. Parent of everything below.
-- `agentgraph.super_step` (DEBUG) — one per super-step; fields `step`, `active_nodes`.
-- `agentgraph.node` (INFO) — one per spawned node task; fields `node`, `step`.
+- `rusty.run` (INFO) — one per `Executor::run` call; fields `thread_id`, `max_steps`, `resume`, `replay`. Parent of everything below.
+- `rusty.super_step` (DEBUG) — one per super-step; fields `step`, `active_nodes`.
+- `rusty.node` (INFO) — one per spawned node task; fields `node`, `step`.
 - Events: DEBUG on each barrier merge (channels written), INFO on interrupt and run completion (`steps`, `duration_ms`), WARN on node failure with a `retryable` classification.
 
-The `agentgraph-otel` crate turns this on in one call — a `tracing` subscriber with optional OTLP span export — so a run shows up in your collector as a run span with super-step and node children, no instrumentation code of your own.
+The `rusty-otel` crate turns this on in one call — a `tracing` subscriber with optional OTLP span export — so a run shows up in your collector as a run span with super-step and node children, no instrumentation code of your own.
 
 ## 7. The whole thing, in one page of code
 
-Everything above — a reducer, a conditional edge, an interrupt, a checkpointed resume — in one runnable program (assemble from `agentgraph/examples/human_in_loop.rs` and `agentgraph/README.md`; every identifier is in the prelude):
+Everything above — a reducer, a conditional edge, an interrupt, a checkpointed resume — in one runnable program (assemble from `rusty-core/examples/human_in_loop.rs` and `rusty-core/README.md`; every identifier is in the prelude):
 
 ```rust
-use agentgraph::prelude::*;
+use rusty_agent_runtime::prelude::*;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -424,35 +426,47 @@ async fn main() -> Result<()> {
 }
 ```
 
-Runnable variants of each piece live in [`agentgraph/examples/`](agentgraph/examples/): `react_agent`, `parallel_fanout`, `human_in_loop`, `live_agent`.
+Runnable variants of each piece live in [`rusty-core/examples/`](rusty-core/examples/): `react_agent`, `parallel_fanout`, `human_in_loop`, `live_agent`.
 
 ## 8. Named failure modes
 
 Agent systems fail in a small number of characteristic ways. Each row names one, and what the mechanism above does about it.
 
-| Failure mode | agentgraph's response |
+| Failure mode | Rusty's response |
 |---|---|
-| **A node fails mid-step** | The super-step is transactional: the JoinSet is dropped, stragglers abort, every write of the step is discarded, and the run errors naming the node and step (agentgraph/src/executor.rs:L638). No half-applied state. |
-| **Two parallel nodes write the same `LastValue` channel** | `InvalidUpdate` at the barrier, before any mutation, naming both writers and prescribing a multi-write reducer (agentgraph/src/state.rs:L432). |
-| **LLM endpoint returns 429 / 5xx / times out** | Classified retryable; capped, jittered exponential backoff with `Retry-After` as a floor. Other 4xx are permanent and surface immediately (agentgraph/src/llm.rs:L522). Node-level, LLM and tool errors are the retryable classes in executor telemetry (agentgraph/src/executor.rs:L641). |
-| **A tool throws or panics** | Contained per call: the batch returns an `ERROR:` tool message in that call's slot, in order, and the model sees the failure as data (agentgraph/src/tool.rs:L150). |
-| **A second run arrives on a busy thread** | One active run per thread, enforced by the `RunManager`: `reject` answers 409; `enqueue` (default) queues FIFO up to the configured depth, then 409 (agentgraph-server/src/runs.rs:L350). |
-| **Replay leaves a stale "latest" head** | Recency is insertion order, not step number: replay appends a new timeline and resume follows it; deterministic `(step, created_at, id)` listing keeps fork truncation stable across backends (agentgraph/src/checkpoint.rs:L90). The safe pattern is fork first, replay on the fork. |
-| **A runaway graph cycle** | A cycle is re-scheduling, not recursion, so the guard is a step budget: `max_steps` (default 1000) aborts with an error naming the likely infinite cycle (agentgraph/src/executor.rs:L472). |
-| **A guest WASM module loops forever or eats memory** | Fuel metering traps the loop; a `ResourceLimiter` rejects memory growth past the cap; the guest has no imports at all — no WASI, no host functions (agentgraph/src/wasm_node.rs:L31). |
-| **A hostile MCP server declares a giant frame** | Inbound frames are capped at 16 MiB *before* any length-driven allocation; per-request timeouts bound waiting (agentgraph/src/mcp.rs:L71). |
-| **A client probes another tenant's thread** | Tenant isolation is id namespacing: the foreign thread does not exist in your scope, so the answer is 404 (never 403 — existence is not leaked); malformed client ids are rejected 400 (agentgraph-server/src/routes.rs:L144). |
+| **A node fails mid-step** | The super-step is transactional: the JoinSet is dropped, stragglers abort, every write of the step is discarded, and the run errors naming the node and step (rusty-core/src/executor.rs:L638). No half-applied state. |
+| **Two parallel nodes write the same `LastValue` channel** | `InvalidUpdate` at the barrier, before any mutation, naming both writers and prescribing a multi-write reducer (rusty-core/src/state.rs:L432). |
+| **LLM endpoint returns 429 / 5xx / times out** | Classified retryable; capped, jittered exponential backoff with `Retry-After` as a floor. Other 4xx are permanent and surface immediately (rusty-core/src/llm.rs:L522). Node-level, LLM and tool errors are the retryable classes in executor telemetry (rusty-core/src/executor.rs:L641). |
+| **A tool throws or panics** | Contained per call: the batch returns an `ERROR:` tool message in that call's slot, in order, and the model sees the failure as data (rusty-core/src/tool.rs:L150). |
+| **A second run arrives on a busy thread** | One active run per thread, enforced by the `RunManager`: `reject` answers 409; `enqueue` (default) queues FIFO up to the configured depth, then 409 (rusty-server/src/runs.rs:L350). |
+| **Replay leaves a stale "latest" head** | Recency is insertion order, not step number: replay appends a new timeline and resume follows it; deterministic `(step, created_at, id)` listing keeps fork truncation stable across backends (rusty-core/src/checkpoint.rs:L90). The safe pattern is fork first, replay on the fork. |
+| **A runaway graph cycle** | A cycle is re-scheduling, not recursion, so the guard is a step budget: `max_steps` (default 1000) aborts with an error naming the likely infinite cycle (rusty-core/src/executor.rs:L472). |
+| **A guest WASM module loops forever or eats memory** | Fuel metering traps the loop; a `ResourceLimiter` rejects memory growth past the cap; the guest has no imports at all — no WASI, no host functions (rusty-core/src/wasm_node.rs:L31). |
+| **A hostile MCP server declares a giant frame** | Inbound frames are capped at 16 MiB *before* any length-driven allocation; per-request timeouts bound waiting (rusty-core/src/mcp.rs:L71). |
+| **A client probes another tenant's thread** | Tenant isolation is id namespacing: the foreign thread does not exist in your scope, so the answer is 404 (never 403 — existence is not leaked); malformed client ids are rejected 400 (rusty-server/src/routes.rs:L144). |
 
 ## 9. Where the project is today
 
 Platform releases group the monorepo's independently-versioned crates; [CHANGELOG.md](CHANGELOG.md) carries the history and [docs/roadmap.md](docs/roadmap.md) the per-phase detail.
 
-- **v0.1–v0.5 (shipped).** The core kernel (channels, executor, checkpoints, HITL, `Send`, ReAct) — v0.1; Postgres checkpointer, token streaming, server Phase A — v0.2; MCP client, remote nodes + worker SDK, server API completion, executor tracing — v0.3; WASM nodes, time travel end-to-end, Postgres server store, `agentgraph-otel`, Studio, CORS — v0.4; Python + TypeScript SDKs, multi-tenant auth, live-LLM validation of the ReAct example against real Ollama models — v0.5. A final quality pass hardened docs, examples, and test coverage across the workspace.
-- **Next (Phase D, directional, not scheduled).** A hosted multi-tenant control plane — the tenant-isolation brick shipped in v0.5; durable queues and autoscaling remain open. Running graphs themselves on a WASM target (browser/edge, sans native checkpointers). Package publishing to crates.io and the npm/PyPI equivalents.
+## Releases
 
-Read next: [docs/roadmap.md](docs/roadmap.md) (phases and rejections) · [docs/agentgraph-server-design.md](docs/agentgraph-server-design.md) (endpoint mapping, SSE semantics) · [docs/server-quickstart.md](docs/server-quickstart.md) (zero to a served graph with interrupt/resume over HTTP) · [docs/studio.md](docs/studio.md) (the debug UI) · [docs/live-demo-transcript.md](docs/live-demo-transcript.md) (a real ReAct run, warts included) · crate READMEs: [agentgraph](agentgraph/README.md), [agentgraph-server](agentgraph-server/README.md).
+Release branding maps onto the shipped platform versions as follows. All five branded releases below have shipped; the branding is retrospective for R0.1–R0.4 and current for R1.0.
 
-Contributing: [CONTRIBUTING.md](CONTRIBUTING.md) (workspace-wide) and [agentgraph/CONTRIBUTING.md](agentgraph/CONTRIBUTING.md) (core crate). License: dual [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE), at your option.
+| Release | Name | Maps to | Status |
+|---|---|---|---|
+| R0.1 | Ignition | v0.1 — the core kernel: channels, executor, checkpoints, HITL, `Send`, ReAct (`rusty-agent-runtime` 0.1.0) | Shipped 2026-07-31 |
+| R0.2 | Persistence | v0.2 — Postgres checkpointer, token streaming, Rusty Server Phase A (`rusty-agent-runtime` 0.2.0, `rusty-server` 0.1.0) | Shipped 2026-08-05 |
+| R0.3 | Interop | v0.3 — MCP client, remote nodes + `rusty-worker`, server API completion, executor tracing (`rusty-agent-runtime` 0.3.0, `rusty-server` 0.2.0, `rusty-worker` 0.1.0) | Shipped 2026-08-05 |
+| R0.4 | Time Travel | v0.4 — fork + replay time travel end to end, WASM nodes, Postgres server store, `rusty-otel`, Rusty Studio (`rusty-agent-runtime` 0.4.0, `rusty-server` 0.3.0, `rusty-otel` 0.1.0) | Shipped 2026-08-05 |
+| R1.0 | Unleashed | v0.5 — the platform opened to polyglot clients: Rusty SDK for Python and TypeScript, multi-tenant auth, live-LLM validation (`rusty-server` 0.4.0, `sdks/*` 0.1.0) | Shipped 2026-08-05 |
+
+- **v0.1–v0.5 (shipped).** The core kernel (channels, executor, checkpoints, HITL, `Send`, ReAct) — v0.1 (R0.1 — Ignition); Postgres checkpointer, token streaming, server Phase A — v0.2 (R0.2 — Persistence); MCP client, remote nodes + worker SDK, server API completion, executor tracing — v0.3 (R0.3 — Interop); WASM nodes, time travel end-to-end, Postgres server store, `rusty-otel`, Rusty Studio, CORS — v0.4 (R0.4 — Time Travel); Python + TypeScript SDKs, multi-tenant auth, live-LLM validation of the ReAct example against real Ollama models — v0.5 (R1.0 — Unleashed). A final quality pass hardened docs, examples, and test coverage across the workspace.
+- **Next (Phase D, directional, not scheduled).** This is the only upcoming track; no release branding is assigned to it yet. A hosted multi-tenant control plane — the tenant-isolation brick shipped in v0.5; durable queues and autoscaling remain open. Running graphs themselves on a WASM target (browser/edge, sans native checkpointers). Package publishing to crates.io and the npm/PyPI equivalents.
+
+Read next: [docs/roadmap.md](docs/roadmap.md) (phases and rejections) · [docs/rusty-server-design.md](docs/rusty-server-design.md) (endpoint mapping, SSE semantics) · [docs/server-quickstart.md](docs/server-quickstart.md) (zero to a served graph with interrupt/resume over HTTP) · [docs/studio.md](docs/studio.md) (the debug UI) · [docs/live-demo-transcript.md](docs/live-demo-transcript.md) (a real ReAct run, warts included) · crate READMEs: [rusty-core](rusty-core/README.md), [rusty-server](rusty-server/README.md).
+
+Contributing: [CONTRIBUTING.md](CONTRIBUTING.md) (workspace-wide) and [rusty-core/CONTRIBUTING.md](rusty-core/CONTRIBUTING.md) (Rusty Core crate). License: dual [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE), at your option.
 
 ## Glossary
 

@@ -1,15 +1,15 @@
-# Rust Server Plugin Patterns — Precedent Research for `agentgraph-server`
+# Rust Server Plugin Patterns — Precedent Research for `rusty-server`
 
 **Author role:** Rust_Server_Patterns_Researcher
 **Date:** 2026-08-04
 **Workspace:** `/Users/amjad.shaikh/claude-work/claude-white-papers/05 - RUST`
-**Question:** In a compiled language, how does USER code (agent graphs/nodes) get into a server? Python's `langgraph.json` just imports modules at runtime — Rust cannot. This document surveys the six viable patterns, their real-world precedents, and ranks them for `agentgraph-server` (crate: `agentgraph/`, a LangGraph-style engine with typed channels/reducers, Pregel/BSP super-step execution, checkpoints, interrupts, and streaming).
+**Question:** In a compiled language, how does USER code (agent graphs/nodes) get into a server? Python's `langgraph.json` just imports modules at runtime — Rust cannot. This document surveys the six viable patterns, their real-world precedents, and ranks them for `rusty-server` (crate: `rusty-core/`, a LangGraph-style engine with typed channels/reducers, Pregel/BSP super-step execution, checkpoints, interrupts, and streaming).
 
 ---
 
 ## Pattern 1 — Library-Embedded Server ("server as a crate")
 
-**Mechanism.** The server ships as a library crate (`agentgraph-server`), not a binary. Users write their own `main.rs`, build their graphs with the `agentgraph` crate, register them into a `GraphRegistry`, and call `agentgraph_server::serve(registry).await`. Compilation statically links user code and server code into one binary. Deployment = "ship the user's binary."
+**Mechanism.** The server ships as a library crate (`rusty-server`), not a binary. Users write their own `main.rs`, build their graphs with the `rusty-agent-runtime` crate, register them into a `GraphRegistry`, and call `rusty_server::serve(registry).await`. Compilation statically links user code and server code into one binary. Deployment = "ship the user's binary."
 
 ```rust
 #[tokio::main]
@@ -17,7 +17,7 @@ async fn main() {
     let mut registry = GraphRegistry::new();
     registry.register("support_agent", build_support_graph());
     registry.register("research_agent", build_research_graph());
-    agentgraph_server::serve(registry, "0.0.0.0:8080").await.unwrap();
+    rusty_server::serve(registry, "0.0.0.0:8080").await.unwrap();
 }
 ```
 
@@ -29,7 +29,7 @@ async fn main() {
 - **graph-flow / rig**: the two most relevant Rust agent-framework precedents both assume the embedded model — you write a Rust `main.rs`, compose your graph/agents, and run your own binary ([graph-flow repo](https://github.com/a-agmon/rs-graph-llm), [rig ecosystem](https://github.com/0xPlaygrounds/rig/blob/main/ECOSYSTEM.md)). Neither ships a standalone "agent server you load graphs into."
 
 **Pros.**
-- Full type safety end-to-end: state types, reducers, and node signatures are checked at compile time — this is `agentgraph`'s core value proposition (typed channels).
+- Full type safety end-to-end: state types, reducers, and node signatures are checked at compile time — this is `rusty-agent-runtime`'s core value proposition (typed channels).
 - Zero serialization boundary: node state stays as native Rust types; no JSON round-trip per super-step.
 - Best performance; LLM-token streaming can flow straight from node futures into the SSE response without intermediate encoding.
 - Operational simplicity: one binary, one deploy artifact, no version-skew between server and user code.
@@ -46,7 +46,7 @@ async fn main() {
 
 ## Pattern 2 — Worker / Delegate Model (server is pure infra; user code runs out-of-process)
 
-**Mechanism.** `agentgraph-server` becomes a durable execution + state + routing service. User graphs/nodes run in separate worker processes (any language) that long-poll the server for node-execution tasks over gRPC/HTTP, execute them, and post results back. The server owns checkpoints, super-step scheduling, interrupts, and stream fan-out; workers own user code.
+**Mechanism.** `rusty-server` becomes a durable execution + state + routing service. User graphs/nodes run in separate worker processes (any language) that long-poll the server for node-execution tasks over gRPC/HTTP, execute them, and post results back. The server owns checkpoints, super-step scheduling, interrupts, and stream fan-out; workers own user code.
 
 **Precedent — how Temporal's split works exactly** (sources: [Temporal architecture overview](https://www.mintlify.com/temporalio/temporal/architecture/overview), [Temporal durable agents](https://www.mdjawad.com/posts/temporal-durable-agents/), [n8n vs Temporal — ZenML](https://www.zenml.io/blog/n8n-vs-temporal), [Temporal worker architecture](https://levelup.gitconnected.com/temporal-worker-architecture-and-scaling-af0c670ce6c1)):
 - The **server** is four services: *Frontend* (stateless gRPC gateway; all client and worker traffic flows through it), *History* (persists every workflow event; replay drives execution; sharded for throughput), *Matching* (hosts **task queues** and dispatches work), plus persistence. Usually deployed as one binary for simplicity.
@@ -57,12 +57,12 @@ async fn main() {
 **Why it fits agent workloads specifically.** Agent nodes are dominated by LLM call latency (hundreds of ms to minutes per node). A gRPC hop of 1–5 ms is <1% overhead — the classic objection to out-of-process execution evaporates. Meanwhile the wins are large: **polyglot workers** (a Python worker can host the LangChain ecosystem while the Rust engine owns orchestration), independent scaling of GPU/tool-heavy nodes, crash isolation (a segfaulting tool node can't take down the checkpoint store), and per-node retry/timeout policy at the queue level. This is also the only pattern that gives a hosted multi-tenant platform story (LangGraph Cloud equivalent).
 
 **Cons.**
-- State must cross the wire: `agentgraph`'s typed channels become serde-JSON at the worker boundary, losing compile-time state-type checking between server and worker (a versioned protobuf/JSON schema mitigates).
+- State must cross the wire: `rusty-agent-runtime`'s typed channels become serde-JSON at the worker boundary, losing compile-time state-type checking between server and worker (a versioned protobuf/JSON schema mitigates).
 - Streaming is harder: token-level SSE from a node must be relayed worker→server→client (Hatchet shows streaming step outputs are doable; Temporal notably does *not* stream activity output well).
 - Two artifacts to deploy; worker/server protocol versioning becomes a permanent maintenance surface.
 - Distributed checkpoint semantics (who owns reducer application?) must be designed carefully — Temporal's answer (server owns history, workers are dumb executors) is the right template.
 
-**Verdict:** The strongest **second** pattern, and arguably the long-term platform play. It converts `agentgraph-server` from "a Rust library" into "an agent execution platform," and LLM latency makes the network hop a non-issue. Recommend as the **v1.5/v2 extension**, with the wire protocol designed early enough that Pattern 1 nodes and Pattern 2 workers share one `Node` trait abstraction.
+**Verdict:** The strongest **second** pattern, and arguably the long-term platform play. It converts `rusty-server` from "a Rust library" into "an agent execution platform," and LLM latency makes the network hop a non-issue. Recommend as the **v1.5/v2 extension**, with the wire protocol designed early enough that Pattern 1 nodes and Pattern 2 workers share one `Node` trait abstraction.
 
 ---
 
@@ -72,7 +72,7 @@ async fn main() {
 
 **Why most projects reject it** (sources: [Plugins in Rust: Diving into Dynamic Loading — nullderef.com](https://nullderef.com/blog/plugin-dynload/), [rust-lang forum: ABI stability of dylib vs cdylib](https://users.rust-lang.org/t/abi-stability-guarantee-of-dylib-vs-cdylib/50879)):
 - **Rust has no stable ABI.** `#[repr(Rust)]` layout and the `extern "Rust"` ABI are implementation details; the compiler may change type layout *between any two invocations*, even identical ones. A plugin compiled with a different rustc (or even different flags) than the server can silently corrupt memory.
-- The only safe boundary is `extern "C"` + `#[repr(C)]` + a hand-rolled FFI contract — which means no `async fn`, no generics, no `String`/`Vec` across the boundary, manual lifetime management. `agentgraph`'s async, generic-over-state `Node` trait cannot cross this boundary without an enormous marshalling layer.
+- The only safe boundary is `extern "C"` + `#[repr(C)]` + a hand-rolled FFI contract — which means no `async fn`, no generics, no `String`/`Vec` across the boundary, manual lifetime management. `rusty-agent-runtime`'s async, generic-over-state `Node` trait cannot cross this boundary without an enormous marshalling layer.
 - Ecosystem band-aids exist (`stabby`, `abi_stable`, `safer_ffi`) but add a heavy framework tax and still can't carry `async` cleanly.
 - Operational hazards: no unloading safety (can't safely `dlclose` a library with running tokio tasks), no sandboxing (a plugin segfault kills the server), symbol/version skew debugging.
 - This is why essentially no major Rust service (Vector, TiKV, Linkerd, DataFusion) offers native dylib plugins as a supported extension path.
@@ -95,13 +95,13 @@ async fn main() {
 **Pros.**
 - Real sandboxing: no syscalls except explicitly granted capabilities — the *only* pattern where you can run **untrusted** third-party node code in-process. Essential for any marketplace/multi-tenant "upload a node" story.
 - Polyglot authoring (Rust, Go, JS, Python→WASM toolchains) with one host runtime.
-- Distribution via OCI registries is now standard practice (hyper-mcp model) — a plausible `agentgraph publish` UX.
+- Distribution via OCI registries is now standard practice (hyper-mcp model) — a plausible `rusty publish` UX.
 - Cold-start and per-invocation overhead (µs–low ms) is invisible next to LLM latency.
 
 **Cons.**
 - WASI's networking story is the friction point: direct HTTP from inside a module requires `wasi:http` (works but adds toolchain constraints); many hosts instead proxy LLM/tool calls through host functions, which is more code for the server team.
 - Component Model tooling, while real, is still rougher than native cargo builds; debugging a WASM node is materially worse than debugging native Rust.
-- State must still serialize across the boundary (WIT-defined types); `agentgraph`'s rich typed channels flatten to WIT records.
+- State must still serialize across the boundary (WIT-defined types); `rusty-agent-runtime`'s rich typed channels flatten to WIT records.
 - Async/streaming across the WASM boundary is workable (`wasi:http` streaming bodies) but adds engineering effort to get token-level SSE through.
 
 **Verdict:** **Adopt selectively.** Not the default authoring path, but the right answer for untrusted/community nodes and a future node marketplace. Position as a `Node` trait implementation (`WasmNode`) — Pattern 1 graphs can embed WASM nodes without architectural upheaval.
@@ -110,16 +110,16 @@ async fn main() {
 
 ## Pattern 5 — Graph-as-Data / DSL (declarative YAML/JSON graph definitions + fixed node catalog)
 
-**Mechanism.** The server ships with a compiled-in catalog of node types (LLM call, tool call, branch, human-approval, map/fanout); users declaratively wire them via YAML/JSON (`agentgraph.yaml` — the honest Rust analogue of `langgraph.json`). No user code is loaded at all.
+**Mechanism.** The server ships with a compiled-in catalog of node types (LLM call, tool call, branch, human-approval, map/fanout); users declaratively wire them via YAML/JSON (`rusty.yaml` — the honest Rust analogue of `langgraph.json`). No user code is loaded at all.
 
 **Where it works:** **n8n** and **Dify** prove the model at scale for integration-style and RAG-pipeline workflows — a visual/declarative graph over a fixed palette of nodes covers a large market ([Dify/n8n/activepieces landscape](https://github.com/underlines/awesome-marketing-data-science/blob/main/llm-tools.md?plain=1), [n8n vs Temporal — ZenML](https://www.zenml.io/blog/n8n-vs-temporal)).
 
 **Where it breaks for code-heavy agents.**
-- The escape hatch problem: the moment a user needs a custom reducer, a domain-specific router, or a non-trivial tool, declarative DSLs force them into "expression languages" inside YAML — the worst of both worlds. LangGraph's success comes precisely from nodes being *real functions with real code*; `agentgraph`'s typed-channel/reducer model is even more code-centric.
+- The escape hatch problem: the moment a user needs a custom reducer, a domain-specific router, or a non-trivial tool, declarative DSLs force them into "expression languages" inside YAML — the worst of both worlds. LangGraph's success comes precisely from nodes being *real functions with real code*; `rusty-agent-runtime`'s typed-channel/reducer model is even more code-centric.
 - A fixed node catalog ossifies the framework: every new capability requires a server release.
 - Versioning/validation of graph JSON against evolving state schemas is a quiet maintenance swamp.
 
-**Pros.** Zero-compile iteration; non-Rust-developers can compose graphs; trivially pairs with a visual builder (LangGraph Studio equivalent); graph definitions are diffable/auditable artifacts. **Cons.** Ceiling on expressiveness; does not cover `agentgraph`'s target users (systems engineers who chose Rust deliberately).
+**Pros.** Zero-compile iteration; non-Rust-developers can compose graphs; trivially pairs with a visual builder (LangGraph Studio equivalent); graph definitions are diffable/auditable artifacts. **Cons.** Ceiling on expressiveness; does not cover `rusty-agent-runtime`'s target users (systems engineers who chose Rust deliberately).
 
 **Verdict:** **Useful complement, not a core answer.** Ship a small declarative format later for the 80% boilerplate graphs (ReAct, RAG, human-in-the-loop templates) and for Studio-style visualization — but never as the only door for user code.
 
@@ -145,8 +145,8 @@ async fn main() {
 
 Regardless of pattern, the serving layer norms are settled (sources: [axum SSE discussion #1670](https://github.com/tokio-rs/axum/discussions/1670), [MCP rust-sdk transports](https://github.com/modelcontextprotocol/rust-sdk), [SSE streaming engineering guide](https://ethosbytes.com.au/streaming-llm-responses-with-sse-the-2025-engineering-guide-for-australian-enterprises/)):
 - **axum + `Sse::new(stream)`** over a `tokio::sync::broadcast`/mpsc-backed `Stream` is the canonical SSE pattern; `axum::response::sse::Event` with keep-alive.
-- The **MCP Rust SDK (`rmcp`)** is the important 2026 precedent: Streamable HTTP responses are *either* a single JSON body *or* a `text/event-stream` SSE stream, handled transparently — this "one endpoint, two response modes" is now the expected shape for agent APIs. `agentgraph-server` should mirror it: `POST /graphs/{id}/runs` returning either a completed run or an SSE stream of super-step/token events.
-- Production gotchas to bake into docs: reverse proxies (NGINX/Cloudflare/ALB) buffer SSE by default — ship guidance on `X-Accel-Buffering: no`, chunked encoding, flush-per-event; corporate proxies kill long connections — support SSE `retry:` and `Last-Event-ID` resume (which `agentgraph`'s checkpoint model makes natural: resume from checkpoint on reconnect — a genuine differentiator vs. naive LLM streaming).
+- The **MCP Rust SDK (`rmcp`)** is the important 2026 precedent: Streamable HTTP responses are *either* a single JSON body *or* a `text/event-stream` SSE stream, handled transparently — this "one endpoint, two response modes" is now the expected shape for agent APIs. `rusty-server` should mirror it: `POST /graphs/{id}/runs` returning either a completed run or an SSE stream of super-step/token events.
+- Production gotchas to bake into docs: reverse proxies (NGINX/Cloudflare/ALB) buffer SSE by default — ship guidance on `X-Accel-Buffering: no`, chunked encoding, flush-per-event; corporate proxies kill long connections — support SSE `retry:` and `Last-Event-ID` resume (which `rusty-agent-runtime`'s checkpoint model makes natural: resume from checkpoint on reconnect — a genuine differentiator vs. naive LLM streaming).
 
 ---
 
@@ -167,16 +167,16 @@ Regardless of pattern, the serving layer norms are settled (sources: [axum SSE d
 
 ---
 
-## Ranked Recommendation for `agentgraph-server`
+## Ranked Recommendation for `rusty-server`
 
-1. **Pattern 1 — Library-embedded server (primary, ship first).** It is the idiomatic Rust answer, matches every comparable precedent (axum, DataFusion, rig, graph-flow), preserves `agentgraph`'s typed-channel compile-time guarantees, and gives the best SSE streaming path. Deliverable: `agentgraph-server` crate exposing `GraphRegistry` + `serve()` over axum, with an rmcp-style "JSON or SSE" run endpoint and checkpoint-resumable streams.
+1. **Pattern 1 — Library-embedded server (primary, ship first).** It is the idiomatic Rust answer, matches every comparable precedent (axum, DataFusion, rig, graph-flow), preserves `rusty-agent-runtime`'s typed-channel compile-time guarantees, and gives the best SSE streaming path. Deliverable: `rusty-server` crate exposing `GraphRegistry` + `serve()` over axum, with an rmcp-style "JSON or SSE" run endpoint and checkpoint-resumable streams.
 2. **Pattern 2 — Worker/delegate (design for it now, build second).** Define the `Node` execution contract and wire protocol (gRPC + versioned JSON/protobuf state) so the same `Node` trait has both an in-process and a remote implementation. LLM latency makes the hop free; Temporal/Inngest/Hatchet prove the shape; it's the only route to polyglot workers and a hosted platform. The key architectural rule: **the server owns checkpoints and scheduling; workers are stateless executors** — copied directly from Temporal's History/Worker split.
 3. **Pattern 4 — WASM (scoped adoption).** Add a `WasmNode` behind the same `Node` trait when (and only when) untrusted/community nodes or a node marketplace become a goal. wasmtime/Extism are production-ready in 2026; MCP-component distribution (Wassette model) is the emerging norm.
 4. **Pattern 6 — Rhai scripting (cheap DX garnish).** For routing predicates and prompt assembly inside otherwise-compiled graphs. Sandboxed by default, trivial to embed.
-5. **Pattern 5 — Declarative graph format (later, for templates/visualization).** `agentgraph.yaml` as a *compiler target* for the 80% boilerplate graphs and a Studio-style UI — never the sole extension door.
+5. **Pattern 5 — Declarative graph format (later, for templates/visualization).** `rusty.yaml` as a *compiler target* for the 80% boilerplate graphs and a Studio-style UI — never the sole extension door.
 6. **Pattern 3 — cdylib dynamic loading (rejected).** No stable Rust ABI, no async across FFI, no fault isolation. Document the rejection in the white paper to preempt the question.
 
-**The one-sentence architecture:** `agentgraph-server` is a *crate you call* (Pattern 1) built on a *protocol you can also speak* (Pattern 2), with WASM and scripting as capability-scoped escape hatches — "`Cargo.toml` is the new `langgraph.json`, and the worker protocol is the new `pip install`."
+**The one-sentence architecture:** `rusty-server` is a *crate you call* (Pattern 1) built on a *protocol you can also speak* (Pattern 2), with WASM and scripting as capability-scoped escape hatches — "`Cargo.toml` is the new `langgraph.json`, and the worker protocol is the new `pip install`."
 
 ---
 

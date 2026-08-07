@@ -1,10 +1,10 @@
-"""End-to-end tests for agentgraph_client against a LIVE agentgraph-server.
+"""End-to-end tests for rusty_client against a LIVE rusty-server.
 
 The suite starts the real ``server_demo`` example binary as a subprocess
 (fixed bind ``127.0.0.1:8100``), waits for ``/ok``, exercises the full
 API surface, and kills the server in ``tearDownClass``.
 
-Graphs registered by ``agentgraph-server/examples/server_demo.rs``:
+Graphs registered by ``rusty-server/examples/server_demo.rs``:
 
 - ``pipeline``    — ``first -> second``, appending to a ``log`` channel.
 - ``react_agent`` — scripted-model ReAct agent (no network) with an
@@ -34,7 +34,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "sdks" / "python"))
 
-from agentgraph_client import AgentGraphClient, AgentGraphError, SSEEvent  # noqa: E402
+from rusty_client import RustyClient, RustyError, SSEEvent  # noqa: E402
 
 BASE_URL = "http://127.0.0.1:8100"
 CARGO = shutil.which("cargo") or str(Path.home() / ".cargo" / "bin" / "cargo")
@@ -47,7 +47,7 @@ def _port_in_use(port: int) -> bool:
 
 def _ensure_binary() -> Path:
     """Locate (or build) the server_demo example binary."""
-    target = REPO_ROOT / "agentgraph-server" / "target"
+    target = REPO_ROOT / "rusty-server" / "target"
     candidates = [
         target / "release" / "examples" / "server_demo",
         target / "debug" / "examples" / "server_demo",
@@ -57,7 +57,7 @@ def _ensure_binary() -> Path:
             return path
     if not (shutil.which("cargo") or Path(CARGO).exists()):
         raise unittest.SkipTest("cargo not available to build server_demo")
-    manifest = REPO_ROOT / "agentgraph-server" / "Cargo.toml"
+    manifest = REPO_ROOT / "rusty-server" / "Cargo.toml"
     for profile in (["--release"], []):
         try:
             subprocess.run(
@@ -78,7 +78,7 @@ class LiveServerTestCase(unittest.TestCase):
 
     server: subprocess.Popen
     workdir: str
-    client: AgentGraphClient
+    client: RustyClient
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -88,7 +88,7 @@ class LiveServerTestCase(unittest.TestCase):
             )
         binary = _ensure_binary()
         # Run from a scratch dir so ./data/server-demo-checkpoints is isolated.
-        cls.workdir = tempfile.mkdtemp(prefix="agentgraph-sdk-test-")
+        cls.workdir = tempfile.mkdtemp(prefix="rusty-sdk-test-")
         cls._log = open(os.path.join(cls.workdir, "server.log"), "wb")
         cls.server = subprocess.Popen(
             [str(binary)],
@@ -96,7 +96,7 @@ class LiveServerTestCase(unittest.TestCase):
             stdout=cls._log,
             stderr=subprocess.STDOUT,
         )
-        cls.client = AgentGraphClient(BASE_URL, timeout=30)
+        cls.client = RustyClient(BASE_URL, timeout=30)
         deadline = time.time() + 30
         while time.time() < deadline:
             if cls.server.poll() is not None:
@@ -136,7 +136,7 @@ class TestServiceAndThreads(LiveServerTestCase):
     def test_01_ok_and_info(self) -> None:
         self.assertTrue(self.client.ok())
         info = self.client.info()
-        self.assertEqual(info["service"], "agentgraph-server")
+        self.assertEqual(info["service"], "rusty-server")
         graphs = {g["name"]: g for g in info["graphs"]}
         self.assertIn("pipeline", graphs)
         self.assertIn("react_agent", graphs)
@@ -152,7 +152,7 @@ class TestServiceAndThreads(LiveServerTestCase):
         self.assertEqual(thread["metadata"], {"origin": "sdk-test"})
 
     def test_03_error_unknown_graph(self) -> None:
-        with self.assertRaises(AgentGraphError) as ctx:
+        with self.assertRaises(RustyError) as ctx:
             self.client.create_thread("no_such_graph")
         self.assertIn(ctx.exception.status, (400, 404))
         self.assertIsNotNone(ctx.exception.body)
@@ -245,10 +245,14 @@ class TestStreaming(LiveServerTestCase):
         self.assertEqual(frames[0].data["graph"], "pipeline")
         self.assertEqual(frames[0].data["thread_id"], tid)
 
-        # One `updates` frame per executed node, in order.
+        # One `updates` frame per executed node, in order. Each payload
+        # carries the post-reducer channel value read back from the merged
+        # state (per the server README), so the Append `log` channel
+        # accumulates across steps.
         updates = [f.data for f in frames if f.event == "updates"]
         self.assertEqual(
-            [u["updates"]["log"] for u in updates], ["first", "second"]
+            [u["updates"]["log"] for u in updates],
+            [["first"], ["first", "second"]],
         )
 
         # `values` frames carry the full state per step.
@@ -309,7 +313,7 @@ class TestTimeTravel(LiveServerTestCase):
     def test_31_fork_unknown_checkpoint_404(self) -> None:
         tid = self.new_thread()
         self.client.run_wait(tid)
-        with self.assertRaises(AgentGraphError) as ctx:
+        with self.assertRaises(RustyError) as ctx:
             self.client.fork(tid, checkpoint_id=str(uuid.uuid4()))
         self.assertEqual(ctx.exception.status, 404)
 
@@ -329,7 +333,7 @@ class TestPlatformSurface(LiveServerTestCase):
         listed = self.client.list_assistants()
         self.assertIn(aid, [a["assistant_id"] for a in listed])
 
-        with self.assertRaises(AgentGraphError) as ctx:
+        with self.assertRaises(RustyError) as ctx:
             self.client.get_assistant(str(uuid.uuid4()))
         self.assertEqual(ctx.exception.status, 404)
 
@@ -355,7 +359,7 @@ class TestPlatformSurface(LiveServerTestCase):
         self.assertNotIn(
             cron_id, [(c.get("cron_id") or c.get("id")) for c in listed]
         )
-        with self.assertRaises(AgentGraphError) as ctx:
+        with self.assertRaises(RustyError) as ctx:
             self.client.delete_cron(cron_id)
         self.assertEqual(ctx.exception.status, 404)
 
@@ -387,7 +391,7 @@ class TestPlatformSurface(LiveServerTestCase):
         self.assertEqual(keys, ["user-1", "user-2"])
 
         self.client.kv_delete(ns, "user-1")
-        with self.assertRaises(AgentGraphError) as ctx:
+        with self.assertRaises(RustyError) as ctx:
             self.client.kv_get(ns, "user-1")
         self.assertEqual(ctx.exception.status, 404)
         self.assertEqual([i["key"] for i in self.client.kv_list(ns)], ["user-2"])
@@ -395,9 +399,9 @@ class TestPlatformSurface(LiveServerTestCase):
     def test_43_api_key_header_sent(self) -> None:
         # Dev-mode server has auth disabled, so a key-bearing client must
         # still work — this exercises the X-Api-Key code path end to end.
-        keyed = AgentGraphClient(BASE_URL, api_key="test-key", timeout=10)
+        keyed = RustyClient(BASE_URL, api_key="test-key", timeout=10)
         self.assertTrue(keyed.ok())
-        self.assertEqual(keyed.info()["service"], "agentgraph-server")
+        self.assertEqual(keyed.info()["service"], "rusty-server")
 
 
 class TestInterruptResume(unittest.TestCase):

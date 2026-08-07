@@ -1,14 +1,14 @@
-# agentgraph-server quickstart — 10 minutes to a served agent graph
+# Rusty Server quickstart — 10 minutes to a served agent graph
 
 In this tutorial you will:
 
-1. Create a new Rust binary project and depend on `agentgraph` + `agentgraph-server` (path deps).
+1. Create a new Rust binary project and depend on `rusty-agent-runtime` + `rusty-server` (path deps).
 2. Define a two-node graph — `draft → approve` — with a human-in-the-loop interrupt.
 3. Serve it over HTTP + SSE with `GraphRegistry` and `serve()`.
 4. Drive it with `curl`: create a thread, run to the interrupt, inspect state, stream the resume over SSE, and list checkpoint history.
 5. Branch the timeline: fork the thread at an earlier checkpoint and replay the run on the fork.
 
-**Prerequisites:** a Rust toolchain (`rustup`), `curl`, and ~10 minutes. No Docker, no database, no Redis — everything runs in one process. Commands below assume you create the project as a *sibling* of the `agentgraph` and `agentgraph-server` checkouts; adjust the `path =` values if your layout differs.
+**Prerequisites:** a Rust toolchain (`rustup`), `curl`, and ~10 minutes. No Docker, no database, no Redis — everything runs in one process. Commands below assume you create the project as a *sibling* of the `rusty-core` and `rusty-server` checkouts; adjust the `path =` values if your layout differs.
 
 ---
 
@@ -23,8 +23,8 @@ Add the dependencies to `Cargo.toml`:
 
 ```toml
 [dependencies]
-agentgraph = { path = "../agentgraph" }
-agentgraph-server = { path = "../agentgraph-server" }
+rusty-agent-runtime = { path = "../rusty-core" }
+rusty-server = { path = "../rusty-server" }
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
@@ -36,8 +36,8 @@ That's the whole setup story: **Cargo.toml is the new langgraph.json**. There is
 Replace `src/main.rs` with:
 
 ```rust
-use agentgraph::prelude::*;
-use agentgraph_server::{serve, GraphRegistry, ServerConfig};
+use rusty_agent_runtime::prelude::*;
+use rusty_server::{serve, GraphRegistry, ServerConfig};
 use serde_json::{json, Value};
 
 #[tokio::main]
@@ -61,7 +61,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     builder.add_node("draft", |ctx: NodeContext| async move {
         // If the run's `input` seeded a draft, keep it; otherwise write one.
         let draft = ctx.state().get("draft").cloned().unwrap_or_else(|| {
-            json!("agentgraph-server serves durable agent graphs from one binary.")
+            json!("Rusty Server serves durable agent graphs from one binary.")
         });
         println!("[draft] {draft}");
         Ok(NodeOutput::update("draft", draft))
@@ -114,7 +114,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Every `agentgraph` call above is the same API the library examples use (`agentgraph/examples/human_in_loop.rs`) — `StateSpec`, `GraphBuilder`, `NodeContext::interrupt` / `resume_value`, `NodeOutput::update`. The server crate adds exactly three names you call directly: `GraphRegistry`, `ServerConfig`, `serve` (plus `router` if you want to embed the routes in a larger axum app).
+Every `rusty-agent-runtime` call above is the same API the library examples use (`rusty-core/examples/human_in_loop.rs`) — `StateSpec`, `GraphBuilder`, `NodeContext::interrupt` / `resume_value`, `NodeOutput::update`. The server crate adds exactly three names you call directly: `GraphRegistry`, `ServerConfig`, `serve` (plus `router` if you want to embed the routes in a larger axum app).
 
 ## 3. Run it (1 min)
 
@@ -129,7 +129,7 @@ curl localhost:8080/ok
 # {"ok":true}
 
 curl localhost:8080/info
-# {"service":"agentgraph-server","version":"0.4.0","checkpointer":"json_file",
+# {"service":"rusty-server","version":"0.4.0","checkpointer":"json_file",
 #  "store_path":"./data/checkpoints",
 #  "graphs":[{"channels":["approval","draft"],"name":"publisher"}]}
 ```
@@ -279,6 +279,6 @@ The safe pattern is fork first, replay on the fork: the branch gets its own thre
 ## Where to go next
 
 - **Run in the background instead of blocking:** `POST /threads/{id}/runs` returns `202` + a `run_id` immediately; control same-thread concurrency with `"multitask_strategy": "enqueue" | "reject"`.
-- **Serve a real LLM agent:** register `create_react_agent(model, tools)` (see `agentgraph/examples/react_agent.rs`) the same way, with an `OpenAiCompatibleClient` as the model (e.g. `OpenAiCompatibleClient::from_env("https://api.openai.com/v1", "OPENAI_API_KEY", "gpt-4o-mini")`; `agentgraph/examples/live_agent.rs` shows the full live setup). Add `"messages"` to `stream_mode` to stream LLM token deltas when the node uses `ChatModel::chat_stream`.
-- **Deploy:** `cargo build --release` produces one static binary; see the `FROM scratch` Dockerfile and the `ServerConfig` reference in the [agentgraph-server README](../agentgraph-server/README.md#deployment).
-- **Design rationale:** endpoint mapping, SSE semantics, and the phased roadmap (gRPC workers, WASM nodes, crons, assistants) are in [docs/agentgraph-server-design.md](agentgraph-server-design.md).
+- **Serve a real LLM agent:** register `create_react_agent(model, tools)` (see `rusty-core/examples/react_agent.rs`) the same way, with an `OpenAiCompatibleClient` as the model (e.g. `OpenAiCompatibleClient::from_env("https://api.openai.com/v1", "OPENAI_API_KEY", "gpt-4o-mini")`; `rusty-core/examples/live_agent.rs` shows the full live setup). Add `"messages"` to `stream_mode` to stream LLM token deltas when the node uses `ChatModel::chat_stream`.
+- **Deploy:** `cargo build --release` produces one static binary; see the `FROM scratch` Dockerfile and the `ServerConfig` reference in the [rusty-server README](../rusty-server/README.md#deployment).
+- **Design rationale:** endpoint mapping, SSE semantics, and the phased roadmap (gRPC workers, WASM nodes, crons, assistants) are in [docs/rusty-server-design.md](rusty-server-design.md).

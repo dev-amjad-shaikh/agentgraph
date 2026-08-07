@@ -1,6 +1,6 @@
 # LangGraph Platform / Agent Server — HTTP API Reference Spec
 
-**Purpose:** design reference for `agentgraph-server` (Rust). Covers the commercial
+**Purpose:** design reference for `rusty-server` (Rust). Covers the commercial
 LangGraph server surface — formerly "LangGraph Platform" / `langgraph-api` / "LangGraph
 Server", now branded **LangSmith Deployment** with the runtime called the **Agent Server**.
 
@@ -450,11 +450,11 @@ see the open-source reimplementation discussion
   ([issue #5390](https://github.com/langchain-ai/langgraph/issues/5390)).
 - Practitioners confirm there is effectively **no supported self-host path without LangChain
   keys** for the production image ([forum, May 2026](https://forum.langchain.com/t/best-practices-for-self-hosting-langgraph-server-oss-without-langgraph-keys/3779)) — which is exactly the gap open
-  reimplementations (aegra, skein-js) and `agentgraph-server` target.
+  reimplementations (aegra, skein-js) and `rusty-server` target.
 
 ---
 
-## Implications for agentgraph-server
+## Implications for Rusty Server
 
 1. **Implement the Agent Protocol subset first, byte-for-byte compatible.** Threads/runs/store
    CRUD + `POST /threads`, `POST /threads/{tid}/runs{,/stream,/wait}`, stateless `/runs/*`,
@@ -468,7 +468,7 @@ see the open-source reimplementation discussion
 3. **Copy the SSE contract exactly: `stream_mode` multiplexing, `metadata`/`error`/`end`
    frames, `Last-Event-ID` resume with `stream_resumable`, thread-level streams, and
    join-stream.** Buffering discipline matters: LangGraph does *not* buffer join-stream
-   output — decide explicitly whether agentgraph-server matches (cheaper) or improves
+   output — decide explicitly whether rusty-server matches (cheaper) or improves
    (replay buffer per run) and document it.
 4. **Improve on durability/primitives, don't clone the queue.** LangGraph needs
    Postgres + Redis + queue workers for exactly-once runs and streaming fan-out. In Rust, a
@@ -480,11 +480,11 @@ see the open-source reimplementation discussion
    Rollback = delete run + its checkpoints, not just "stop".
 6. **Steal the `langgraph.json` pattern, generalized.** One declarative file mapping
    `name → graph entrypoint`, plus env/deps/auth/store-index config. For Rust this becomes
-   e.g. `agentgraph.toml` mapping names to compiled graph modules/WASM/dylibs or remote
+   e.g. `rusty.toml` mapping names to compiled graph modules/WASM/dylibs or remote
    graph services — same ergonomics, no Dockerfile step needed.
 7. **Skip / de-prioritize:** A2A and MCP server endpoints (bolt on later), the
    WebSocket "protocol v2" command surface (SSE + HTTP sidecar is sufficient), `feedback_keys`
-   (LangSmith tracing coupling), and Lite/Enterprise feature-gating — agentgraph-server
+   (LangSmith tracing coupling), and Lite/Enterprise feature-gating — rusty-server
    should ship crons + custom auth ungated, since LangChain's gating is the main
    self-hosting grievance.
 8. **Auth: copy the shape, not the handler-in-Python mechanism.** LangSmith's
