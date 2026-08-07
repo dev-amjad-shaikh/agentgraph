@@ -451,7 +451,7 @@ Platform releases group the monorepo's independently-versioned crates; [CHANGELO
 
 ## Releases
 
-Release branding maps onto the shipped platform versions as follows. All five branded releases below have shipped; the branding is retrospective for R0.1–R0.4 and current for R1.0.
+Release branding maps onto the platform versions as follows. R0.1–R0.4 have shipped; R1.0 — Unleashed is the upcoming 1.0 track.
 
 | Release | Name | Maps to | Status |
 |---|---|---|---|
@@ -459,10 +459,10 @@ Release branding maps onto the shipped platform versions as follows. All five br
 | R0.2 | Persistence | v0.2 — Postgres checkpointer, token streaming, Rusty Server Phase A (`rusty-agent-runtime` 0.2.0, `rusty-server` 0.1.0) | Shipped 2026-08-05 |
 | R0.3 | Interop | v0.3 — MCP client, remote nodes + `rusty-worker`, server API completion, executor tracing (`rusty-agent-runtime` 0.3.0, `rusty-server` 0.2.0, `rusty-worker` 0.1.0) | Shipped 2026-08-05 |
 | R0.4 | Time Travel | v0.4 — fork + replay time travel end to end, WASM nodes, Postgres server store, `rusty-otel`, Rusty Studio (`rusty-agent-runtime` 0.4.0, `rusty-server` 0.3.0, `rusty-otel` 0.1.0) | Shipped 2026-08-05 |
-| R1.0 | Unleashed | v0.5 — the platform opened to polyglot clients: Rusty SDK for Python and TypeScript, multi-tenant auth, live-LLM validation (`rusty-server` 0.4.0, `sdks/*` 0.1.0) | Shipped 2026-08-05 |
+| R1.0 | Unleashed | v1.0 — hosted multi-tenant control plane, graphs on a WASM target (browser/edge), registry publishing to crates.io / npm / PyPI | Upcoming |
 
-- **v0.1–v0.5 (shipped).** The core kernel (channels, executor, checkpoints, HITL, `Send`, ReAct) — v0.1 (R0.1 — Ignition); Postgres checkpointer, token streaming, server Phase A — v0.2 (R0.2 — Persistence); MCP client, remote nodes + worker SDK, server API completion, executor tracing — v0.3 (R0.3 — Interop); WASM nodes, time travel end-to-end, Postgres server store, `rusty-otel`, Rusty Studio, CORS — v0.4 (R0.4 — Time Travel); Python + TypeScript SDKs, multi-tenant auth, live-LLM validation of the ReAct example against real Ollama models — v0.5 (R1.0 — Unleashed). A final quality pass hardened docs, examples, and test coverage across the workspace.
-- **Next (Phase D, directional, not scheduled).** This is the only upcoming track; no release branding is assigned to it yet. A hosted multi-tenant control plane — the tenant-isolation brick shipped in v0.5; durable queues and autoscaling remain open. Running graphs themselves on a WASM target (browser/edge, sans native checkpointers). Package publishing to crates.io and the npm/PyPI equivalents.
+- **v0.1–v0.5 (shipped).** The core kernel (channels, executor, checkpoints, HITL, `Send`, ReAct) — v0.1 (R0.1 — Ignition); Postgres checkpointer, token streaming, server Phase A — v0.2 (R0.2 — Persistence); MCP client, remote nodes + worker SDK, server API completion, executor tracing — v0.3 (R0.3 — Interop); WASM nodes, time travel end-to-end, Postgres server store, `rusty-otel`, Rusty Studio, CORS — v0.4 (R0.4 — Time Travel); Python + TypeScript SDKs, multi-tenant auth, live-LLM validation of the ReAct example against real Ollama models — v0.5 (pre-1.0; the tenant-isolation brick of R1.0). A final quality pass hardened docs, examples, and test coverage across the workspace.
+- **Next (R1.0 — Unleashed; directional, not scheduled).** This is the only upcoming track. A hosted multi-tenant control plane — the tenant-isolation brick shipped in v0.5; durable queues and autoscaling remain open. Running graphs themselves on a WASM target (browser/edge, sans native checkpointers). Package publishing to crates.io and the npm/PyPI equivalents.
 
 Read next: [docs/roadmap.md](docs/roadmap.md) (phases and rejections) · [docs/rusty-server-design.md](docs/rusty-server-design.md) (endpoint mapping, SSE semantics) · [docs/server-quickstart.md](docs/server-quickstart.md) (zero to a served graph with interrupt/resume over HTTP) · [docs/studio.md](docs/studio.md) (the debug UI) · [docs/live-demo-transcript.md](docs/live-demo-transcript.md) (a real ReAct run, warts included) · crate READMEs: [rusty-core](rusty-core/README.md), [rusty-server](rusty-server/README.md).
 

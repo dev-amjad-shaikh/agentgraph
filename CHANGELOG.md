@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to the Rusty platform. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); crates are versioned independently (`rusty-agent-runtime`, `rusty-server`, `rusty-otel`, `rusty-worker`). Release branding: v0.1 = R0.1 — Ignition, v0.2 = R0.2 — Persistence, v0.3 = R0.3 — Interop, v0.4 = R0.4 — Time Travel, v0.5 = R1.0 — Unleashed.
+All notable changes to the Rusty platform. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); crates are versioned independently (`rusty-agent-runtime`, `rusty-server`, `rusty-otel`, `rusty-worker`). Release branding: v0.1 = R0.1 — Ignition, v0.2 = R0.2 — Persistence, v0.3 = R0.3 — Interop, v0.4 = R0.4 — Time Travel; R1.0 — Unleashed is the upcoming v1.0 track.
 
 ## [Unreleased] — Quality & documentation review pass
 
@@ -31,7 +31,7 @@ All notable changes to the Rusty platform. Format loosely follows [Keep a Change
 
 - Full rustdoc review pass: module inventory in `rusty-core/src/lib.rs` corrected (file saver no longer marked WIP; `PostgresCheckpointer` / MCP / `RemoteNode` / WASM documented), `create_react_agent_streaming` added to the prelude, `RemoteNode` wire-error semantics and `NodeContext::interrupt` run-wide suspension semantics documented.
 
-## [0.5.0] — 2026-08-05 — R1.0 — Unleashed
+## [0.5.0] — 2026-08-05
 
 ### Added
 
