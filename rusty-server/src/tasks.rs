@@ -1,0 +1,881 @@
+//! Durable task queue (R0.6 — Durable Work): effectively-once activities.
+//!
+//! A *task* is a unit of work enqueued by a control-plane caller (today: any
+//! API client; later waves add the run-side transactional outbox) and
+//! executed by an out-of-process worker. The server owns the substrate:
+//! durable records, leases with visibility timeouts, heartbeats, retries, and
+//! a dead-letter queue. The retry policy is not local: failed attempts are
+//! classified into core's shared [`ErrorClass`] taxonomy and decided by
+//! core's [`classify_retry`] — the same function the worker SDK runs — so
+//! server and workers can never disagree about a retry (see
+//! `docs/durable-work-design.md`). The guarantee is *effectively once*: a
+//! task may be delivered more than once (lease expiry reclaims it), so
+//! workers make their effects idempotent — the enqueue-side
+//! `idempotency_key` dedups task creation, and the lease/409 protocol
+//! ensures only the current lease holder can settle a task.
+//!
+//! Records are durable: one JSON file per task under
+//! `{store_path}/tasks/{task_id}.json` on the default backend (atomic
+//! temp+rename writes, reloaded at startup), or the auto-migrated
+//! `server_tasks` table with the `postgres` feature. Task ids are
+//! server-minted UUIDs; tenant isolation goes through the record's `tenant`
+//! field (set from the request's [`crate::auth::TenantContext`]), which every
+//! store operation is scoped by — a cross-tenant id simply does not resolve.
+
+use std::collections::HashMap;
+use std::io;
+use std::path::{Path, PathBuf};
+
+use chrono::{DateTime, Duration, Utc};
+use rusty_agent_runtime::durable::{classify_retry, ErrorClass, RetryDecision};
+use rusty_agent_runtime::record::Effect;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+/// The pool every task lands in when the enqueue payload names none.
+pub(crate) const DEFAULT_POOL: &str = "default";
+
+/// Default attempt ceiling when the enqueue payload sets none. Three
+/// attempts = the initial try plus two retries before dead-lettering.
+pub(crate) const DEFAULT_MAX_ATTEMPTS: u32 = 3;
+
+/// Hard ceiling on `max_attempts`; bounds the retry schedule and keeps the
+/// `u32 -> i32` Postgres column mapping lossless by construction.
+pub(crate) const MAX_ATTEMPTS_LIMIT: u32 = 100;
+
+/// Lease bounds accepted on claim/heartbeat: 100 ms (anything shorter is an
+/// instant expiry — claimable again before the holder can act) to one hour.
+pub(crate) const MIN_LEASE_MS: u64 = 100;
+/// See [`MIN_LEASE_MS`].
+pub(crate) const MAX_LEASE_MS: u64 = 3_600_000;
+
+/// Lifecycle of a durable task.
+///
+/// ```text
+/// queued ──claim──> leased ──complete──> completed   (terminal)
+///                     │
+///                     ├──fail──> RetryDecision::Retry ──> failed (next_attempt_at set)
+///                     │            ──backoff elapsed──> claimable again
+///                     ├──fail──> RetryDecision::Dead  ──> dead     (terminal, DLQ)
+///                     ├──fail──> RetryDecision::Fail  ──> failed (next_attempt_at null;
+///                     │                                     terminal, *not* the DLQ)
+///                     └──lease expires──> claimable again (new attempt)
+/// ```
+///
+/// `Failed` covers both failure resting states, distinguished by
+/// `next_attempt_at`: set = a retry is scheduled (claimable once it
+/// passes); null = the shared retry policy
+/// ([`classify_retry`]) failed the task outright — a non-retryable class or
+/// work the worker declared unsafe to re-drive. Terminal failure that a
+/// human can act on is `Dead` (the DLQ, `RetryDecision::Dead`); the DLQ
+/// never holds outright fails, per the design's "DLQ is for actionable
+/// work, not a graveyard" rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum TaskStatus {
+    Queued,
+    Leased,
+    Failed,
+    Completed,
+    Dead,
+}
+
+impl TaskStatus {
+    /// The wire/storage spelling (also the Postgres `status` column value).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Leased => "leased",
+            Self::Failed => "failed",
+            Self::Completed => "completed",
+            Self::Dead => "dead",
+        }
+    }
+
+    /// Parse a `?status=` filter value; `None` for unknown statuses (the
+    /// route answers 400 — a silently ignored filter would hide DLQ entries).
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s {
+            "queued" => Some(Self::Queued),
+            "leased" => Some(Self::Leased),
+            "failed" => Some(Self::Failed),
+            "completed" => Some(Self::Completed),
+            "dead" => Some(Self::Dead),
+            _ => None,
+        }
+    }
+}
+
+/// A live lease: the worker currently allowed to settle the task, and the
+/// visibility timeout. Past `expires_at` the task is claimable again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TaskLease {
+    pub owner: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// One durable task. Persisted whole (JSON file) or column-mapped
+/// (Postgres); the wire representation is [`TaskRecord::wire`], which omits
+/// `tenant` (an internal isolation detail, like the `{tenant}/` id prefixes
+/// elsewhere in the server).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TaskRecord {
+    pub task_id: String,
+    /// Owning tenant (`default` in open/dev mode). Every store operation is
+    /// scoped by it; cross-tenant ids resolve to nothing → 404.
+    pub tenant: String,
+    pub kind: String,
+    /// Work payload: arbitrary JSON. Large payloads are out of scope until
+    /// the artifact store lands (R0.7); a caller can always pass a reference
+    /// object of its own making — the server stores the value verbatim.
+    pub payload: Value,
+    pub pool: String,
+    pub status: TaskStatus,
+    /// 1-based number of the current/last attempt (0 = never claimed).
+    pub attempt: u32,
+    pub max_attempts: u32,
+    /// The lease, present exactly while `status == leased`.
+    #[serde(default)]
+    pub lease: Option<TaskLease>,
+    /// Classification of the last failed attempt's error — core's closed
+    /// [`ErrorClass`] taxonomy (snake_case on the wire and in storage),
+    /// shared verbatim with the worker SDK so both sides of the queue agree.
+    #[serde(default)]
+    pub error_class: Option<ErrorClass>,
+    /// The declared effect classification of the work (core's [`Effect`]
+    /// taxonomy), when the enqueuer declared one. This is the effect gate's
+    /// input on failure: a declared non-repeatable effect is never silently
+    /// retried, whatever the worker's `retryable` flag says. `None` defers
+    /// to the worker's per-attempt `retryable` declaration.
+    #[serde(default)]
+    pub effect: Option<Effect>,
+    /// The last failed attempt's error message.
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// The completed task's result (any JSON value), set by `complete`.
+    #[serde(default)]
+    pub result: Option<Value>,
+    /// Run/thread linkage, reserved for the outbox wave (R0.6 remainder);
+    /// always `null` through the public enqueue endpoint today.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// See [`TaskRecord::run_id`].
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    /// When a `failed` task becomes claimable again (`None` while queued,
+    /// leased, or terminal).
+    #[serde(default)]
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// The enqueuer-supplied shape of a new task: everything [`TaskRecord::new`]
+/// needs beyond its timestamps. Grouping these keeps the constructor (and
+/// its call sites) readable.
+pub(crate) struct NewTask {
+    pub task_id: String,
+    pub tenant: String,
+    pub kind: String,
+    pub payload: Value,
+    pub pool: String,
+    pub max_attempts: u32,
+    pub idempotency_key: Option<String>,
+    pub effect: Option<Effect>,
+}
+
+/// A worker's report of a failed attempt: the shared [`ErrorClass`]
+/// classification, a human-readable message, and whether the worker judges
+/// the work safe to re-drive. Grouped so the store trait's `fail_task` stays
+/// within the argument ceiling.
+pub(crate) struct FailureReport {
+    pub error_class: ErrorClass,
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl TaskRecord {
+    /// A freshly enqueued task: `queued`, attempt 0, claimable immediately.
+    pub(crate) fn new(new: NewTask, now: DateTime<Utc>) -> Self {
+        let NewTask {
+            task_id,
+            tenant,
+            kind,
+            payload,
+            pool,
+            max_attempts,
+            idempotency_key,
+            effect,
+        } = new;
+        Self {
+            task_id,
+            tenant,
+            kind,
+            payload,
+            pool,
+            status: TaskStatus::Queued,
+            attempt: 0,
+            max_attempts,
+            lease: None,
+            error_class: None,
+            effect,
+            last_error: None,
+            idempotency_key,
+            result: None,
+            run_id: None,
+            thread_id: None,
+            next_attempt_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// `true` when a claim at `now` may take this task: fresh or
+    /// backoff-elapsed, or leased past its visibility timeout (safe
+    /// reassignment after worker loss).
+    pub(crate) fn claimable_at(&self, now: DateTime<Utc>) -> bool {
+        match self.status {
+            TaskStatus::Queued => true,
+            TaskStatus::Failed => self.next_attempt_at.is_some_and(|at| at <= now),
+            TaskStatus::Leased => self.lease.as_ref().is_some_and(|l| l.expires_at <= now),
+            TaskStatus::Completed | TaskStatus::Dead => false,
+        }
+    }
+
+    /// `true` when `worker_id` currently holds this task's lease. Past-expiry
+    /// leases that no other worker has reclaimed still count: the lease check
+    /// is atomic with the mutation, so the holder can never double-settle —
+    /// a reclaimed task has a new owner and fails this check.
+    pub(crate) fn leased_to(&self, worker_id: &str) -> bool {
+        self.status == TaskStatus::Leased
+            && self.lease.as_ref().is_some_and(|l| l.owner == worker_id)
+    }
+
+    /// Take the task as a new attempt for `worker_id`.
+    pub(crate) fn claim(&mut self, worker_id: &str, lease_ms: u64, now: DateTime<Utc>) {
+        self.status = TaskStatus::Leased;
+        self.attempt = self.attempt.saturating_add(1);
+        self.lease = Some(TaskLease {
+            owner: worker_id.to_string(),
+            expires_at: now + lease_duration(lease_ms),
+        });
+        self.next_attempt_at = None;
+        self.updated_at = now;
+    }
+
+    /// Extend the held lease (heartbeat). Caller checked [`Self::leased_to`].
+    pub(crate) fn renew_lease(&mut self, lease_ms: u64, now: DateTime<Utc>) {
+        if let Some(lease) = &mut self.lease {
+            lease.expires_at = now + lease_duration(lease_ms);
+        }
+        self.updated_at = now;
+    }
+
+    /// Settle the task successfully, storing `result`. Caller checked
+    /// [`Self::leased_to`]. `error_class` / `last_error` from earlier failed
+    /// attempts are kept — they are the history of what this task survived.
+    pub(crate) fn complete(&mut self, result: Value, now: DateTime<Utc>) {
+        self.status = TaskStatus::Completed;
+        self.result = Some(result);
+        self.lease = None;
+        self.next_attempt_at = None;
+        self.updated_at = now;
+    }
+
+    /// Record a failed attempt, deciding through core's shared
+    /// [`classify_retry`] policy. Caller checked [`Self::leased_to`].
+    ///
+    /// The effect gate's input: the task's declared [`Effect`] when the
+    /// enqueuer supplied one (a declared non-repeatable effect is never
+    /// silently retried — the declaration outranks the worker's flag);
+    /// otherwise the worker's `retryable` bool stands in, as the executor's
+    /// own declaration that re-driving this work is safe (`true` →
+    /// [`Effect::Idempotent`], `false` → the conservative
+    /// [`Effect::NonIdempotent`]).
+    ///
+    /// The decision lands as: `Retry` → [`TaskStatus::Failed`] with
+    /// `next_attempt_at` set (backoff + full jitter, cap 5 min); `Dead` →
+    /// [`TaskStatus::Dead`] (the DLQ); `Fail` → [`TaskStatus::Failed`] with
+    /// `next_attempt_at` null — terminal, but *not* dead-lettered.
+    pub(crate) fn fail(
+        &mut self,
+        error_class: ErrorClass,
+        message: &str,
+        retryable: bool,
+        now: DateTime<Utc>,
+    ) {
+        let effect = self.effect.unwrap_or(if retryable {
+            Effect::Idempotent
+        } else {
+            Effect::NonIdempotent
+        });
+        match classify_retry(
+            effect,
+            error_class,
+            self.attempt,
+            self.max_attempts,
+            uniform(),
+        ) {
+            RetryDecision::Retry { after_ms } => {
+                self.status = TaskStatus::Failed;
+                self.next_attempt_at =
+                    Some(now + Duration::milliseconds(after_ms.min(i64::MAX as u64) as i64));
+            }
+            RetryDecision::Dead => {
+                self.status = TaskStatus::Dead;
+                self.next_attempt_at = None;
+            }
+            RetryDecision::Fail => {
+                self.status = TaskStatus::Failed;
+                self.next_attempt_at = None;
+            }
+        }
+        self.error_class = Some(error_class);
+        self.last_error = Some(message.to_string());
+        self.lease = None;
+        self.updated_at = now;
+    }
+
+    /// The public representation: every field a worker needs, minus `tenant`.
+    pub(crate) fn wire(&self) -> Value {
+        json!({
+            "task_id": self.task_id,
+            "kind": self.kind,
+            "payload": self.payload,
+            "pool": self.pool,
+            "status": self.status.as_str(),
+            "attempt": self.attempt,
+            "max_attempts": self.max_attempts,
+            "error_class": self.error_class,
+            "effect": self.effect,
+            "last_error": self.last_error,
+            "idempotency_key": self.idempotency_key,
+            "result": self.result,
+            "run_id": self.run_id,
+            "thread_id": self.thread_id,
+            "lease": self.lease.as_ref().map(|lease| json!({
+                "owner": lease.owner,
+                "expires_at": lease.expires_at,
+            })),
+            "next_attempt_at": self.next_attempt_at,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        })
+    }
+}
+
+fn lease_duration(lease_ms: u64) -> Duration {
+    Duration::milliseconds(lease_ms.min(i64::MAX as u64) as i64)
+}
+
+/// Result of a lease-guarded mutation (heartbeat / complete / fail).
+#[derive(Debug, Clone)]
+pub(crate) enum MutationOutcome {
+    /// The mutation landed; carries the updated record (boxed — the record
+    /// is far larger than the other variants).
+    Applied(Box<TaskRecord>),
+    /// The task exists (in this tenant) but the caller does not hold its
+    /// lease — already settled, never leased, or reclaimed by another
+    /// worker after expiry. Routes answer 409.
+    LeaseLost,
+    /// No such task in this tenant (unknown or cross-tenant id — the two
+    /// are deliberately indistinguishable). Routes answer 404.
+    Unknown,
+}
+
+/// A `[0, 1)` jitter sample for [`classify_retry`], from OS entropy via the
+/// already-linked `uuid` crate. The design's seeded-`RngSource` determinism
+/// story applies to runs; queue-side retry scheduling just needs the
+/// decorrelation full jitter provides.
+fn uniform() -> f64 {
+    let bytes = uuid::Uuid::new_v4().into_bytes();
+    let roll = u64::from_le_bytes(bytes[..8].try_into().expect("uuid is 16 bytes"));
+    // Top 53 bits, as f64 / 2^53 — the standard uniform-double recipe.
+    (roll >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Parse a wire string into one of core's closed taxonomies (`T` =
+/// [`ErrorClass`] / [`Effect`]); `Err` for anything outside it (routes
+/// answer 400 — a silently accepted free-form value would fork the contract
+/// the worker SDK matches on). `expected` lists the valid wire names for the
+/// error message.
+fn parse_taxonomy<T: serde::de::DeserializeOwned>(
+    what: &str,
+    raw: &str,
+    expected: &str,
+) -> Result<T, String> {
+    serde_json::from_value(Value::String(raw.to_string()))
+        .map_err(|_| format!("unknown `{what}` `{raw}` (expected {expected})"))
+}
+
+/// The storage spelling of a taxonomy value (its serde name) — the Postgres
+/// columns are TEXT, so binds go through this. Only the `postgres` feature
+/// consumes it (and the shared unit tests).
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+fn taxonomy_name<T: Serialize>(value: T) -> String {
+    match serde_json::to_value(value).expect("taxonomy serialization is infallible") {
+        Value::String(name) => name,
+        _ => unreachable!("taxonomy enums serialize to strings"),
+    }
+}
+
+/// Parse a wire `error_class` string into the shared [`ErrorClass`]
+/// taxonomy (routes map `Err` to 400).
+pub(crate) fn parse_error_class(raw: &str) -> Result<ErrorClass, String> {
+    parse_taxonomy(
+        "error_class",
+        raw,
+        "transient|rate_limited|timeout|invalid_input|dependency_failure|resource_exhausted|cancelled|unknown",
+    )
+}
+
+/// The storage spelling of an [`ErrorClass`] (its serde name).
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+pub(crate) fn error_class_name(class: ErrorClass) -> String {
+    taxonomy_name(class)
+}
+
+/// Parse a wire `effect` string into the shared [`Effect`] taxonomy
+/// (routes map `Err` to 400).
+pub(crate) fn parse_effect(raw: &str) -> Result<Effect, String> {
+    parse_taxonomy(
+        "effect",
+        raw,
+        "pure|read_only|idempotent|compensatable|non_idempotent",
+    )
+}
+
+/// The storage spelling of an [`Effect`] (its serde name).
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+pub(crate) fn effect_name(effect: Effect) -> String {
+    taxonomy_name(effect)
+}
+
+// --------------------------------------------------------------------- //
+// Validation (routes map `Err` to 400)
+// --------------------------------------------------------------------- //
+
+/// A short label: task `kind`, `worker_id`. Non-empty, bounded; content is
+/// otherwise free-form (it is stored, never pathed). `error_class` is NOT a
+/// label — it validates against the shared taxonomy via
+/// [`parse_error_class`].
+pub(crate) fn validate_label(what: &str, value: &str, max_len: usize) -> Result<(), String> {
+    if value.trim().is_empty() || value.len() > max_len {
+        return Err(format!("`{what}` must be non-empty and <= {max_len} chars"));
+    }
+    Ok(())
+}
+
+/// A pool name becomes a claim filter and (in the JSON layout) stays inside
+/// the task record — restrict it like a KV segment so pooling stays
+/// unambiguous across backends.
+pub(crate) fn validate_pool(pool: &str) -> Result<(), String> {
+    let ok = !pool.is_empty()
+        && pool.len() <= 128
+        && pool
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+    if ok {
+        Ok(())
+    } else {
+        Err("`pool` must match [A-Za-z0-9._-] and be 1..=128 chars".to_string())
+    }
+}
+
+/// `lease_ms` bounds, shared by claim and heartbeat.
+pub(crate) fn validate_lease_ms(lease_ms: u64) -> Result<(), String> {
+    if (MIN_LEASE_MS..=MAX_LEASE_MS).contains(&lease_ms) {
+        Ok(())
+    } else {
+        Err(format!(
+            "`lease_ms` must be within {MIN_LEASE_MS}..={MAX_LEASE_MS}"
+        ))
+    }
+}
+
+// --------------------------------------------------------------------- //
+// JSON-file persistence (`{store_path}/tasks/{task_id}.json`)
+// --------------------------------------------------------------------- //
+
+/// The tasks directory under the store root. `tasks` is a reserved layout
+/// name (see [`crate::RESERVED_NAMES`]): client-chosen thread ids may not
+/// claim it.
+pub(crate) fn dir(root: &Path) -> PathBuf {
+    root.join("tasks")
+}
+
+/// Persist one task record (create or overwrite), atomically: temp file +
+/// rename, mirroring the journal store's durability discipline — a crash
+/// mid-write must never leave a truncated task file behind.
+pub(crate) async fn persist(root: &Path, record: &TaskRecord) -> io::Result<()> {
+    let dir = dir(root);
+    tokio::fs::create_dir_all(&dir).await?;
+    let bytes = serde_json::to_vec_pretty(record)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let path = dir.join(format!("{}.json", record.task_id));
+    let tmp = dir.join(format!("{}.tmp", record.task_id));
+    tokio::fs::write(&tmp, bytes).await?;
+    tokio::fs::rename(&tmp, path).await
+}
+
+/// Load all persisted tasks, skipping (with a warning) any file that fails
+/// to parse — one corrupt record must not take the queue down at boot.
+pub(crate) fn load(root: &Path) -> HashMap<String, TaskRecord> {
+    let mut out = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(dir(root)) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let parsed = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<TaskRecord>(&raw).ok());
+        match parsed {
+            Some(record) => {
+                out.insert(record.task_id.clone(), record);
+            }
+            None => {
+                tracing::warn!(path = %path.display(), "skipping unreadable task file")
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record() -> TaskRecord {
+        TaskRecord::new(
+            NewTask {
+                task_id: "task-1".to_string(),
+                tenant: "acme".to_string(),
+                kind: "send_email".to_string(),
+                payload: json!({"to": "a@b.c"}),
+                pool: DEFAULT_POOL.to_string(),
+                max_attempts: DEFAULT_MAX_ATTEMPTS,
+                idempotency_key: None,
+                effect: None,
+            },
+            Utc::now(),
+        )
+    }
+
+    #[test]
+    fn status_wire_spellings_round_trip() {
+        for (status, s) in [
+            (TaskStatus::Queued, "queued"),
+            (TaskStatus::Leased, "leased"),
+            (TaskStatus::Failed, "failed"),
+            (TaskStatus::Completed, "completed"),
+            (TaskStatus::Dead, "dead"),
+        ] {
+            assert_eq!(status.as_str(), s);
+            assert_eq!(TaskStatus::parse(s), Some(status));
+            assert_eq!(serde_json::to_value(status).unwrap(), json!(s));
+            assert_eq!(
+                serde_json::from_value::<TaskStatus>(json!(s)).unwrap(),
+                status
+            );
+        }
+        assert_eq!(TaskStatus::parse("zombie"), None);
+    }
+
+    #[test]
+    fn fail_with_retryable_false_is_terminal_but_not_dead_lettered() {
+        let mut task = record();
+        let t0 = Utc::now();
+        task.claim("w-1", 60_000, t0);
+        // The worker declares re-driving unsafe → RetryDecision::Fail via
+        // the effect gate: terminal, next_attempt_at null, and NOT the DLQ.
+        task.fail(ErrorClass::Timeout, "charged twice maybe", false, t0);
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.next_attempt_at, None);
+        assert!(!task.claimable_at(t0 + Duration::days(365)));
+        assert_eq!(task.error_class, Some(ErrorClass::Timeout));
+    }
+
+    #[test]
+    fn fail_with_non_retryable_class_is_terminal_despite_retryable_flag() {
+        let mut task = record();
+        let t0 = Utc::now();
+        task.claim("w-1", 60_000, t0);
+        // Class gate: invalid_input fails immediately even when the worker
+        // answered retryable — the class taxonomy wins.
+        task.fail(ErrorClass::InvalidInput, "bad schema", true, t0);
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.next_attempt_at, None);
+    }
+
+    #[test]
+    fn fail_retryable_within_budget_requeues_inside_the_jitter_window() {
+        for attempt in 1..=8u32 {
+            for _ in 0..64 {
+                let mut task = record();
+                task.max_attempts = MAX_ATTEMPTS_LIMIT;
+                let t0 = Utc::now();
+                task.attempt = attempt - 1;
+                task.claim("w-1", 60_000, t0);
+                task.fail(ErrorClass::Transient, "hiccup", true, t0);
+                assert_eq!(task.status, TaskStatus::Failed);
+                let at = task.next_attempt_at.expect("retry scheduled");
+                // Full jitter: delay in [0, base * 2^(attempt-1)], 5 min cap.
+                let bound = (1_000u64 << (attempt - 1)).min(300_000) as i64;
+                let delay = (at - t0).num_milliseconds();
+                assert!(
+                    (0..=bound).contains(&delay),
+                    "delay {delay} ms outside [0, {bound}] for attempt {attempt}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fail_at_the_attempt_ceiling_dead_letters() {
+        let mut task = record(); // DEFAULT_MAX_ATTEMPTS = 3
+        let t0 = Utc::now();
+        task.claim("w-1", 60_000, t0);
+        task.attempt = 3;
+        task.fail(ErrorClass::Unknown, "third strike", true, t0);
+        assert_eq!(task.status, TaskStatus::Dead);
+        assert_eq!(task.next_attempt_at, None);
+        assert!(!task.claimable_at(t0 + Duration::days(365)));
+    }
+
+    #[test]
+    fn declared_effect_outranks_the_workers_retryable_flag() {
+        // A declared non-repeatable effect never silently retries — even
+        // when the worker answered retryable on this attempt.
+        let mut task = record();
+        task.effect = Some(Effect::NonIdempotent);
+        let t0 = Utc::now();
+        task.claim("w-1", 60_000, t0);
+        task.fail(ErrorClass::Timeout, "maybe it fired", true, t0);
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.next_attempt_at, None, "effect gate: fail outright");
+
+        // A declared idempotent effect retries even when the worker
+        // answered non-retryable — the enqueue-time declaration is the
+        // stronger, shared contract.
+        let mut task = record();
+        task.effect = Some(Effect::Idempotent);
+        task.claim("w-1", 60_000, t0);
+        task.fail(ErrorClass::Transient, "hiccup", false, t0);
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert!(
+            task.next_attempt_at.is_some(),
+            "declared idempotent retries"
+        );
+    }
+
+    #[test]
+    fn error_class_names_round_trip_through_the_serde_contract() {
+        for (class, name) in [
+            (ErrorClass::Transient, "transient"),
+            (ErrorClass::RateLimited, "rate_limited"),
+            (ErrorClass::Timeout, "timeout"),
+            (ErrorClass::InvalidInput, "invalid_input"),
+            (ErrorClass::DependencyFailure, "dependency_failure"),
+            (ErrorClass::ResourceExhausted, "resource_exhausted"),
+            (ErrorClass::Cancelled, "cancelled"),
+            (ErrorClass::Unknown, "unknown"),
+        ] {
+            assert_eq!(error_class_name(class), name);
+            assert_eq!(parse_error_class(name).unwrap(), class);
+        }
+        assert!(parse_error_class("bug").is_err());
+        assert!(parse_error_class("").is_err());
+        assert!(
+            parse_error_class("Transient").is_err(),
+            "wire names are snake_case"
+        );
+    }
+
+    #[test]
+    fn effect_names_round_trip_through_the_serde_contract() {
+        for (effect, name) in [
+            (Effect::Pure, "pure"),
+            (Effect::ReadOnly, "read_only"),
+            (Effect::Idempotent, "idempotent"),
+            (Effect::Compensatable, "compensatable"),
+            (Effect::NonIdempotent, "non_idempotent"),
+        ] {
+            assert_eq!(effect_name(effect), name);
+            assert_eq!(parse_effect(name).unwrap(), effect);
+        }
+        assert!(parse_effect("side_effecty").is_err());
+        assert!(
+            parse_effect("Idempotent").is_err(),
+            "wire names are snake_case"
+        );
+    }
+
+    #[test]
+    fn uniform_stays_inside_unit_interval() {
+        for _ in 0..256 {
+            let u = uniform();
+            assert!((0.0..1.0).contains(&u), "uniform sample {u} outside [0, 1)");
+        }
+    }
+
+    #[test]
+    fn lifecycle_claim_heartbeat_complete() {
+        let mut task = record();
+        let t0 = Utc::now();
+        assert!(task.claimable_at(t0));
+        assert!(!task.leased_to("w-1"));
+
+        task.claim("w-1", 60_000, t0);
+        assert_eq!(task.status, TaskStatus::Leased);
+        assert_eq!(task.attempt, 1);
+        assert!(task.leased_to("w-1"));
+        assert!(!task.leased_to("w-2"));
+        // A live lease is not claimable; an expired one is.
+        assert!(!task.claimable_at(t0 + Duration::seconds(30)));
+        assert!(task.claimable_at(t0 + Duration::seconds(61)));
+
+        task.renew_lease(60_000, t0);
+        let expires = task.lease.as_ref().unwrap().expires_at;
+        assert_eq!(expires, t0 + Duration::seconds(60));
+
+        task.complete(json!({"ok": true}), t0);
+        assert_eq!(task.status, TaskStatus::Completed);
+        assert_eq!(task.result, Some(json!({"ok": true})));
+        assert!(task.lease.is_none());
+        assert!(!task.claimable_at(t0 + Duration::days(365)));
+    }
+
+    #[test]
+    fn lifecycle_failed_attempt_schedules_retry_then_dead_letters() {
+        let mut task = record();
+        let t0 = Utc::now();
+        task.claim("w-1", 60_000, t0);
+        task.fail(ErrorClass::Timeout, "upstream timed out", true, t0);
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.error_class, Some(ErrorClass::Timeout));
+        assert_eq!(task.last_error.as_deref(), Some("upstream timed out"));
+        assert!(task.lease.is_none());
+        let at = task.next_attempt_at.expect("retry scheduled");
+        assert!(!task.claimable_at(t0));
+        assert!(task.claimable_at(at));
+
+        // Retry the remaining attempts; the third failure dead-letters.
+        task.claim("w-1", 60_000, at);
+        assert_eq!(task.attempt, 2);
+        assert!(task.next_attempt_at.is_none(), "claim clears the schedule");
+        task.fail(ErrorClass::Timeout, "again", true, at);
+        assert_eq!(task.status, TaskStatus::Failed);
+        let at = task.next_attempt_at.unwrap();
+        task.claim("w-2", 60_000, at);
+        assert_eq!(task.attempt, 3);
+        task.fail(ErrorClass::Timeout, "third strike", true, at);
+        assert_eq!(task.status, TaskStatus::Dead);
+        assert!(task.next_attempt_at.is_none());
+        assert!(!task.claimable_at(at + Duration::days(365)));
+    }
+
+    #[test]
+    fn expired_lease_reclaim_counts_a_new_attempt() {
+        let mut task = record();
+        let t0 = Utc::now();
+        task.claim("w-1", 1_000, t0);
+        let t1 = t0 + Duration::seconds(2);
+        assert!(task.claimable_at(t1));
+        // Expired but unreclaimed: the original holder may still settle —
+        // the owner check is atomic with every mutation, so it can never
+        // settle twice once another worker reclaims.
+        assert!(task.leased_to("w-1"));
+        task.claim("w-2", 1_000, t1);
+        assert_eq!(task.attempt, 2);
+        assert!(task.leased_to("w-2"));
+        assert!(!task.leased_to("w-1"), "the lost lease no longer settles");
+    }
+
+    #[test]
+    fn wire_omits_tenant_and_nests_the_lease() {
+        let mut task = record();
+        task.claim("w-1", 60_000, Utc::now());
+        let wire = task.wire();
+        assert!(wire.get("tenant").is_none());
+        assert_eq!(wire["task_id"], json!("task-1"));
+        assert_eq!(wire["kind"], json!("send_email"));
+        assert_eq!(wire["status"], json!("leased"));
+        assert_eq!(wire["lease"]["owner"], json!("w-1"));
+        assert!(wire["lease"]["expires_at"].is_string());
+        assert_eq!(wire["idempotency_key"], Value::Null);
+        assert_eq!(wire["effect"], Value::Null);
+        assert_eq!(wire["run_id"], Value::Null);
+        assert_eq!(wire["next_attempt_at"], Value::Null);
+    }
+
+    #[test]
+    fn record_serde_round_trip() {
+        let mut task = record();
+        task.idempotency_key = Some("key-1".to_string());
+        task.claim("w-1", 60_000, Utc::now());
+        task.fail(ErrorClass::Unknown, "it broke", true, Utc::now());
+        let raw = serde_json::to_string(&task).unwrap();
+        let back: TaskRecord = serde_json::from_str(&raw).unwrap();
+        assert_eq!(back.task_id, task.task_id);
+        assert_eq!(back.tenant, task.tenant);
+        assert_eq!(back.status, TaskStatus::Failed);
+        assert_eq!(back.attempt, 1);
+        assert_eq!(back.idempotency_key.as_deref(), Some("key-1"));
+        assert_eq!(back.error_class, Some(ErrorClass::Unknown));
+        // The error class persists in the shared snake_case spelling.
+        assert!(raw.contains("\"error_class\":\"unknown\""));
+        assert_eq!(back.next_attempt_at, task.next_attempt_at);
+        // Records written before R0.6 linkage fields existed still load.
+        let legacy = json!({
+            "task_id": "t", "tenant": "default", "kind": "k", "payload": null,
+            "pool": "default", "status": "queued", "attempt": 0,
+            "max_attempts": 3, "created_at": Utc::now(), "updated_at": Utc::now(),
+        });
+        let back: TaskRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back.status, TaskStatus::Queued);
+        assert!(back.lease.is_none() && back.result.is_none() && back.run_id.is_none());
+        assert!(back.effect.is_none() && back.error_class.is_none());
+    }
+
+    #[test]
+    fn validation_bounds() {
+        assert!(validate_label("kind", "send_email", 256).is_ok());
+        assert!(validate_label("kind", "  ", 256).is_err());
+        assert!(validate_label("kind", &"x".repeat(257), 256).is_err());
+        assert!(validate_pool("default").is_ok());
+        assert!(validate_pool("gpu-workers.eu-west").is_ok());
+        assert!(validate_pool("").is_err());
+        assert!(validate_pool("bad/pool").is_err());
+        assert!(validate_lease_ms(100).is_ok());
+        assert!(validate_lease_ms(3_600_000).is_ok());
+        assert!(validate_lease_ms(99).is_err());
+        assert!(validate_lease_ms(3_600_001).is_err());
+    }
+
+    #[tokio::test]
+    async fn persist_then_load_round_trips() {
+        let root = std::env::temp_dir().join(format!("rusty-tasks-test-{}", uuid::Uuid::new_v4()));
+        let mut task = record();
+        task.claim("w-1", 60_000, Utc::now());
+        persist(&root, &task).await.unwrap();
+        let loaded = load(&root);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded["task-1"].status, TaskStatus::Leased);
+        assert!(loaded["task-1"].leased_to("w-1"));
+
+        // Overwrite replaces; a corrupt file is skipped, not fatal.
+        task.complete(json!(1), Utc::now());
+        persist(&root, &task).await.unwrap();
+        std::fs::write(dir(&root).join("corrupt.json"), b"{nope").unwrap();
+        let loaded = load(&root);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded["task-1"].status, TaskStatus::Completed);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

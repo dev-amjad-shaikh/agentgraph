@@ -69,6 +69,13 @@ pub const DEFAULT_MAX_RETRIES: u32 = 2;
 pub const DEFAULT_BASE_BACKOFF: Duration = Duration::from_millis(100);
 
 /// A node invocation sent to a worker (`POST {base_url}/execute`).
+///
+/// The same envelope can be embedded as the payload of a durable task
+/// (Durable Work R0.6, `rusty_agent_runtime::durable::TaskEnvelope`) — in
+/// that flow [`NodeTask::task_id`] carries the leased task's identity.
+/// Direct `/execute` invocations built by [`RemoteNode`] always leave it
+/// `None`, so previously written tasks keep deserializing unchanged
+/// (additive-only evolution within v1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeTask {
     /// Protocol version of the sender. See [`PROTOCOL_VERSION`].
@@ -86,6 +93,14 @@ pub struct NodeTask {
     /// The per-run, per-node configuration (thread id, step, resume value,
     /// extensions). Carried verbatim so `resume` round-trips across the wire.
     pub config: crate::node::NodeConfig,
+
+    /// The durable task identity assigned by the server's task queue,
+    /// present only when this invocation rides the durable-task flow (R0.6)
+    /// rather than a direct `/execute` call. It lets a remote node handler
+    /// correlate external side effects with the durable task (idempotency
+    /// keys, receipts) when a run dispatches node work through the queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
 }
 
 /// Serializable form of [`NodeOutput`].
@@ -413,6 +428,9 @@ impl Node for RemoteNode {
             node: self.node_name.clone(),
             state: ctx.state().clone(),
             config: ctx.config().clone(),
+            // Direct `/execute` calls are not leased; only the server's task
+            // queue assigns `task_id` in the durable-task flow.
+            task_id: None,
         };
 
         let mut attempt: u32 = 0;
@@ -477,6 +495,7 @@ mod tests {
                 resume: Some(json!({"approved": true})),
                 extra: HashMap::from([("tag".to_string(), json!("demo"))]),
             },
+            task_id: Some("task-7".into()),
         };
         let json_str = serde_json::to_string(&task).unwrap();
         let back: NodeTask = serde_json::from_str(&json_str).unwrap();
@@ -487,6 +506,33 @@ mod tests {
         assert_eq!(back.config.step, 3);
         assert_eq!(back.config.resume, Some(json!({"approved": true})));
         assert_eq!(back.config.extra.get("tag"), Some(&json!("demo")));
+        assert_eq!(back.task_id.as_deref(), Some("task-7"));
+    }
+
+    #[test]
+    fn node_task_task_id_is_additive_within_v1() {
+        // Tasks written before `task_id` existed (the direct `/execute`
+        // shape) must keep deserializing...
+        let legacy = r#"{
+            "protocol_version": 1,
+            "node": "doubler",
+            "state": {"n": 21},
+            "config": {"thread_id": "t-1", "step": 3, "resume": null, "extra": {}}
+        }"#;
+        let task: NodeTask = serde_json::from_str(legacy).unwrap();
+        assert_eq!(task.task_id, None);
+
+        // ...and a task with no lease identity must serialize byte-for-byte
+        // into the old shape (no `task_id` key) so old workers accept it.
+        let task = NodeTask {
+            protocol_version: PROTOCOL_VERSION,
+            node: "doubler".into(),
+            state: State::new(),
+            config: NodeConfig::default(),
+            task_id: None,
+        };
+        let value = serde_json::to_value(&task).unwrap();
+        assert!(value.get("task_id").is_none());
     }
 
     #[test]

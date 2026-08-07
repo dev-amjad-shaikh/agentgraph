@@ -8,6 +8,7 @@ use std::time::Duration;
 use axum::extract::{Path, Query, State as AxumState};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{middleware, Extension, Json, Router};
 use chrono::Utc;
@@ -32,6 +33,7 @@ use crate::runs::{
 };
 use crate::server_store::{JsonFileStore, ServerStore};
 use crate::sse;
+use crate::tasks::{self, MutationOutcome, TaskRecord, TaskStatus};
 use crate::threads::ThreadRecord;
 use crate::{store, GraphRegistry, ServerConfig, RESERVED_NAMES};
 
@@ -131,6 +133,12 @@ pub(crate) fn router(registry: GraphRegistry, config: ServerConfig) -> Router {
                 .get(get_store_item)
                 .delete(delete_store_item),
         )
+        .route("/tasks", post(enqueue_task).get(list_tasks))
+        .route("/tasks/claim", post(claim_task))
+        .route("/tasks/{task_id}", get(get_task))
+        .route("/tasks/{task_id}/heartbeat", post(heartbeat_task))
+        .route("/tasks/{task_id}/complete", post(complete_task))
+        .route("/tasks/{task_id}/fail", post(fail_task))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             crate::auth::require_api_key,
@@ -1593,4 +1601,341 @@ async fn list_store_namespace(
         })
         .collect();
     Ok(Json(json!(items)))
+}
+
+// --------------------------------------------------------------------- //
+// Durable task queue (R0.6)
+// --------------------------------------------------------------------- //
+
+#[derive(Debug, Deserialize)]
+struct EnqueueTaskPayload {
+    /// Work classification the worker fleet dispatches on (free-form).
+    kind: String,
+    /// Work payload: any JSON value, stored verbatim.
+    payload: Value,
+    /// Named pool (default `default`); workers claim from named pools.
+    #[serde(default)]
+    pool: Option<String>,
+    /// Attempt ceiling before dead-lettering (default 3, max 100).
+    #[serde(default)]
+    max_attempts: Option<u32>,
+    /// Dedup key, unique per tenant across live tasks: re-enqueueing with
+    /// the same key returns the existing task (`deduplicated: true`).
+    #[serde(default)]
+    idempotency_key: Option<String>,
+    /// Declared effect classification of the work (`pure` / `read_only` /
+    /// `idempotent` / `compensatable` / `non_idempotent`, the Flight
+    /// Recorder taxonomy). The retry policy's effect gate: a declared
+    /// non-repeatable effect is never silently retried. Optional — when
+    /// absent, the worker's per-attempt `retryable` flag decides.
+    #[serde(default)]
+    effect: Option<String>,
+}
+
+/// `POST /tasks` — enqueue a durable task. `201 {task_id, deduplicated:
+/// false}` on creation, `200 {task_id, deduplicated: true}` when the
+/// idempotency key already names a live task in this tenant.
+async fn enqueue_task(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
+    Json(payload): Json<EnqueueTaskPayload>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    tasks::validate_label("kind", &payload.kind, 256).map_err(ApiError::bad_request)?;
+    let pool = payload
+        .pool
+        .unwrap_or_else(|| tasks::DEFAULT_POOL.to_string());
+    tasks::validate_pool(&pool).map_err(ApiError::bad_request)?;
+    let max_attempts = payload.max_attempts.unwrap_or(tasks::DEFAULT_MAX_ATTEMPTS);
+    if !(1..=tasks::MAX_ATTEMPTS_LIMIT).contains(&max_attempts) {
+        return Err(ApiError::bad_request(format!(
+            "`max_attempts` must be within 1..={}",
+            tasks::MAX_ATTEMPTS_LIMIT
+        )));
+    }
+    if let Some(key) = &payload.idempotency_key {
+        tasks::validate_label("idempotency_key", key, 256).map_err(ApiError::bad_request)?;
+    }
+    let effect = payload
+        .effect
+        .as_deref()
+        .map(tasks::parse_effect)
+        .transpose()
+        .map_err(ApiError::bad_request)?;
+
+    let record = TaskRecord::new(
+        tasks::NewTask {
+            task_id: uuid::Uuid::new_v4().to_string(),
+            tenant: tenant.tenant().to_string(),
+            kind: payload.kind,
+            payload: payload.payload,
+            pool,
+            max_attempts,
+            idempotency_key: payload.idempotency_key,
+            effect,
+        },
+        Utc::now(),
+    );
+    let (task, deduplicated) = state
+        .server_store
+        .enqueue_task(&record)
+        .await
+        .map_err(internal_err)?;
+    let status = if deduplicated {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((
+        status,
+        Json(json!({
+            "task_id": task.task_id,
+            "deduplicated": deduplicated,
+        })),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaimTaskPayload {
+    /// Stable worker identity; only this id may heartbeat/settle the lease.
+    worker_id: String,
+    /// Pools to claim from (default `["default"]`); an explicit empty list
+    /// is a 400 — it could never match a task.
+    #[serde(default)]
+    pools: Option<Vec<String>>,
+    /// Visibility timeout in milliseconds (100..=3_600_000).
+    lease_ms: u64,
+}
+
+/// `POST /tasks/claim` — take the oldest claimable task: `200 {"task": {…}}`
+/// with a fresh lease, or `204` (empty body) when nothing is claimable.
+/// Claimable means queued, failed past its backoff schedule, or leased past
+/// its visibility timeout (safe reassignment after worker loss).
+async fn claim_task(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
+    Json(payload): Json<ClaimTaskPayload>,
+) -> Result<Response, ApiError> {
+    tasks::validate_label("worker_id", &payload.worker_id, 256).map_err(ApiError::bad_request)?;
+    tasks::validate_lease_ms(payload.lease_ms).map_err(ApiError::bad_request)?;
+    let pools = payload
+        .pools
+        .unwrap_or_else(|| vec![tasks::DEFAULT_POOL.to_string()]);
+    if pools.is_empty() {
+        return Err(ApiError::bad_request(
+            "`pools` must name at least one pool".to_string(),
+        ));
+    }
+    for pool in &pools {
+        tasks::validate_pool(pool).map_err(ApiError::bad_request)?;
+    }
+
+    let claimed = state
+        .server_store
+        .claim_task(
+            tenant.tenant(),
+            &payload.worker_id,
+            &pools,
+            payload.lease_ms,
+            Utc::now(),
+        )
+        .await
+        .map_err(internal_err)?;
+    Ok(match claimed {
+        Some(task) => Json(json!({ "task": task.wire() })).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct HeartbeatTaskPayload {
+    worker_id: String,
+    /// New visibility timeout in milliseconds, from now.
+    lease_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompleteTaskPayload {
+    worker_id: String,
+    /// The task's result: any JSON value, stored on the record.
+    result: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct FailTaskPayload {
+    worker_id: String,
+    /// Free-form error classification (`timeout`, `rate_limit`, `bug`, …),
+    /// stored for DLQ triage.
+    error_class: String,
+    /// The failure message, stored as the task's `last_error`.
+    message: String,
+    /// The worker's permanence judgment: `false` dead-letters immediately,
+    /// regardless of remaining attempts.
+    retryable: bool,
+}
+
+/// Shared 404/409 mapping for the lease-guarded mutations: 404 when the task
+/// is unknown to this tenant, 409 when it exists but the caller does not
+/// hold its lease (never leased, already settled, or reclaimed by another
+/// worker after the visibility timeout expired).
+fn lease_outcome(
+    outcome: MutationOutcome,
+    task_id: &str,
+    worker_id: &str,
+) -> Result<TaskRecord, ApiError> {
+    match outcome {
+        MutationOutcome::Applied(task) => Ok(*task),
+        MutationOutcome::LeaseLost => Err(ApiError::conflict(format!(
+            "task `{task_id}` is not leased to worker `{worker_id}` (lost, expired and reclaimed, or already settled)"
+        ))),
+        MutationOutcome::Unknown => {
+            Err(ApiError::not_found(format!("task `{task_id}` not found")))
+        }
+    }
+}
+
+/// `POST /tasks/{id}/heartbeat` — extend the held lease → `200
+/// {"lease_expires_at": "…"}`; `409` when the lease is lost.
+async fn heartbeat_task(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
+    Path(task_id): Path<String>,
+    Json(payload): Json<HeartbeatTaskPayload>,
+) -> Result<Json<Value>, ApiError> {
+    tasks::validate_label("worker_id", &payload.worker_id, 256).map_err(ApiError::bad_request)?;
+    tasks::validate_lease_ms(payload.lease_ms).map_err(ApiError::bad_request)?;
+    let outcome = state
+        .server_store
+        .heartbeat_task(
+            tenant.tenant(),
+            &task_id,
+            &payload.worker_id,
+            payload.lease_ms,
+            Utc::now(),
+        )
+        .await
+        .map_err(internal_err)?;
+    let task = lease_outcome(outcome, &task_id, &payload.worker_id)?;
+    let expires_at = task.lease.map(|lease| lease.expires_at);
+    Ok(Json(json!({ "lease_expires_at": expires_at })))
+}
+
+/// `POST /tasks/{id}/complete` — settle the held lease successfully, storing
+/// `result` → `200` with the updated task record; `409` when the lease is
+/// lost.
+async fn complete_task(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
+    Path(task_id): Path<String>,
+    Json(payload): Json<CompleteTaskPayload>,
+) -> Result<Json<Value>, ApiError> {
+    tasks::validate_label("worker_id", &payload.worker_id, 256).map_err(ApiError::bad_request)?;
+    let outcome = state
+        .server_store
+        .complete_task(
+            tenant.tenant(),
+            &task_id,
+            &payload.worker_id,
+            payload.result,
+            Utc::now(),
+        )
+        .await
+        .map_err(internal_err)?;
+    let task = lease_outcome(outcome, &task_id, &payload.worker_id)?;
+    Ok(Json(task.wire()))
+}
+
+/// `POST /tasks/{id}/fail` — record a failed attempt → `200 {requeued,
+/// next_attempt_at, dead}`. The decision is core's shared `classify_retry`
+/// policy: a retryable failure with attempts left requeues with exponential
+/// backoff + full jitter (cap 5 min, scheduled at `next_attempt_at`);
+/// exhausting the attempt budget dead-letters; a non-retryable class — or
+/// work not safe to re-drive (the worker's `retryable: false`, or a declared
+/// non-repeatable `effect` on the task) — fails outright (terminal, *not*
+/// dead-lettered: `requeued: false, dead: false, next_attempt_at: null`).
+/// `400` for an `error_class` outside the shared taxonomy; `409` when the
+/// lease is lost.
+async fn fail_task(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
+    Path(task_id): Path<String>,
+    Json(payload): Json<FailTaskPayload>,
+) -> Result<Json<Value>, ApiError> {
+    tasks::validate_label("worker_id", &payload.worker_id, 256).map_err(ApiError::bad_request)?;
+    let error_class =
+        tasks::parse_error_class(&payload.error_class).map_err(ApiError::bad_request)?;
+    tasks::validate_label("message", &payload.message, 4096).map_err(ApiError::bad_request)?;
+    let outcome = state
+        .server_store
+        .fail_task(
+            tenant.tenant(),
+            &task_id,
+            &payload.worker_id,
+            tasks::FailureReport {
+                error_class,
+                message: payload.message,
+                retryable: payload.retryable,
+            },
+            Utc::now(),
+        )
+        .await
+        .map_err(internal_err)?;
+    let task = lease_outcome(outcome, &task_id, &payload.worker_id)?;
+    Ok(Json(json!({
+        // A retry is outstanding exactly when a next attempt is scheduled;
+        // a `failed` task with a null schedule failed outright.
+        "requeued": task.status == TaskStatus::Failed && task.next_attempt_at.is_some(),
+        "next_attempt_at": task.next_attempt_at,
+        "dead": task.status == TaskStatus::Dead,
+    })))
+}
+
+/// `GET /tasks/{id}` — the task record (tenant-scoped; unknown or
+/// cross-tenant ids answer 404).
+async fn get_task(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
+    Path(task_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    state
+        .server_store
+        .get_task(tenant.tenant(), &task_id)
+        .await
+        .map_err(internal_err)?
+        .map(|task| Json(task.wire()))
+        .ok_or_else(|| ApiError::not_found(format!("task `{task_id}` not found")))
+}
+
+#[derive(Debug, Deserialize)]
+struct ListTasksQuery {
+    /// Filter to one lifecycle status; `status=dead` is the DLQ listing.
+    #[serde(default)]
+    status: Option<String>,
+}
+
+/// `GET /tasks?status=…` — the tenant's tasks, oldest first, optionally
+/// filtered by status. An unknown status answers 400 rather than silently
+/// returning everything.
+async fn list_tasks(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
+    Query(query): Query<ListTasksQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let status = query
+        .status
+        .as_deref()
+        .map(|s| {
+            TaskStatus::parse(s).ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "unknown task status `{s}` (expected queued|leased|failed|completed|dead)"
+                ))
+            })
+        })
+        .transpose()?;
+    let tasks = state
+        .server_store
+        .list_tasks(tenant.tenant(), status)
+        .await
+        .map_err(internal_err)?;
+    let wire: Vec<Value> = tasks.iter().map(TaskRecord::wire).collect();
+    Ok(Json(json!(wire)))
 }

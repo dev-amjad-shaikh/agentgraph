@@ -35,6 +35,12 @@
 //! - **Remote nodes** ([`remote`]): a [`remote::RemoteNode`] executes node
 //!   work on a remote worker over HTTP behind the same [`node::Node`] trait;
 //!   HITL interrupts cross the wire.
+//! - **Durable work** ([`durable`]): the shared R0.6 contracts for
+//!   effectively-once distributed activities — the [`durable::ErrorClass`]
+//!   retry taxonomy, the [`durable::RetryDecision`] policy mapping, and the
+//!   serde-versioned [`durable::TaskEnvelope`]. Queue, leases, and workers
+//!   live in `rusty-server` / `rusty-worker`; these are the pure contracts
+//!   both sides agree on.
 //! - **Replay** ([`replay`]): exact replay of journaled runs — model, tool,
 //!   remote, and WASM calls are served from the journal instead of executed —
 //!   plus branch diffs between journal snapshots and portable
@@ -69,6 +75,7 @@
 pub mod checkpoint;
 #[cfg(feature = "postgres")]
 pub mod checkpoint_postgres;
+pub mod durable;
 pub mod error;
 pub mod executor;
 pub mod graph;
@@ -92,6 +99,10 @@ pub mod prelude {
     };
     #[cfg(feature = "postgres")]
     pub use crate::checkpoint_postgres::PostgresCheckpointer;
+    pub use crate::durable::{
+        backoff_delay_ms, classify_retry, ArtifactContract, ErrorClass, RetryDecision, TaskBudget,
+        TaskEnvelope, BASE_RETRY_DELAY_MS, MAX_RETRY_DELAY_MS, TASK_ENVELOPE_FORMAT_VERSION,
+    };
     pub use crate::error::{Result, RustyError};
     pub use crate::executor::{ExecutionOutcome, Executor, GraphEvent, RunConfig};
     pub use crate::graph::{ConditionalRouter, Edge, Graph, GraphBuilder, Route, Send};

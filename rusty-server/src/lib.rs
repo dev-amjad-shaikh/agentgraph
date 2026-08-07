@@ -50,6 +50,13 @@
 //! | `PUT /store/{ns}/{key}` | upsert a JSON value in a namespace (`201` create, `200` replace) |
 //! | `GET /store/{ns}/{key}` / `DELETE /store/{ns}/{key}` | fetch / delete one item |
 //! | `GET /store/{ns}` | list a namespace's items |
+//! | `POST /tasks` | R0.6 durable task queue: enqueue a task `{kind, payload, pool?, max_attempts?, idempotency_key?}` → `201 {task_id, deduplicated}` (`200` + `deduplicated: true` when the idempotency key already names a live task in this tenant) |
+//! | `POST /tasks/claim` | R0.6: claim the oldest claimable task `{worker_id, pools?, lease_ms}` → `200 {task}` with a fresh lease, `204` when nothing is claimable |
+//! | `POST /tasks/{id}/heartbeat` | R0.6: extend the held lease `{worker_id, lease_ms}` → `{lease_expires_at}`; `409` when the lease is lost |
+//! | `POST /tasks/{id}/complete` | R0.6: settle the held lease `{worker_id, result}` → updated task record; `409` when the lease is lost |
+//! | `POST /tasks/{id}/fail` | R0.6: record a failed attempt `{worker_id, error_class, message, retryable}` → `{requeued, next_attempt_at, dead}` (backoff + jitter requeue, or dead-letter); `409` when the lease is lost |
+//! | `GET /tasks/{id}` | R0.6: the task record (404 unknown/cross-tenant) |
+//! | `GET /tasks?status=…` | R0.6: the tenant's tasks, oldest first; `status=dead` is the DLQ listing |
 //!
 //! Runs support `command.resume` (HITL), `config.recursion_limit`, the
 //! `reject` / `enqueue` multitask strategies (one active run per thread),
@@ -68,6 +75,7 @@ mod runs;
 mod server_store;
 mod sse;
 mod store;
+mod tasks;
 mod threads;
 
 use std::collections::HashMap;
@@ -82,16 +90,18 @@ pub use error::ApiError;
 pub use runs::RunStatus;
 
 /// Names the JSON-file layout already owns at the store root
-/// (`assistants/`, `crons/`, `journals/`, `threads/`, `store/`, plus the
-/// `latest` pointer file inside each thread's checkpoint dir). Client-chosen
-/// ids and tenant ids claiming one of these would write checkpoints into
-/// platform directories (or platform records into checkpoint dirs), so both
-/// `validate_client_id` and [`ServerConfig::with_tenant_key`] reject them.
+/// (`assistants/`, `crons/`, `journals/`, `store/`, `tasks/`, `threads/`,
+/// plus the `latest` pointer file inside each thread's checkpoint dir).
+/// Client-chosen ids and tenant ids claiming one of these would write
+/// checkpoints into platform directories (or platform records into
+/// checkpoint dirs), so both `validate_client_id` and
+/// [`ServerConfig::with_tenant_key`] reject them.
 pub(crate) const RESERVED_NAMES: &[&str] = &[
     "assistants",
     "crons",
     "journals",
     "store",
+    "tasks",
     "threads",
     "latest",
 ];

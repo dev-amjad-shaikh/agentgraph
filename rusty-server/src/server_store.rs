@@ -9,11 +9,13 @@
 //!   one JSON file per record under `{store_path}/{assistants,crons,threads}/`;
 //!   KV items are pure file-backed reads/writes under `{store_path}/store/`;
 //!   Flight Recorder journals are one file per run under
-//!   `{store_path}/journals/`.
+//!   `{store_path}/journals/`; durable tasks are an in-memory index persisted
+//!   as one file per task under `{store_path}/tasks/` (R0.6).
 //! - [`PostgresStore`] (feature `postgres`) — tables `server_assistants`,
-//!   `server_crons`, `server_threads`, `server_kv`, and `server_journals`
-//!   with JSONB payloads, auto-migrated on (lazy) connect. Selected via
-//!   `ServerConfig::with_postgres(url)`.
+//!   `server_crons`, `server_threads`, `server_kv`, `server_journals`, and
+//!   `server_tasks` (the R0.6 durable task queue, column-mapped for
+//!   `FOR UPDATE SKIP LOCKED` claiming), auto-migrated on (lazy) connect.
+//!   Selected via `ServerConfig::with_postgres(url)`.
 //!
 //! All trait errors are plain `String`s; routes map them to 500s — no store
 //! error is ever a client error (validation happens before the store call).
@@ -29,6 +31,7 @@ use crate::assistants::{self, AssistantRecord};
 use crate::crons::{self, CronRecord};
 use crate::journals;
 use crate::store::{self, StoreItem};
+use crate::tasks::{self, MutationOutcome, TaskRecord, TaskStatus};
 use crate::threads::{self, ThreadRecord};
 
 /// Store operation result. The `String` payload is a 500-class internal
@@ -93,6 +96,66 @@ pub(crate) trait ServerStore: Send + Sync {
     /// persisted — e.g. a queued run, or one that failed before its first
     /// checkpoint boundary).
     async fn get_journal(&self, run_id: &str) -> StoreResult<Option<JournalSnapshot>>;
+
+    // -- Durable task queue (R0.6) -------------------------------------- //
+
+    /// Enqueue a task. With an idempotency key, a live task already carrying
+    /// that key (same tenant) is returned unchanged with `deduplicated:
+    /// true` — enqueue is safe to retry. Without a key the insert always
+    /// creates (`false`).
+    async fn enqueue_task(&self, record: &TaskRecord) -> StoreResult<(TaskRecord, bool)>;
+    /// Atomically claim the oldest claimable task in `pools` for `worker_id`
+    /// (tenant-scoped): queued tasks, backoff-elapsed failed tasks, and
+    /// leased tasks past their visibility timeout. `None` when nothing is
+    /// claimable (route answers 204).
+    async fn claim_task(
+        &self,
+        tenant: &str,
+        worker_id: &str,
+        pools: &[String],
+        lease_ms: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<Option<TaskRecord>>;
+    /// Extend the lease held by `worker_id` (heartbeat).
+    async fn heartbeat_task(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        worker_id: &str,
+        lease_ms: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<MutationOutcome>;
+    /// Settle the task held by `worker_id` as completed, storing `result`.
+    async fn complete_task(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        worker_id: &str,
+        result: Value,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<MutationOutcome>;
+    /// Record a failed attempt on the task held by `worker_id`: requeue with
+    /// backoff, dead-letter, or fail outright — decided by core's shared
+    /// [`classify_retry`](rusty_agent_runtime::durable::classify_retry)
+    /// policy inside [`crate::tasks::TaskRecord::fail`].
+    async fn fail_task(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        worker_id: &str,
+        report: tasks::FailureReport,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<MutationOutcome>;
+    /// Fetch one task, tenant-scoped (`None` for unknown or cross-tenant
+    /// ids — the two are indistinguishable by design).
+    async fn get_task(&self, tenant: &str, task_id: &str) -> StoreResult<Option<TaskRecord>>;
+    /// List a tenant's tasks, optionally filtered to one status (the DLQ
+    /// listing is `status == dead`), oldest first.
+    async fn list_tasks(
+        &self,
+        tenant: &str,
+        status: Option<TaskStatus>,
+    ) -> StoreResult<Vec<TaskRecord>>;
 }
 
 // --------------------------------------------------------------------- //
@@ -112,6 +175,7 @@ pub(crate) struct JsonFileStore {
     crons: Mutex<HashMap<String, CronRecord>>,
     threads: Mutex<HashMap<String, ThreadRecord>>,
     kv_lock: Mutex<()>,
+    tasks: Mutex<HashMap<String, TaskRecord>>,
 }
 
 impl JsonFileStore {
@@ -123,6 +187,7 @@ impl JsonFileStore {
             crons: Mutex::new(crons::load(root)),
             threads: Mutex::new(threads::load(root)),
             kv_lock: Mutex::new(()),
+            tasks: Mutex::new(tasks::load(root)),
         }
     }
 }
@@ -264,6 +329,170 @@ impl ServerStore for JsonFileStore {
             .await
             .map_err(io_err("get journal"))
     }
+
+    async fn enqueue_task(&self, record: &TaskRecord) -> StoreResult<(TaskRecord, bool)> {
+        let mut map = self.tasks.lock().await;
+        if let Some(key) = &record.idempotency_key {
+            // Linear dedup scan under the index lock: correct at the file
+            // backend's scale (it backs single-binary deployments); the
+            // Postgres backend enforces this with a unique index instead.
+            if let Some(existing) = map
+                .values()
+                .find(|t| t.tenant == record.tenant && t.idempotency_key.as_deref() == Some(key))
+            {
+                return Ok((existing.clone(), true));
+            }
+        }
+        tasks::persist(&self.root, record)
+            .await
+            .map_err(io_err("persist task"))?;
+        map.insert(record.task_id.clone(), record.clone());
+        Ok((record.clone(), false))
+    }
+
+    async fn claim_task(
+        &self,
+        tenant: &str,
+        worker_id: &str,
+        pools: &[String],
+        lease_ms: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<Option<TaskRecord>> {
+        let mut map = self.tasks.lock().await;
+        // The whole claim (pick + mutate + persist) runs under the one
+        // index lock, so two concurrent claims can never take the same
+        // task — the file backend's SKIP LOCKED equivalent.
+        let candidate = map
+            .values()
+            .filter(|t| {
+                t.tenant == tenant && pools.iter().any(|p| p == &t.pool) && t.claimable_at(now)
+            })
+            .min_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| a.task_id.cmp(&b.task_id))
+            })
+            .map(|t| t.task_id.clone());
+        let Some(task_id) = candidate else {
+            return Ok(None);
+        };
+        let mut task = map
+            .get(&task_id)
+            .cloned()
+            .expect("claim candidate came from the task index");
+        task.claim(worker_id, lease_ms, now);
+        tasks::persist(&self.root, &task)
+            .await
+            .map_err(io_err("persist task"))?;
+        map.insert(task_id, task.clone());
+        Ok(Some(task))
+    }
+
+    async fn heartbeat_task(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        worker_id: &str,
+        lease_ms: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<MutationOutcome> {
+        self.mutate_task(tenant, task_id, worker_id, |task| {
+            task.renew_lease(lease_ms, now);
+        })
+        .await
+    }
+
+    async fn complete_task(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        worker_id: &str,
+        result: Value,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<MutationOutcome> {
+        self.mutate_task(tenant, task_id, worker_id, |task| {
+            task.complete(result, now);
+        })
+        .await
+    }
+
+    async fn fail_task(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        worker_id: &str,
+        report: tasks::FailureReport,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<MutationOutcome> {
+        self.mutate_task(tenant, task_id, worker_id, |task| {
+            task.fail(report.error_class, &report.message, report.retryable, now);
+        })
+        .await
+    }
+
+    async fn get_task(&self, tenant: &str, task_id: &str) -> StoreResult<Option<TaskRecord>> {
+        Ok(self
+            .tasks
+            .lock()
+            .await
+            .get(task_id)
+            .filter(|t| t.tenant == tenant)
+            .cloned())
+    }
+
+    async fn list_tasks(
+        &self,
+        tenant: &str,
+        status: Option<TaskStatus>,
+    ) -> StoreResult<Vec<TaskRecord>> {
+        let mut tasks: Vec<TaskRecord> = self
+            .tasks
+            .lock()
+            .await
+            .values()
+            .filter(|t| t.tenant == tenant && status.is_none_or(|s| t.status == s))
+            .cloned()
+            .collect();
+        tasks.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.task_id.cmp(&b.task_id))
+        });
+        Ok(tasks)
+    }
+}
+
+impl JsonFileStore {
+    /// Shared skeleton of the lease-guarded task mutations (heartbeat /
+    /// complete / fail): resolve tenant-scoped, check the lease, mutate a
+    /// copy, persist, then swap the index. Persisting before the swap keeps
+    /// a failed write from leaving state a restart would silently rewind.
+    async fn mutate_task(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        worker_id: &str,
+        mutate: impl FnOnce(&mut TaskRecord),
+    ) -> StoreResult<MutationOutcome> {
+        let mut map = self.tasks.lock().await;
+        let Some(current) = map.get(task_id) else {
+            return Ok(MutationOutcome::Unknown);
+        };
+        // Cross-tenant ids are indistinguishable from unknown ones (404).
+        if current.tenant != tenant {
+            return Ok(MutationOutcome::Unknown);
+        }
+        if !current.leased_to(worker_id) {
+            return Ok(MutationOutcome::LeaseLost);
+        }
+        let mut task = current.clone();
+        mutate(&mut task);
+        tasks::persist(&self.root, &task)
+            .await
+            .map_err(io_err("persist task"))?;
+        map.insert(task_id.to_string(), task.clone());
+        Ok(MutationOutcome::Applied(Box::new(task)))
+    }
 }
 
 // --------------------------------------------------------------------- //
@@ -282,6 +511,7 @@ mod postgres {
     use crate::assistants::AssistantRecord;
     use crate::crons::CronRecord;
     use crate::store::StoreItem;
+    use crate::tasks::{self, MutationOutcome, TaskLease, TaskRecord, TaskStatus};
     use crate::threads::ThreadRecord;
 
     // -- Schema (auto-migrated on connect) ------------------------------ //
@@ -333,6 +563,46 @@ mod postgres {
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )";
 
+    /// `server_tasks`: the durable task queue (R0.6). Unlike the record
+    /// tables above this one is column-mapped, not JSONB-payloaded: claiming
+    /// filters and locks on `status` / `pool` / lease columns, so they must
+    /// be real columns. `status` spells [`crate::tasks::TaskStatus::as_str`].
+    pub(crate) const CREATE_TASKS_SQL: &str = "
+        CREATE TABLE IF NOT EXISTS server_tasks (
+            task_id          TEXT PRIMARY KEY,
+            tenant           TEXT NOT NULL,
+            kind             TEXT NOT NULL,
+            payload          JSONB NOT NULL,
+            pool             TEXT NOT NULL,
+            status           TEXT NOT NULL,
+            lease_owner      TEXT,
+            lease_expires_at TIMESTAMPTZ,
+            attempt          INTEGER NOT NULL,
+            max_attempts     INTEGER NOT NULL,
+            error_class      TEXT,
+            effect           TEXT,
+            last_error       TEXT,
+            idempotency_key  TEXT,
+            result           JSONB,
+            run_id           TEXT,
+            thread_id        TEXT,
+            next_attempt_at  TIMESTAMPTZ,
+            created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+        )";
+
+    /// Enqueue dedup: at most one live task per (tenant, idempotency_key).
+    /// Partial — keyless tasks (NULLs) never conflict.
+    pub(crate) const CREATE_TASKS_IDEMPOTENCY_INDEX_SQL: &str = "
+        CREATE UNIQUE INDEX IF NOT EXISTS server_tasks_idempotency_unique
+            ON server_tasks (tenant, idempotency_key)
+            WHERE idempotency_key IS NOT NULL";
+
+    /// Claim scans filter on exactly these three columns.
+    pub(crate) const CREATE_TASKS_CLAIMABLE_INDEX_SQL: &str = "
+        CREATE INDEX IF NOT EXISTS server_tasks_claimable
+            ON server_tasks (tenant, pool, status)";
+
     /// All idempotent migration statements, executed in order on connect.
     pub(crate) const MIGRATION_SQL: &[&str] = &[
         CREATE_ASSISTANTS_SQL,
@@ -340,6 +610,9 @@ mod postgres {
         CREATE_THREADS_SQL,
         CREATE_KV_SQL,
         CREATE_JOURNALS_SQL,
+        CREATE_TASKS_SQL,
+        CREATE_TASKS_IDEMPOTENCY_INDEX_SQL,
+        CREATE_TASKS_CLAIMABLE_INDEX_SQL,
     ];
 
     /// Transaction-scoped advisory lock key serializing concurrent
@@ -426,6 +699,126 @@ mod postgres {
     pub(crate) const SELECT_JOURNAL_SQL: &str =
         "SELECT payload FROM server_journals WHERE run_id = $1";
 
+    // -- Task queue statements (R0.6) ------------------------------------ //
+
+    /// Insert-only enqueue; `ON CONFLICT DO NOTHING` absorbs both the
+    /// (effectively impossible) task-id collision and the idempotency-key
+    /// dedup — a no-row result with a key set means *deduplicated*.
+    pub(crate) const INSERT_TASK_SQL: &str = "
+        INSERT INTO server_tasks (
+            task_id, tenant, kind, payload, pool, status,
+            attempt, max_attempts, error_class, effect, idempotency_key,
+            run_id, thread_id, next_attempt_at, created_at, updated_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, 'queued', 0, $6, NULL, $7, $8, $9, $10, NULL, $11, $11
+        )
+        ON CONFLICT DO NOTHING
+        RETURNING task_id";
+
+    /// The dedup read-back after an absorbed idempotency conflict.
+    pub(crate) const SELECT_TASK_BY_IDEMPOTENCY_SQL: &str = "
+        SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
+            attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
+            run_id, thread_id, next_attempt_at, created_at, updated_at
+        FROM server_tasks
+        WHERE tenant = $1 AND idempotency_key = $2";
+
+    /// Claim candidate selection, run inside a transaction: `FOR UPDATE
+    /// SKIP LOCKED` makes concurrent workers take distinct tasks without
+    /// blocking each other. Claimable = queued, backoff-elapsed failed, or
+    /// leased past its visibility timeout.
+    pub(crate) const CLAIM_SELECT_SQL: &str = "
+        SELECT task_id, attempt FROM server_tasks
+        WHERE tenant = $1
+          AND pool = ANY($2)
+          AND (
+              (status IN ('queued', 'failed')
+                  AND (next_attempt_at IS NULL OR next_attempt_at <= $3))
+              OR (status = 'leased' AND lease_expires_at <= $3)
+          )
+        ORDER BY created_at, task_id
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED";
+
+    /// The claim itself, applied to the row locked by [`CLAIM_SELECT_SQL`]
+    /// in the same transaction.
+    pub(crate) const CLAIM_UPDATE_SQL: &str = "
+        UPDATE server_tasks
+        SET lease_owner = $2, lease_expires_at = $3, attempt = $4,
+            status = 'leased', next_attempt_at = NULL, updated_at = $5
+        WHERE task_id = $1
+        RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
+            attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
+            run_id, thread_id, next_attempt_at, created_at, updated_at";
+
+    /// Heartbeat: extends the lease only while the caller holds it. No row
+    /// means unknown/cross-tenant (404) or lease lost (409), distinguished
+    /// by [`TASK_EXISTS_SQL`].
+    pub(crate) const HEARTBEAT_TASK_SQL: &str = "
+        UPDATE server_tasks
+        SET lease_expires_at = $4, updated_at = $5
+        WHERE task_id = $1 AND tenant = $2 AND lease_owner = $3 AND status = 'leased'
+        RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
+            attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
+            run_id, thread_id, next_attempt_at, created_at, updated_at";
+
+    /// Complete: settle only the caller's own lease.
+    pub(crate) const COMPLETE_TASK_SQL: &str = "
+        UPDATE server_tasks
+        SET status = 'completed', result = $4, lease_owner = NULL,
+            lease_expires_at = NULL, next_attempt_at = NULL, updated_at = $5
+        WHERE task_id = $1 AND tenant = $2 AND lease_owner = $3 AND status = 'leased'
+        RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
+            attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
+            run_id, thread_id, next_attempt_at, created_at, updated_at";
+
+    /// Fail, step 1: lock the row (the requeue-vs-dead decision needs the
+    /// current attempt count, and concurrent settlement must serialize).
+    pub(crate) const FAIL_SELECT_SQL: &str = "
+        SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
+            attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
+            run_id, thread_id, next_attempt_at, created_at, updated_at
+        FROM server_tasks
+        WHERE task_id = $1 AND tenant = $2
+        FOR UPDATE";
+
+    /// Fail, step 2: apply the decision computed in Rust
+    /// ([`crate::tasks::TaskRecord::fail`]) to the locked row.
+    pub(crate) const FAIL_UPDATE_SQL: &str = "
+        UPDATE server_tasks
+        SET status = $2, error_class = $3, last_error = $4,
+            lease_owner = NULL, lease_expires_at = NULL,
+            next_attempt_at = $5, updated_at = $6
+        WHERE task_id = $1
+        RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
+            attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
+            run_id, thread_id, next_attempt_at, created_at, updated_at";
+
+    /// Tenant-scoped existence probe distinguishing 404 from 409 after a
+    /// lease-guarded update matched no row.
+    pub(crate) const TASK_EXISTS_SQL: &str =
+        "SELECT task_id FROM server_tasks WHERE task_id = $1 AND tenant = $2";
+
+    pub(crate) const SELECT_TASK_SQL: &str =
+        "SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
+            attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
+            run_id, thread_id, next_attempt_at, created_at, updated_at
+        FROM server_tasks WHERE task_id = $1 AND tenant = $2";
+
+    pub(crate) const LIST_TASKS_SQL: &str = "
+        SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
+            attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
+            run_id, thread_id, next_attempt_at, created_at, updated_at
+        FROM server_tasks
+        WHERE tenant = $1 ORDER BY created_at, task_id";
+
+    pub(crate) const LIST_TASKS_BY_STATUS_SQL: &str = "
+        SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
+            attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
+            run_id, thread_id, next_attempt_at, created_at, updated_at
+        FROM server_tasks
+        WHERE tenant = $1 AND status = $2 ORDER BY created_at, task_id";
+
     // -- Row <-> record mapping (unit-tested without a database) -------- //
 
     /// Serialize a record for the JSONB `payload` column.
@@ -456,6 +849,61 @@ mod postgres {
             created_at,
             updated_at,
         }
+    }
+
+    /// Assemble a [`TaskRecord`] from one `server_tasks` row (name-based, so
+    /// additive columns never break the mapping). A corrupt `status` or a
+    /// negative attempt count is a store error, not a panic — the same
+    /// discipline as `record_from_payload`.
+    pub(crate) fn task_from_row(row: &sqlx::postgres::PgRow) -> StoreResult<TaskRecord> {
+        let status_raw: String = row.get("status");
+        let status = TaskStatus::parse(&status_raw)
+            .ok_or_else(|| format!("corrupt task status `{status_raw}`"))?;
+        let attempt = u32::try_from(row.get::<i32, _>("attempt"))
+            .map_err(|_| "corrupt task attempt (negative)".to_string())?;
+        let max_attempts = u32::try_from(row.get::<i32, _>("max_attempts"))
+            .map_err(|_| "corrupt task max_attempts (negative)".to_string())?;
+        let lease = match (
+            row.get::<Option<String>, _>("lease_owner"),
+            row.get::<Option<DateTime<Utc>>, _>("lease_expires_at"),
+        ) {
+            (Some(owner), Some(expires_at)) => Some(TaskLease { owner, expires_at }),
+            _ => None,
+        };
+        let error_class = row
+            .get::<Option<String>, _>("error_class")
+            .map(|raw| {
+                tasks::parse_error_class(&raw)
+                    .map_err(|_| format!("corrupt task error_class `{raw}`"))
+            })
+            .transpose()?;
+        let effect = row
+            .get::<Option<String>, _>("effect")
+            .map(|raw| {
+                tasks::parse_effect(&raw).map_err(|_| format!("corrupt task effect `{raw}`"))
+            })
+            .transpose()?;
+        Ok(TaskRecord {
+            task_id: row.get("task_id"),
+            tenant: row.get("tenant"),
+            kind: row.get("kind"),
+            payload: row.get("payload"),
+            pool: row.get("pool"),
+            status,
+            attempt,
+            max_attempts,
+            lease,
+            error_class,
+            effect,
+            last_error: row.get("last_error"),
+            idempotency_key: row.get("idempotency_key"),
+            result: row.get("result"),
+            run_id: row.get("run_id"),
+            thread_id: row.get("thread_id"),
+            next_attempt_at: row.get("next_attempt_at"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+        })
     }
 
     fn db_err(context: &str) -> impl Fn(sqlx::Error) -> String + '_ {
@@ -719,6 +1167,230 @@ mod postgres {
             row.map(|r| record_from_payload("journal", r.get::<Value, _>("payload")))
                 .transpose()
         }
+
+        async fn enqueue_task(&self, record: &TaskRecord) -> StoreResult<(TaskRecord, bool)> {
+            let row = sqlx::query(INSERT_TASK_SQL)
+                .bind(&record.task_id)
+                .bind(&record.tenant)
+                .bind(&record.kind)
+                .bind(&record.payload)
+                .bind(&record.pool)
+                .bind(record.max_attempts as i32)
+                .bind(record.effect.map(tasks::effect_name))
+                .bind(&record.idempotency_key)
+                .bind(&record.run_id)
+                .bind(&record.thread_id)
+                .bind(record.created_at)
+                .fetch_optional(self.pool().await?)
+                .await
+                .map_err(db_err("enqueue task"))?;
+            if row.is_some() {
+                return Ok((record.clone(), false));
+            }
+            // The insert was absorbed by a conflict. With an idempotency key
+            // that is the dedup path: the live task carrying the key wins.
+            let Some(key) = &record.idempotency_key else {
+                return Err(format!(
+                    "task id `{}` collided with an existing task",
+                    record.task_id
+                ));
+            };
+            let existing = sqlx::query(SELECT_TASK_BY_IDEMPOTENCY_SQL)
+                .bind(&record.tenant)
+                .bind(key)
+                .fetch_optional(self.pool().await?)
+                .await
+                .map_err(db_err("enqueue task dedup lookup"))?;
+            match existing {
+                Some(row) => Ok((task_from_row(&row)?, true)),
+                None => Err(format!(
+                    "task insert for idempotency key `{key}` conflicted but no live task carries it"
+                )),
+            }
+        }
+
+        async fn claim_task(
+            &self,
+            tenant: &str,
+            worker_id: &str,
+            pools: &[String],
+            lease_ms: u64,
+            now: DateTime<Utc>,
+        ) -> StoreResult<Option<TaskRecord>> {
+            let pool = self.pool().await?;
+            // Lock-and-update in one transaction: SKIP LOCKED lets
+            // concurrent workers claim distinct tasks; the row lock holds
+            // until the claim commits, so no two workers ever take one task.
+            let mut tx = pool.begin().await.map_err(db_err("claim task"))?;
+            let candidate = sqlx::query(CLAIM_SELECT_SQL)
+                .bind(tenant)
+                .bind(pools.to_vec())
+                .bind(now)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err("claim task"))?;
+            let Some(candidate) = candidate else {
+                tx.rollback().await.map_err(db_err("claim task"))?;
+                return Ok(None);
+            };
+            let expires_at =
+                now + chrono::Duration::milliseconds(lease_ms.min(i64::MAX as u64) as i64);
+            let updated = sqlx::query(CLAIM_UPDATE_SQL)
+                .bind(candidate.get::<String, _>("task_id"))
+                .bind(worker_id)
+                .bind(expires_at)
+                .bind(candidate.get::<i32, _>("attempt") + 1)
+                .bind(now)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db_err("claim task"))?;
+            tx.commit().await.map_err(db_err("claim task"))?;
+            Ok(Some(task_from_row(&updated)?))
+        }
+
+        async fn heartbeat_task(
+            &self,
+            tenant: &str,
+            task_id: &str,
+            worker_id: &str,
+            lease_ms: u64,
+            now: DateTime<Utc>,
+        ) -> StoreResult<MutationOutcome> {
+            let expires_at =
+                now + chrono::Duration::milliseconds(lease_ms.min(i64::MAX as u64) as i64);
+            let updated = sqlx::query(HEARTBEAT_TASK_SQL)
+                .bind(task_id)
+                .bind(tenant)
+                .bind(worker_id)
+                .bind(expires_at)
+                .bind(now)
+                .fetch_optional(self.pool().await?)
+                .await
+                .map_err(db_err("heartbeat task"))?;
+            self.lease_outcome(tenant, task_id, updated).await
+        }
+
+        async fn complete_task(
+            &self,
+            tenant: &str,
+            task_id: &str,
+            worker_id: &str,
+            result: Value,
+            now: DateTime<Utc>,
+        ) -> StoreResult<MutationOutcome> {
+            let updated = sqlx::query(COMPLETE_TASK_SQL)
+                .bind(task_id)
+                .bind(tenant)
+                .bind(worker_id)
+                .bind(result)
+                .bind(now)
+                .fetch_optional(self.pool().await?)
+                .await
+                .map_err(db_err("complete task"))?;
+            self.lease_outcome(tenant, task_id, updated).await
+        }
+
+        async fn fail_task(
+            &self,
+            tenant: &str,
+            task_id: &str,
+            worker_id: &str,
+            report: tasks::FailureReport,
+            now: DateTime<Utc>,
+        ) -> StoreResult<MutationOutcome> {
+            let pool = self.pool().await?;
+            let mut tx = pool.begin().await.map_err(db_err("fail task"))?;
+            let locked = sqlx::query(FAIL_SELECT_SQL)
+                .bind(task_id)
+                .bind(tenant)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err("fail task"))?;
+            let Some(locked) = locked else {
+                tx.rollback().await.map_err(db_err("fail task"))?;
+                return Ok(MutationOutcome::Unknown);
+            };
+            let mut task = task_from_row(&locked)?;
+            if !task.leased_to(worker_id) {
+                tx.rollback().await.map_err(db_err("fail task"))?;
+                return Ok(MutationOutcome::LeaseLost);
+            }
+            // Retry / dead-letter / fail-outright, computed by the same
+            // record logic the file backend runs — core's shared
+            // `classify_retry` (one decision, one test surface).
+            task.fail(report.error_class, &report.message, report.retryable, now);
+            sqlx::query(FAIL_UPDATE_SQL)
+                .bind(&task.task_id)
+                .bind(task.status.as_str())
+                .bind(task.error_class.map(tasks::error_class_name))
+                .bind(&task.last_error)
+                .bind(task.next_attempt_at)
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err("fail task"))?;
+            tx.commit().await.map_err(db_err("fail task"))?;
+            Ok(MutationOutcome::Applied(task))
+        }
+
+        async fn get_task(&self, tenant: &str, task_id: &str) -> StoreResult<Option<TaskRecord>> {
+            let row = sqlx::query(SELECT_TASK_SQL)
+                .bind(task_id)
+                .bind(tenant)
+                .fetch_optional(self.pool().await?)
+                .await
+                .map_err(db_err("get task"))?;
+            row.as_ref().map(task_from_row).transpose()
+        }
+
+        async fn list_tasks(
+            &self,
+            tenant: &str,
+            status: Option<TaskStatus>,
+        ) -> StoreResult<Vec<TaskRecord>> {
+            let rows = match status {
+                Some(status) => sqlx::query(LIST_TASKS_BY_STATUS_SQL)
+                    .bind(tenant)
+                    .bind(status.as_str())
+                    .fetch_all(self.pool().await?)
+                    .await
+                    .map_err(db_err("list tasks"))?,
+                None => sqlx::query(LIST_TASKS_SQL)
+                    .bind(tenant)
+                    .fetch_all(self.pool().await?)
+                    .await
+                    .map_err(db_err("list tasks"))?,
+            };
+            rows.iter().map(task_from_row).collect()
+        }
+    }
+
+    impl PostgresStore {
+        /// Map a lease-guarded update's outcome: the updated row means
+        /// applied; no row means either the task is unknown to this tenant
+        /// (404) or the lease check failed (409) — the existence probe
+        /// decides.
+        async fn lease_outcome(
+            &self,
+            tenant: &str,
+            task_id: &str,
+            updated: Option<sqlx::postgres::PgRow>,
+        ) -> StoreResult<MutationOutcome> {
+            if let Some(row) = updated {
+                return Ok(MutationOutcome::Applied(task_from_row(&row)?));
+            }
+            let exists = sqlx::query(TASK_EXISTS_SQL)
+                .bind(task_id)
+                .bind(tenant)
+                .fetch_optional(self.pool().await?)
+                .await
+                .map_err(db_err("task existence probe"))?;
+            Ok(if exists.is_some() {
+                MutationOutcome::LeaseLost
+            } else {
+                MutationOutcome::Unknown
+            })
+        }
     }
 
     /// Lazily-connecting [`Checkpointer`] facade over core's
@@ -808,10 +1480,10 @@ mod postgres {
 
         #[test]
         fn migration_sql_creates_all_tables_idempotently() {
-            assert_eq!(MIGRATION_SQL.len(), 5);
+            assert_eq!(MIGRATION_SQL.len(), 8);
             for stmt in MIGRATION_SQL {
                 assert!(
-                    stmt.contains("CREATE TABLE IF NOT EXISTS"),
+                    stmt.contains("IF NOT EXISTS"),
                     "migration must be idempotent: {stmt}"
                 );
             }
@@ -827,6 +1499,56 @@ mod postgres {
             assert!(CREATE_JOURNALS_SQL.contains("server_journals"));
             assert!(CREATE_JOURNALS_SQL.contains("JSONB"));
             assert!(CREATE_JOURNALS_SQL.contains("TEXT PRIMARY KEY"));
+            assert!(CREATE_TASKS_SQL.contains("server_tasks"));
+            assert!(CREATE_TASKS_SQL.contains("TEXT PRIMARY KEY"));
+            assert!(CREATE_TASKS_IDEMPOTENCY_INDEX_SQL.contains("CREATE UNIQUE INDEX"));
+            assert!(CREATE_TASKS_CLAIMABLE_INDEX_SQL.contains("CREATE INDEX"));
+        }
+
+        #[test]
+        fn tasks_schema_has_claim_columns_and_scoped_idempotency() {
+            // Claiming filters and locks on real columns (not JSONB).
+            for col in [
+                "tenant",
+                "pool",
+                "status",
+                "lease_owner",
+                "lease_expires_at",
+                "next_attempt_at",
+                "attempt",
+                "max_attempts",
+                "effect",
+            ] {
+                assert!(CREATE_TASKS_SQL.contains(col), "missing column {col}");
+            }
+            // Dedup is per tenant and partial: keyless tasks never conflict.
+            assert!(CREATE_TASKS_IDEMPOTENCY_INDEX_SQL.contains("(tenant, idempotency_key)"));
+            assert!(
+                CREATE_TASKS_IDEMPOTENCY_INDEX_SQL.contains("WHERE idempotency_key IS NOT NULL")
+            );
+        }
+
+        #[test]
+        fn claim_sql_locks_and_skips_locked_rows() {
+            assert!(CLAIM_SELECT_SQL.contains("FOR UPDATE SKIP LOCKED"));
+            assert!(CLAIM_SELECT_SQL.contains("pool = ANY($2)"));
+            assert!(CLAIM_SELECT_SQL.contains("status IN ('queued', 'failed')"));
+            assert!(CLAIM_SELECT_SQL.contains("status = 'leased'"));
+            assert!(CLAIM_SELECT_SQL.contains("lease_expires_at <= $3"));
+            assert!(CLAIM_UPDATE_SQL.contains("status = 'leased'"));
+            assert!(CLAIM_UPDATE_SQL.contains("next_attempt_at = NULL"));
+        }
+
+        #[test]
+        fn lease_guarded_updates_check_owner_tenant_and_leased_status() {
+            for sql in [HEARTBEAT_TASK_SQL, COMPLETE_TASK_SQL] {
+                assert!(sql.contains("task_id = $1 AND tenant = $2 AND lease_owner = $3"));
+                assert!(sql.contains("status = 'leased'"));
+            }
+            // Fail locks the row first: the attempt count read and the
+            // requeue/dead write must serialize against other settlers.
+            assert!(FAIL_SELECT_SQL.contains("FOR UPDATE"));
+            assert!(FAIL_UPDATE_SQL.contains("lease_owner = NULL"));
         }
 
         #[test]

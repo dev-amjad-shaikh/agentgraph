@@ -1,0 +1,315 @@
+//! Live-Postgres integration tests for the durable task queue: the
+//! `/tasks` surface over the `server_tasks` table — auto-migration, the
+//! enqueue dedup unique index, `FOR UPDATE SKIP LOCKED` claiming under
+//! concurrency, lease reclaim, retry / dead-letter, and tenant isolation.
+//!
+//! Gated two ways — none of this runs in the default test suite:
+//!
+//! 1. compile-time: the whole file is `cfg(feature = "postgres")`;
+//! 2. run-time: every test is `#[ignore]` and requires `DATABASE_URL`.
+//!
+//! Run them with:
+//!
+//! ```bash
+//! DATABASE_URL=postgres://user:pass@localhost/rusty_test \
+//!   cargo test --features postgres --test postgres_tasks -- --ignored
+//! ```
+
+#![cfg(feature = "postgres")]
+
+use std::path::PathBuf;
+
+use axum::body::{to_bytes, Body, Bytes};
+use axum::http::{Request, StatusCode};
+use axum::Router;
+use rusty_server::{router, GraphRegistry, ServerConfig};
+use serde_json::{json, Value};
+use tower::ServiceExt;
+
+/// The database these tests run against; panics with guidance when unset.
+fn database_url() -> String {
+    std::env::var("DATABASE_URL").expect(
+        "DATABASE_URL must point at a scratch Postgres database \
+         (e.g. postgres://user:pass@localhost/rusty_test)",
+    )
+}
+
+/// An app whose server store (including `server_tasks`) is Postgres-backed.
+fn postgres_app() -> Router {
+    let store_path: PathBuf =
+        std::env::temp_dir().join(format!("rusty-server-pg-tasks-{}", uuid::Uuid::new_v4()));
+    let config =
+        ServerConfig::new("127.0.0.1:0".parse().unwrap(), store_path).with_postgres(database_url());
+    router(GraphRegistry::new(), config)
+}
+
+/// Two-tenant Postgres app for the isolation test.
+fn postgres_tenant_app() -> Router {
+    let store_path: PathBuf =
+        std::env::temp_dir().join(format!("rusty-server-pg-tasks-{}", uuid::Uuid::new_v4()));
+    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap(), store_path)
+        .with_postgres(database_url())
+        .with_tenant_key("acme", "acme-secret")
+        .with_tenant_key("globex", "globex-secret");
+    router(GraphRegistry::new(), config)
+}
+
+/// Send a request; returns `(status, json-body-or-null)`.
+async fn call(app: &Router, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
+    call_as(app, None, method, uri, body).await
+}
+
+/// Send a request with an optional auth header.
+async fn call_as(
+    app: &Router,
+    auth: Option<(&str, &str)>,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some((k, v)) = auth {
+        builder = builder.header(k, v);
+    }
+    let body = match body {
+        Some(v) => {
+            builder = builder.header("content-type", "application/json");
+            Body::from(v.to_string())
+        }
+        None => Body::empty(),
+    };
+    let response = app
+        .clone()
+        .oneshot(builder.body(body).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes: Bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, value)
+}
+
+/// Unique fragment so repeated runs against a shared scratch database
+/// never collide.
+fn uniq() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres (DATABASE_URL)"]
+async fn postgres_task_lifecycle_and_dedup() {
+    let app = postgres_app();
+    let key = format!("charge-{}", uniq());
+
+    // Enqueue with an idempotency key and a declared effect.
+    let (status, v) = call(
+        &app,
+        "POST",
+        "/tasks",
+        Some(json!({
+            "kind": "charge_card",
+            "payload": {"amount": 100},
+            "idempotency_key": key,
+            "effect": "idempotent",
+            "max_attempts": 2,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "enqueue failed: {v}");
+    let task_id = v["task_id"].as_str().unwrap().to_string();
+
+    // The partial unique index dedups the retry, returning the same row.
+    let (status, v) = call(
+        &app,
+        "POST",
+        "/tasks",
+        Some(json!({"kind": "charge_card", "payload": {"amount": 100},
+                    "idempotency_key": key})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "dedup enqueue failed: {v}");
+    assert_eq!(v["task_id"], json!(task_id));
+    assert_eq!(v["deduplicated"], json!(true));
+
+    // Claim → heartbeat → fail (retryable, budget left) → requeued.
+    let (status, v) = call(
+        &app,
+        "POST",
+        "/tasks/claim",
+        Some(json!({"worker_id": "pg-worker", "lease_ms": 60_000})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "claim failed: {v}");
+    assert_eq!(v["task"]["task_id"], json!(task_id));
+    assert_eq!(v["task"]["attempt"], json!(1));
+    assert_eq!(v["task"]["effect"], json!("idempotent"));
+    assert_eq!(v["task"]["max_attempts"], json!(2));
+
+    let (status, v) = call(
+        &app,
+        "POST",
+        &format!("/tasks/{task_id}/heartbeat"),
+        Some(json!({"worker_id": "pg-worker", "lease_ms": 60_000})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "heartbeat failed: {v}");
+    assert!(v["lease_expires_at"].is_string());
+
+    let (status, v) = call(
+        &app,
+        "POST",
+        &format!("/tasks/{task_id}/fail"),
+        Some(
+            json!({"worker_id": "pg-worker", "error_class": "rate_limited",
+                    "message": "429", "retryable": true}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "fail failed: {v}");
+    assert_eq!(v["requeued"], json!(true));
+    assert_eq!(v["dead"], json!(false));
+
+    // Attempt 2 (after the ≤1s first-retry backoff) dead-letters at the
+    // budget; the DLQ listing comes out of Postgres with the evidence.
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    let (status, v) = call(
+        &app,
+        "POST",
+        "/tasks/claim",
+        Some(json!({"worker_id": "pg-worker-2", "lease_ms": 60_000})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "re-claim failed: {v}");
+    assert_eq!(v["task"]["attempt"], json!(2));
+    assert_eq!(v["task"]["error_class"], json!("rate_limited"));
+
+    let (status, v) = call(
+        &app,
+        "POST",
+        &format!("/tasks/{task_id}/fail"),
+        Some(
+            json!({"worker_id": "pg-worker-2", "error_class": "rate_limited",
+                    "message": "429 again", "retryable": true}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["dead"], json!(true));
+
+    let (status, v) = call(&app, "GET", "/tasks?status=dead", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let entry = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["task_id"] == json!(task_id))
+        .expect("dead-lettered task missing from the DLQ");
+    assert_eq!(entry["error_class"], json!("rate_limited"));
+    assert_eq!(entry["last_error"], json!("429 again"));
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres (DATABASE_URL)"]
+async fn postgres_concurrent_claims_hand_one_task_to_one_worker() {
+    let app = postgres_app();
+    let (status, v) = call(
+        &app,
+        "POST",
+        "/tasks",
+        Some(json!({"kind": "solo", "payload": {}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "enqueue failed: {v}");
+
+    // Eight workers race one task: SKIP LOCKED hands it to exactly one.
+    let claims: Vec<_> = (0..8)
+        .map(|i| {
+            let app = app.clone();
+            async move {
+                call(
+                    &app,
+                    "POST",
+                    "/tasks/claim",
+                    Some(json!({"worker_id": format!("racer-{i}"), "lease_ms": 60_000})),
+                )
+                .await
+            }
+        })
+        .collect();
+    let outcomes = futures::future::join_all(claims).await;
+    let winners: Vec<&(StatusCode, Value)> = outcomes
+        .iter()
+        .filter(|(status, _)| *status == StatusCode::OK)
+        .collect();
+    let losers = outcomes
+        .iter()
+        .filter(|(status, _)| *status == StatusCode::NO_CONTENT)
+        .count();
+    assert_eq!(winners.len(), 1, "exactly one claim may win: {outcomes:?}");
+    assert_eq!(losers, 7);
+    assert_eq!(winners[0].1["task"]["attempt"], json!(1));
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres (DATABASE_URL)"]
+async fn postgres_lease_expiry_reclaims_and_tenants_are_isolated() {
+    let app = postgres_tenant_app();
+
+    let (status, v) = call_as(
+        &app,
+        Some(("x-api-key", "acme-secret")),
+        "POST",
+        "/tasks",
+        Some(json!({"kind": "k", "payload": {}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "acme enqueue failed: {v}");
+    let task_id = v["task_id"].as_str().unwrap().to_string();
+
+    // Acme worker takes a 100 ms lease; globex sees nothing meanwhile.
+    let (status, _) = call_as(
+        &app,
+        Some(("x-api-key", "acme-secret")),
+        "POST",
+        "/tasks/claim",
+        Some(json!({"worker_id": "a", "lease_ms": 100})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call_as(
+        &app,
+        Some(("x-api-key", "globex-secret")),
+        "GET",
+        &format!("/tasks/{task_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // The expired lease is reclaimable as attempt 2; the lost holder 409s.
+    let (status, v) = call_as(
+        &app,
+        Some(("x-api-key", "acme-secret")),
+        "POST",
+        "/tasks/claim",
+        Some(json!({"worker_id": "b", "lease_ms": 60_000})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "reclaim failed: {v}");
+    assert_eq!(v["task"]["attempt"], json!(2));
+    let (status, _) = call_as(
+        &app,
+        Some(("x-api-key", "acme-secret")),
+        "POST",
+        &format!("/tasks/{task_id}/complete"),
+        Some(json!({"worker_id": "a", "result": null})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}

@@ -58,6 +58,17 @@
 //! node whose transient failures should be retried must therefore rely on
 //! transport-level retry (connection/timeout/5xx on the client) or surface
 //! retryable outcomes through its own protocol on top of `extra`.
+//!
+//! ## Durable activities (R0.6)
+//!
+//! [`ActivityWorker`] is the pull-based counterpart to [`serve`]: it claims
+//! leased tasks (`kind` + JSON `payload`) from the rusty-server task queue
+//! (`POST /tasks/claim`), executes the [`activity::Activity`] registered for
+//! the task's kind while a background heartbeat renews the lease every
+//! `lease / 3`, and settles with `complete` or a classified `fail`. Lease
+//! loss (`409`) aborts the activity via a `CancellationToken`, and
+//! cancelling the shutdown token drains in-flight work before exit. See the
+//! [`activity`] module for the protocol and semantics.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -74,6 +85,10 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tracing::Instrument;
 use uuid::Uuid;
+
+pub mod activity;
+
+pub use activity::{Activity, ActivityContext, ActivityWorker};
 
 /// The registry of named node handlers a worker serves.
 ///
