@@ -24,7 +24,7 @@ jobs:
           - { dir: rusty-worker, pkg: rusty-worker }
           - { dir: rusty-otel, pkg: rusty-otel }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust (stable + rustfmt + clippy)
         uses: dtolnay/rust-toolchain@stable
@@ -71,7 +71,7 @@ jobs:
           - { dir: rusty-worker, pkg: rusty-worker }
           - { dir: rusty-otel, pkg: rusty-otel }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Uses the runner's preinstalled cargo; runs before any toolchain setup.
       - name: Read effective rust-version via cargo metadata
@@ -106,7 +106,7 @@ jobs:
     name: audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@v2
@@ -124,7 +124,7 @@ jobs:
     name: python
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -155,7 +155,7 @@ jobs:
     name: typescript
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
