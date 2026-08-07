@@ -23,7 +23,12 @@ use rusty_agent_runtime::prelude::*;
 const SIZES: [usize; 3] = [1_024, 102_400, 1_048_576];
 
 fn make_checkpoint(bytes: usize, step: usize) -> Checkpoint {
-    Checkpoint::new("bench-thread", step, state_sized(bytes), vec!["next".into()])
+    Checkpoint::new(
+        "bench-thread",
+        step,
+        state_sized(bytes),
+        vec!["next".into()],
+    )
 }
 
 fn bench_serialize(c: &mut Criterion) {

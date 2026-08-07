@@ -43,12 +43,7 @@ fn bench_interrupt_resume(c: &mut Criterion) {
                         rt.block_on(async {
                             // Phase 1: suspend at `human`.
                             let outcome = executor
-                                .run(
-                                    &graph,
-                                    &spec,
-                                    initial.clone(),
-                                    RunConfig::new("bench-hitl"),
-                                )
+                                .run(&graph, &spec, initial.clone(), RunConfig::new("bench-hitl"))
                                 .await
                                 .expect("phase 1 run succeeds");
                             debug_assert!(outcome.is_interrupted());

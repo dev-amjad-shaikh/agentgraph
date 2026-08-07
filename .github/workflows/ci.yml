@@ -98,7 +98,8 @@ jobs:
           key: ${{ matrix.pkg }}
 
       - name: Check with MSRV toolchain
-        run: cargo check -p ${{ matrix.pkg }} --locked
+        # No committed Cargo.lock (library policy), so --locked cannot be used.
+        run: cargo check -p ${{ matrix.pkg }}
 
   # Advisory scan of the workspace Cargo.lock against the RustSec advisory DB.
   audit:

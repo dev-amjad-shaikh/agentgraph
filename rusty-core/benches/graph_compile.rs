@@ -39,17 +39,13 @@ fn uncompiled_chain(n: usize) -> GraphBuilder {
 fn bench_graph_compile(c: &mut Criterion) {
     let mut group = c.benchmark_group("graph_compile");
     for nodes in [10usize, 100, 1000] {
-        group.bench_with_input(
-            BenchmarkId::new("chain", nodes),
-            &nodes,
-            |b, &nodes| {
-                b.iter_batched(
-                    || uncompiled_chain(nodes),
-                    |builder| builder.compile().expect("compiles"),
-                    BatchSize::SmallInput,
-                );
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("chain", nodes), &nodes, |b, &nodes| {
+            b.iter_batched(
+                || uncompiled_chain(nodes),
+                |builder| builder.compile().expect("compiles"),
+                BatchSize::SmallInput,
+            );
+        });
     }
     group.finish();
 }

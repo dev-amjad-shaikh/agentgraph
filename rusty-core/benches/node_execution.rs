@@ -17,24 +17,20 @@ fn bench_sequential_execution(c: &mut Criterion) {
     let mut group = c.benchmark_group("sequential_chain_execution");
 
     for nodes in [10usize, 50, 100] {
-        group.bench_with_input(
-            BenchmarkId::new("nodes", nodes),
-            &nodes,
-            |b, &nodes| {
-                let (graph, spec) = chain_graph(nodes);
-                let executor = Executor::new();
-                b.iter(|| {
-                    rt.block_on(async {
-                        let outcome = executor
-                            .run(&graph, &spec, State::new(), RunConfig::new("bench-seq"))
-                            .await
-                            .expect("run succeeds");
-                        debug_assert!(!outcome.is_interrupted());
-                        criterion::black_box(outcome)
-                    })
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("nodes", nodes), &nodes, |b, &nodes| {
+            let (graph, spec) = chain_graph(nodes);
+            let executor = Executor::new();
+            b.iter(|| {
+                rt.block_on(async {
+                    let outcome = executor
+                        .run(&graph, &spec, State::new(), RunConfig::new("bench-seq"))
+                        .await
+                        .expect("run succeeds");
+                    debug_assert!(!outcome.is_interrupted());
+                    criterion::black_box(outcome)
+                })
+            });
+        });
     }
     group.finish();
 }
