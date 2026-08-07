@@ -26,14 +26,13 @@ import {
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..', '..', '..');
-const BINARY = path.join(
-  REPO_ROOT,
-  'rusty-server',
-  'target',
-  'debug',
-  'examples',
-  'server_demo',
-);
+// The repo is a Cargo workspace: examples build into the workspace-root
+// target/. Fall back to the legacy per-crate path for pre-workspace clones.
+const BINARY_CANDIDATES = [
+  path.join(REPO_ROOT, 'target', 'debug', 'examples', 'server_demo'),
+  path.join(REPO_ROOT, 'rusty-server', 'target', 'debug', 'examples', 'server_demo'),
+];
+const BINARY = BINARY_CANDIDATES.find((p) => existsSync(p)) ?? BINARY_CANDIDATES[0];
 const SERVER_MANIFEST = path.join(REPO_ROOT, 'rusty-server', 'Cargo.toml');
 const SCRATCH_DIR = path.join(REPO_ROOT, 'sdks', 'typescript', '.tmp-e2e');
 const BASE_URL = 'http://127.0.0.1:8100';

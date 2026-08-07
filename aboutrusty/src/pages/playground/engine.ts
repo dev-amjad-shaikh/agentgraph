@@ -286,7 +286,7 @@ const FINAL_ANSWER_MAIN =
   "The current time in UTC is August 6, 2026, 06:42:52. 128 multiplied by 46 equals 5888. The phrase 'the quick brown fox jumps over the lazy dog' contains 9 words.";
 
 const FINAL_ANSWER_BRANCH =
-  "UTC time: 2026-08-06 06:42:52. 128 × 46 = 5888. Word count: 9 (the forked timeline re-planned the work one tool per super-step).";
+  "UTC time: 2026-08-06 06:42:52. 128 × 46 = 5888 (verified twice on this fork). Word count: 9.";
 
 /**
  * The scripted model. The main persona batches all three tool calls into one
@@ -304,6 +304,20 @@ function scriptedModelReply(messages: ChatMessage[], persona: Persona): ChatMess
   const pending = TOOL_PLAN.filter((_, i) => !answered.has(`call-${i}`));
 
   if (pending.length === 0) {
+    // On a forked timeline the scripted model makes a different choice:
+    // it re-verifies the arithmetic with one extra tool call before
+    // answering — so a replay on the fork visibly diverges (more
+    // super-steps, a longer checkpoint history).
+    if (persona === "branch" && !answered.has("call-verify")) {
+      return {
+        id,
+        role: "assistant",
+        content: "Forked timeline: re-verifying the arithmetic before I answer.",
+        tool_calls: [
+          { id: "call-verify", name: "calculator", args: { a: 128, b: 46, op: "multiply" } },
+        ],
+      };
+    }
     return {
       id,
       role: "assistant",
@@ -363,18 +377,23 @@ export function createThread(
   };
 }
 
-/** Emit the run's metadata frame (id uses "-" before the first checkpoint). */
+/** Emit the run's metadata frame — always `-:0:1` (before the run's first checkpoint). */
 export function beginRun(t: ThreadSim): ThreadSim {
   const attempt = t.attempt + 1;
-  const started: ThreadSim = { ...t, attempt, seq: 0, status: "running" };
-  const frame = nextFrame(started, 0, "metadata", {
-    run_id: `run-${started.id}-${attempt}`,
-    thread_id: started.id,
-    graph: SCENARIOS[started.scenario].graphName,
-    attempt,
-    metadata: null,
-  });
-  return { ...started, seq: frame.seq, frames: [...started.frames, frame] };
+  const frame: SimFrame = {
+    seq: 1,
+    step: 0,
+    frameId: "-:0:1",
+    event: "metadata",
+    data: {
+      run_id: `run-${t.id}-${attempt}`,
+      thread_id: t.id,
+      graph: SCENARIOS[t.scenario].graphName,
+      attempt,
+      metadata: null,
+    },
+  };
+  return { ...t, attempt, seq: 1, status: "running", frames: [...t.frames, frame] };
 }
 
 // ---------------------------------------------------------------------------
@@ -565,7 +584,8 @@ let forkCounter = 0;
  */
 export function forkThread(src: ThreadSim, at: Checkpoint): ThreadSim {
   forkCounter += 1;
-  const id = `${src.id}-fork-${at.step}`;
+  const suffix = forkCounter === 1 ? "" : `-${forkCounter}`;
+  const id = `${src.id}-fork-${at.step}${suffix}`;
   const copied = src.checkpoints
     .filter((c) => c.clock <= at.clock)
     .map((c) => ({ ...c, thread_id: id }));

@@ -47,10 +47,13 @@ def _port_in_use(port: int) -> bool:
 
 def _ensure_binary() -> Path:
     """Locate (or build) the server_demo example binary."""
-    target = REPO_ROOT / "rusty-server" / "target"
+    # The repo is a Cargo workspace: examples build into the workspace-root
+    # target/. Fall back to the legacy per-crate path for pre-workspace clones.
     candidates = [
-        target / "release" / "examples" / "server_demo",
-        target / "debug" / "examples" / "server_demo",
+        REPO_ROOT / "target" / "release" / "examples" / "server_demo",
+        REPO_ROOT / "target" / "debug" / "examples" / "server_demo",
+        REPO_ROOT / "rusty-server" / "target" / "release" / "examples" / "server_demo",
+        REPO_ROOT / "rusty-server" / "target" / "debug" / "examples" / "server_demo",
     ]
     for path in candidates:
         if path.exists():
