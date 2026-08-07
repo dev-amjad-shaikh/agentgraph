@@ -11,6 +11,9 @@ readme = "README.md"
 description = "The durable agent runtime built in Rust — core graph engine: typed channels with reducers, Pregel/BSP super-step execution, checkpoints, interrupts, and streaming."
 keywords = ["agent", "graph", "llm", "orchestration", "langgraph"]
 categories = ["asynchronous", "network-programming"]
+# Explicit [[bench]] targets only — autodiscovery would also pick up the
+# shared helper module under benches/common/.
+autobenches = false
 
 # NOTE: Cargo.toml and src/lib.rs are owned EXCLUSIVELY by the scaffold engineer.
 # Do not edit them in implementation PRs; request changes instead.
@@ -35,3 +38,34 @@ wasm = ["dep:wasmtime"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+# Benchmarks only: default features off (no plotters/rayon) to keep bench
+# builds lean; results still go to target/criterion as JSON estimates.
+criterion = { version = "0.5", default-features = false }
+
+[[bench]]
+name = "graph_compile"
+harness = false
+
+[[bench]]
+name = "node_execution"
+harness = false
+
+[[bench]]
+name = "parallel_fanout"
+harness = false
+
+[[bench]]
+name = "reducers"
+harness = false
+
+[[bench]]
+name = "checkpoint"
+harness = false
+
+[[bench]]
+name = "interrupt_resume"
+harness = false
+
+[[bench]]
+name = "state_clone"
+harness = false

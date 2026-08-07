@@ -1,0 +1,98 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Rusty — warm rust-toned light theme */
+    --background: 36 33% 97%;
+    --foreground: 20 14% 12%;
+    --card: 0 0% 100%;
+    --card-foreground: 20 14% 12%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 20 14% 12%;
+    --primary: 16 68% 40%;
+    --primary-foreground: 36 33% 97%;
+    --secondary: 30 28% 92%;
+    --secondary-foreground: 20 20% 22%;
+    --muted: 32 20% 93%;
+    --muted-foreground: 24 8% 42%;
+    --accent: 28 45% 90%;
+    --accent-foreground: 18 55% 32%;
+    --destructive: 0 62% 44%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 28 18% 86%;
+    --input: 28 18% 82%;
+    --ring: 16 68% 40%;
+    --radius: 0.625rem;
+    --sidebar-background: 36 30% 96%;
+    --sidebar-foreground: 20 14% 18%;
+    --sidebar-primary: 16 68% 40%;
+    --sidebar-primary-foreground: 36 33% 97%;
+    --sidebar-accent: 30 28% 92%;
+    --sidebar-accent-foreground: 18 55% 32%;
+    --sidebar-border: 28 18% 86%;
+    --sidebar-ring: 16 68% 40%;
+    /* Code blocks (always dark, warm charcoal) */
+    --code-bg: 22 16% 11%;
+    --code-foreground: 34 24% 88%;
+  }
+
+  .dark {
+    --background: 22 14% 8%;
+    --foreground: 34 24% 90%;
+    --card: 22 14% 11%;
+    --card-foreground: 34 24% 90%;
+    --popover: 22 14% 11%;
+    --popover-foreground: 34 24% 90%;
+    --primary: 18 72% 52%;
+    --primary-foreground: 22 14% 8%;
+    --secondary: 24 10% 17%;
+    --secondary-foreground: 34 24% 90%;
+    --muted: 24 10% 15%;
+    --muted-foreground: 28 10% 62%;
+    --accent: 20 22% 20%;
+    --accent-foreground: 20 70% 62%;
+    --destructive: 0 55% 42%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 24 10% 20%;
+    --input: 24 10% 24%;
+    --ring: 18 72% 52%;
+    --sidebar-background: 22 14% 10%;
+    --sidebar-foreground: 34 20% 85%;
+    --sidebar-primary: 18 72% 52%;
+    --sidebar-primary-foreground: 22 14% 8%;
+    --sidebar-accent: 24 10% 17%;
+    --sidebar-accent-foreground: 20 70% 62%;
+    --sidebar-border: 24 10% 20%;
+    --sidebar-ring: 18 72% 52%;
+    --code-bg: 22 18% 7%;
+    --code-foreground: 34 24% 88%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+      "Helvetica Neue", Arial, sans-serif;
+  }
+}
+
+@layer utilities {
+  .font-display {
+    font-family: Charter, "Bitstream Charter", "Sitka Text", Cambria, Georgia,
+      ui-serif, serif;
+  }
+  .font-code {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+      "Liberation Mono", monospace;
+  }
+  .bg-code {
+    background-color: hsl(var(--code-bg));
+    color: hsl(var(--code-foreground));
+  }
+}
