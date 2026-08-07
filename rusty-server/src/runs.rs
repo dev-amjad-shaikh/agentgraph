@@ -21,11 +21,11 @@ use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
+use futures::FutureExt;
 use rusty_agent_runtime::checkpoint::Checkpointer;
 use rusty_agent_runtime::error::RustyError;
 use rusty_agent_runtime::executor::{ExecutionOutcome, Executor, GraphEvent, RunConfig};
 use rusty_agent_runtime::state::State;
-use futures::FutureExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, watch, Mutex};

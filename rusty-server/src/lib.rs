@@ -68,9 +68,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use axum::Router;
 use rusty_agent_runtime::graph::Graph;
 use rusty_agent_runtime::state::StateSpec;
-use axum::Router;
 
 pub use error::ApiError;
 pub use runs::RunStatus;

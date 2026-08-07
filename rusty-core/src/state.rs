@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::error::{RustyError, Result};
+use crate::error::{Result, RustyError};
 
 /// The shared graph state: a thin wrapper over a JSON object (`Map<String, Value>`).
 ///

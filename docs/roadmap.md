@@ -1,27 +1,27 @@
 # Rusty platform roadmap
 
-Where the platform has been, what's landing this cycle, and what's next. Crates are versioned independently (`rusty-agent-runtime` core, `rusty-server`, `rusty-worker`); phases below group work across the monorepo. Named releases: **R0.1 — Ignition**, **R0.2 — Persistence**, **R0.3 — Interop**, **R0.4 — Time Travel** (all shipped), and **R1.0 — Unleashed** (upcoming). History lives in [../CHANGELOG.md](../CHANGELOG.md); per-crate detail lives in each crate's README.
+Where the platform has been, what's landing this cycle, and what's next. Crates are versioned independently (`rusty-agent-runtime` core, `rusty-server`, `rusty-worker`); phases below group work across the monorepo. Named releases: **R0.1 — Ignition**, **R0.2 — Persistence**, **R0.3 — Interop**, **R0.4 — Time Travel** (all implemented), and **R1.0 — Unleashed** (upcoming). History lives in [../CHANGELOG.md](../CHANGELOG.md); per-crate detail lives in each crate's README.
 
 ## Status at a glance
 
 | Release | Phase | Contents | Version target | Status | Date |
 |---|---|---|---|---|---|
-| **R0.1 — Ignition** | Core kernel | State channels + reducers, Pregel/BSP executor, checkpoints, HITL interrupts, `Send` fan-out, `ChatModel`/`ToolExecutor`, prebuilt ReAct agent | `rusty-agent-runtime` v0.1.0 | ✅ Shipped | 2026-07-31 |
-| **R0.2 — Persistence** | Durability & streaming + server Phase A | Postgres checkpointer, token streaming (`messages` mode), live example; axum server: threads, runs, SSE, auth | `rusty-agent-runtime` v0.2.0, `rusty-server` v0.1.0 | ✅ Shipped | 2026-08-05 |
-| **R0.3 — Interop** | interop & distribution | MCP client, remote nodes + worker SDK, server API completion, executor tracing | `rusty-agent-runtime` v0.3.0, `rusty-server` v0.2.0, `rusty-worker` v0.1.0 | ✅ Shipped | 2026-08-05 |
-| **R0.4 — Time Travel** | production hardening | WASM nodes, time-travel core + server API, Postgres server store, OpenTelemetry export, Studio UI, permissive CORS | `rusty-agent-runtime` v0.4.0, `rusty-server` v0.3.0, `rusty-otel` v0.1.0 | ✅ Shipped | 2026-08-05 |
-| v0.5 (pre-1.0) | SDKs & tenancy | Python SDK (stdlib-only), TypeScript SDK (zero-dep ESM), multi-tenant auth with full isolation, live-LLM validation + calculator fix | `rusty-server` v0.4.0, `sdks/*` v0.1.0 | ✅ Shipped | 2026-08-05 |
-| **R1.0 — Unleashed** | platform ambitions | Hosted multi-tenant service (tenant isolation shipped in v0.5 — the first brick), WASM target, edge runtimes | TBD | 🚧 Upcoming | — |
+| **R0.1 — Ignition** | Core kernel | State channels + reducers, Pregel/BSP executor, checkpoints, HITL interrupts, `Send` fan-out, `ChatModel`/`ToolExecutor`, prebuilt ReAct agent | `rusty-agent-runtime` v0.1.0 | ✅ Implemented | 2026-07-31 |
+| **R0.2 — Persistence** | Durability & streaming + server Phase A | Postgres checkpointer, token streaming (`messages` mode), live example; axum server: threads, runs, SSE, auth | `rusty-agent-runtime` v0.2.0, `rusty-server` v0.1.0 | ✅ Implemented | 2026-08-05 |
+| **R0.3 — Interop** | interop & distribution | MCP client, remote nodes + worker SDK, server API completion, executor tracing | `rusty-agent-runtime` v0.3.0, `rusty-server` v0.2.0, `rusty-worker` v0.1.0 | ✅ Implemented | 2026-08-05 |
+| **R0.4 — Time Travel** | production hardening | WASM nodes, time-travel core + server API, Postgres server store, OpenTelemetry export, Studio UI, permissive CORS | `rusty-agent-runtime` v0.4.0, `rusty-server` v0.3.0, `rusty-otel` v0.1.0 | ✅ Implemented | 2026-08-05 |
+| v0.5 (pre-1.0) | SDKs & tenancy | Python SDK (stdlib-only), TypeScript SDK (zero-dep ESM), multi-tenant auth with full isolation, live-LLM validation + calculator fix | `rusty-server` v0.4.0, `sdks/*` v0.1.0 | ✅ Implemented | 2026-08-05 |
+| **R1.0 — Unleashed** | platform ambitions | Hosted multi-tenant service (tenant isolation implemented in v0.5 — the first brick), WASM target, edge runtimes | TBD | 🚧 Upcoming | — |
 
-## Shipped
+## Implemented
 
 ### R0.1 — Ignition · core kernel — `rusty-agent-runtime` v0.1.0 (2026-07-31)
 
-The LangGraph execution model rebuilt on tokio: typed state channels with per-key `Reducer`s, compile-time graph validation, the Pregel/BSP super-step executor (*plan → parallel → barrier → merge → route → checkpoint*), versioned thread-scoped checkpoints (in-memory + JSON-file), interrupt/resume HITL, `Route::Send` dynamic fan-out, typed `GraphEvent` streaming, the minimal `ChatModel` trait with an OpenAI-compatible client, parallel `ToolExecutor`, and `react::create_react_agent`. Details: [CHANGELOG 2026-07-31](../CHANGELOG.md).
+The LangGraph execution model rebuilt on tokio: state channels with per-key `Reducer`s over schema-declared, runtime-validated JSON state, graph validation when you call `GraphBuilder::compile()`, the Pregel/BSP super-step executor (*plan → parallel → barrier → merge → route → checkpoint*), versioned thread-scoped checkpoints (in-memory + JSON-file), interrupt/resume HITL, `Route::Send` dynamic fan-out, typed `GraphEvent` streaming, the minimal `ChatModel` trait with an OpenAI-compatible client, parallel `ToolExecutor`, and `react::create_react_agent`. Details: [CHANGELOG 2026-07-31](../CHANGELOG.md).
 
 ### R0.2 — Persistence · durability & streaming + server Phase A — `rusty-agent-runtime` v0.2.0, `rusty-server` v0.1.0 (2026-08-05)
 
-Core gained the `sqlx`-backed `PostgresCheckpointer` (`postgres` feature), real token streaming (`ChatModel::chat_stream` → `GraphEvent::Token`, the LangGraph `messages` stream mode), and a live-agent example against any OpenAI-compatible endpoint. The new `rusty-server` crate shipped Phase A of the Agent-Protocol surface: threads, background/blocking/SSE runs, checkpoint history, per-thread run queue, API-key auth — 10 integration tests green. Details: [CHANGELOG 2026-08-05](../CHANGELOG.md), [server design doc](rusty-server-design.md), [server quickstart](server-quickstart.md).
+Core gained the `sqlx`-backed `PostgresCheckpointer` (`postgres` feature), real token streaming (`ChatModel::chat_stream` → `GraphEvent::Token`, the LangGraph `messages` stream mode), and a live-agent example against any OpenAI-compatible endpoint. The new `rusty-server` crate implemented Phase A of the Agent-Protocol surface: threads, background/blocking/SSE runs, checkpoint history, per-thread run queue, API-key auth — 10 integration tests green. Details: [CHANGELOG 2026-08-05](../CHANGELOG.md), [server design doc](rusty-server-design.md), [server quickstart](server-quickstart.md).
 
 ### R0.3 — Interop — `rusty-agent-runtime` v0.3.0, `rusty-server` v0.2.0, `rusty-worker` v0.1.0 (2026-08-05)
 
@@ -58,7 +58,7 @@ Five workstreams landed concurrently this cycle:
 
 Directional, not scheduled. The Phase D ambitions below are what R1.0 — Unleashed is made of:
 
-- **Hosted multi-tenant service** — the server crate operated as a managed platform: tenant isolation, durable queues, autoscaling workers. **Partially started:** v0.5 shipped the tenant-isolation brick (per-tenant API keys, namespaced storage, 404-on-cross-tenant semantics) in `rusty-server` v0.4.0; durable queues and autoscaling remain open.
+- **Hosted multi-tenant service** — the server crate operated as a managed platform: tenant isolation, durable queues, autoscaling workers. **Partially started:** v0.5 implemented the tenant-isolation brick (per-tenant API keys, namespaced storage, 404-on-cross-tenant semantics) in `rusty-server` v0.4.0; durable queues and autoscaling remain open.
 - **WASM target** — run graphs themselves in the browser or edge runtimes (sans native checkpointers).
 - **Edge deployment** — single-digit-MB agent services on edge runtimes, leaning on Rust's footprint and the static-binary story.
 
@@ -68,4 +68,4 @@ Directional, not scheduled. The Phase D ambitions below are what R1.0 — Unleas
 - [server quickstart](server-quickstart.md) — zero to a served graph with interrupt/resume over HTTP + SSE.
 - [rusty-agent-runtime README](../rusty-core/README.md#roadmap) — core crate roadmap checklist.
 - [rusty-server README](../rusty-server/README.md) — server endpoint inventory and status.
-- [CHANGELOG](../CHANGELOG.md) — release history.
+- [CHANGELOG](../CHANGELOG.md) — version history.

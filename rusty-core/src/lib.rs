@@ -15,13 +15,14 @@
 //!   state updates plus an optional [`node::Command`] for dynamic routing.
 //! - **Graph** ([`graph`]): a thin builder ([`graph::GraphBuilder`]) with
 //!   normal edges, conditional edges returning a [`graph::Route`] (including
-//!   dynamic fan-out via [`graph::Send`]), and `compile()`-time validation.
+//!   dynamic fan-out via [`graph::Send`]), and structural validation when
+//!   you call [`graph::GraphBuilder::compile`].
 //! - **Execution** ([`executor`]): a Pregel/BSP-inspired super-step loop —
 //!   *plan → run active nodes in parallel over an immutable snapshot →
 //!   barrier → merge writes via reducers → route → checkpoint* — emitting
 //!   [`executor::GraphEvent`]s for streaming.
 //! - **Persistence** ([`checkpoint`]): thread-scoped, versioned snapshots via
-//!   the [`checkpoint::Checkpointer`] trait; ships with an in-memory saver
+//!   the [`checkpoint::Checkpointer`] trait; includes an in-memory saver
 //!   and a durable pure-`serde_json` file saver, plus a `postgres`-feature
 //!   `PostgresCheckpointer` (see the `checkpoint_postgres` module).
 //! - **LLM & tools** ([`llm`], [`tool`]): a [`llm::ChatModel`] abstraction
@@ -84,7 +85,7 @@ pub mod prelude {
     };
     #[cfg(feature = "postgres")]
     pub use crate::checkpoint_postgres::PostgresCheckpointer;
-    pub use crate::error::{RustyError, Result};
+    pub use crate::error::{Result, RustyError};
     pub use crate::executor::{ExecutionOutcome, Executor, GraphEvent, RunConfig};
     pub use crate::graph::{ConditionalRouter, Edge, Graph, GraphBuilder, Route, Send};
     pub use crate::llm::{

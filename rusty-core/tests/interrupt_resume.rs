@@ -121,10 +121,7 @@ async fn resume_without_checkpoint_is_an_error() {
         .await
         .expect_err("resume with no prior checkpoint must fail");
     assert!(
-        matches!(
-            err,
-            RustyError::Checkpoint(_) | RustyError::Graph(_)
-        ),
+        matches!(err, RustyError::Checkpoint(_) | RustyError::Graph(_)),
         "expected Checkpoint/Graph error, got {err:?}"
     );
 }

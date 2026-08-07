@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::error::{RustyError, Result};
+use crate::error::{Result, RustyError};
 use crate::state::State;
 
 /// Per-run, per-node configuration handed to every node invocation.

@@ -15,7 +15,7 @@ Thanks for helping build the Rusty platform. This repository is a monorepo of in
 
 ## Checks
 
-Each crate builds independently (there is no workspace-level `Cargo.toml`). In the crate you touched, run the standard trio on stable Rust:
+The four crates share a virtual workspace (root `Cargo.toml`), so builds resolve from the repository root; per-crate `--manifest-path` commands work as before. In the crate you touched, run the standard trio on stable Rust (MSRV 1.86):
 
 ```bash
 cargo fmt --all -- --check
@@ -37,6 +37,7 @@ node --test sdks/typescript/test/
 - **Tests ship with behavior changes.** Unit tests live in-module under `#[cfg(test)]`; server and SDK changes extend the integration/e2e suites.
 - **Docs must match the real API.** Code samples in prose are reviewed against source; if you change a public signature, grep the READMEs and `docs/` for it.
 - **Crates are versioned independently.** Bump the version in the crate you changed and record the change in the root [CHANGELOG.md](CHANGELOG.md). The platform-release numbers in the root README map to per-crate versions via [docs/roadmap.md](docs/roadmap.md).
+- **`Cargo.lock` is not committed.** All four crates are published libraries, so the lockfile stays out of version control (it is git-ignored) and CI always builds against the latest semver-compatible dependencies. Pin exact versions in your own applications that depend on these crates, not here.
 
 ## Code of conduct
 

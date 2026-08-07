@@ -1,0 +1,226 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run every preflight but publish nothing"
+        type: boolean
+        default: true
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Resolves run mode (tag push = real release; manual dispatch honors the
+  # dry_run input) and probes which publish secrets exist, so downstream jobs
+  # can gate on them. Secrets cannot be referenced in job-level `if:` directly,
+  # which is why they are converted to plain outputs here.
+  config:
+    name: config
+    runs-on: ubuntu-latest
+    outputs:
+      dry_run: ${{ steps.cfg.outputs.dry_run }}
+      has_cargo_token: ${{ steps.cfg.outputs.has_cargo_token }}
+      has_pypi_token: ${{ steps.cfg.outputs.has_pypi_token }}
+      has_npm_token: ${{ steps.cfg.outputs.has_npm_token }}
+    steps:
+      - name: Resolve mode and available secrets
+        id: cfg
+        env:
+          IS_DISPATCH: ${{ github.event_name == 'workflow_dispatch' }}
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+          CARGO_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          dry_run=false
+          if [ "$IS_DISPATCH" = "true" ] && [ "$DRY_RUN_INPUT" = "true" ]; then
+            dry_run=true
+          fi
+          echo "dry_run=$dry_run" >> "$GITHUB_OUTPUT"
+          echo "Run mode: dry_run=$dry_run"
+
+          for pair in cargo:CARGO_TOKEN pypi:PYPI_TOKEN npm:NPM_TOKEN; do
+            name="${pair%%:*}"
+            var="${pair##*:}"
+            if [ -n "${!var}" ]; then
+              echo "has_${name}_token=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "has_${name}_token=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::secret for ${name} is not set; the ${name} publish step will be skipped"
+            fi
+          done
+
+  # crates.io in dependency order: rusty-agent-runtime first, then the three
+  # crates that path-depend on it. Preflight (`cargo publish --dry-run`) runs
+  # in every mode; the real upload only runs when dry_run is false.
+  publish-crates:
+    name: publish-crates
+    needs: config
+    if: needs.config.outputs.dry_run == 'true' || needs.config.outputs.has_cargo_token == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      # Preflight the root of the dependency chain in every mode. The three
+      # dependent crates are preflighted separately below: in real-release
+      # mode their verify step can only resolve rusty-agent-runtime from
+      # crates.io after it has been published, so their preflight is folded
+      # into the publish retry loop instead.
+      - name: Preflight — cargo publish --dry-run (rusty-agent-runtime)
+        working-directory: rusty-core
+        env:
+          # cargo publish --dry-run still requires a token to be configured,
+          # even though it never reaches the registry. Fall back to a
+          # placeholder so secret-less dry runs can still preflight.
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          export CARGO_REGISTRY_TOKEN="${CARGO_REGISTRY_TOKEN:-dry-run-placeholder}"
+          cargo publish --dry-run --allow-dirty
+
+      # Dry-run mode only: preflight the dependent crates. Requires a
+      # compatible rusty-agent-runtime to already exist on crates.io, i.e.
+      # this step is fully green from the second release onward.
+      - name: Preflight — cargo publish --dry-run (dependent crates)
+        if: needs.config.outputs.dry_run == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          export CARGO_REGISTRY_TOKEN="${CARGO_REGISTRY_TOKEN:-dry-run-placeholder}"
+          for crate in rusty-server rusty-worker rusty-otel; do
+            echo "== cargo publish --dry-run: $crate =="
+            (cd "$crate" && cargo publish --dry-run --allow-dirty)
+          done
+
+      - name: Publish rusty-agent-runtime
+        if: needs.config.outputs.dry_run == 'false'
+        working-directory: rusty-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish
+
+      # Each cargo publish packages and verifies the crate before uploading,
+      # which doubles as the dependents' preflight. Retries absorb the lag
+      # while the crates.io index picks up the freshly published
+      # rusty-agent-runtime.
+      - name: Publish rusty-server, rusty-worker, rusty-otel
+        if: needs.config.outputs.dry_run == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          for crate in rusty-server rusty-worker rusty-otel; do
+            echo "== cargo publish: $crate =="
+            cd "$crate"
+            attempt=1
+            until cargo publish; do
+              if [ "$attempt" -ge 5 ]; then
+                echo "::error::cargo publish failed for $crate after $attempt attempts"
+                exit 1
+              fi
+              echo "Retrying $crate in 30s (attempt $attempt of 5)…"
+              sleep 30
+              attempt=$((attempt + 1))
+            done
+            cd "$GITHUB_WORKSPACE"
+          done
+
+  # PyPI. The SDK builds with hatchling (see sdks/python/pyproject.toml);
+  # `python -m build` is the preflight and runs in every mode.
+  publish-pypi:
+    name: publish-pypi
+    needs: [config, publish-crates]
+    if: >-
+      ${{ (needs.config.outputs.dry_run == 'true' || needs.config.outputs.has_pypi_token == 'true')
+          && (needs.publish-crates.result == 'success' || needs.publish-crates.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build frontend
+        run: python -m pip install --upgrade pip build
+
+      - name: Preflight — python -m build
+        working-directory: sdks/python
+        run: python -m build
+
+      - name: Publish to PyPI
+        if: needs.config.outputs.dry_run == 'false'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          packages-dir: sdks/python/dist/
+
+  # npm. `npm pack` is the preflight and runs in every mode; the real
+  # `npm publish --access public` only runs when dry_run is false.
+  publish-npm:
+    name: publish-npm
+    needs: [config, publish-crates]
+    if: >-
+      ${{ (needs.config.outputs.dry_run == 'true' || needs.config.outputs.has_npm_token == 'true')
+          && (needs.publish-crates.result == 'success' || needs.publish-crates.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Preflight — npm pack
+        working-directory: sdks/typescript
+        run: npm pack
+
+      - name: Publish to npm
+        if: needs.config.outputs.dry_run == 'false'
+        working-directory: sdks/typescript
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
+
+  # Always runs so a skipped stage (missing secret) is visible in the run
+  # summary instead of silently producing a green check.
+  release-summary:
+    name: release-summary
+    needs: [config, publish-crates, publish-pypi, publish-npm]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summarize release
+        env:
+          DRY_RUN: ${{ needs.config.outputs.dry_run }}
+          CRATES: ${{ needs.publish-crates.result }}
+          PYPI: ${{ needs.publish-pypi.result }}
+          NPM: ${{ needs.publish-npm.result }}
+        run: |
+          {
+            echo "### Release summary"
+            echo ""
+            echo "| Stage | Result |"
+            echo "| --- | --- |"
+            echo "| dry_run | $DRY_RUN |"
+            echo "| publish-crates | $CRATES |"
+            echo "| publish-pypi | $PYPI |"
+            echo "| publish-npm | $NPM |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for stage in "$CRATES" "$PYPI" "$NPM"; do
+            if [ "$stage" = "failure" ] || [ "$stage" = "cancelled" ]; then
+              exit 1
+            fi
+          done

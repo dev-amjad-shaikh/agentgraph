@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use futures::FutureExt;
 use serde_json::{json, Value};
 
-use crate::error::{RustyError, Result};
+use crate::error::{Result, RustyError};
 use crate::llm::{ChatMessage, ToolCall};
 
 /// An invocable tool.
@@ -152,9 +152,9 @@ impl ToolExecutor {
             let registry = self.registry.clone();
             async move {
                 let result = std::panic::AssertUnwindSafe(async {
-                    let tool = registry.get(&call.name).ok_or_else(|| {
-                        RustyError::Tool(format!("unknown tool `{}`", call.name))
-                    })?;
+                    let tool = registry
+                        .get(&call.name)
+                        .ok_or_else(|| RustyError::Tool(format!("unknown tool `{}`", call.name)))?;
                     let value = tool.call(call.arguments.clone()).await?;
                     Ok::<String, RustyError>(match value {
                         Value::String(s) => s,

@@ -49,7 +49,7 @@ use tokio::sync::{oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-use crate::error::{RustyError, Result};
+use crate::error::{Result, RustyError};
 use crate::tool::Tool;
 
 /// The MCP protocol revision this client requests during `initialize`.

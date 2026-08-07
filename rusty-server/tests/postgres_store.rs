@@ -20,11 +20,11 @@
 
 use std::path::PathBuf;
 
-use rusty_agent_runtime::prelude::*;
-use rusty_server::{router, GraphRegistry, ServerConfig};
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use axum::Router;
+use rusty_agent_runtime::prelude::*;
+use rusty_server::{router, GraphRegistry, ServerConfig};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -58,10 +58,8 @@ fn postgres_app() -> Router {
     registry.register("pipeline", pipeline, pipeline_spec);
     // store_path is irrelevant to Postgres persistence; a temp dir keeps
     // the signature honest.
-    let store_path: PathBuf = std::env::temp_dir().join(format!(
-        "rusty-server-pg-test-{}",
-        uuid::Uuid::new_v4()
-    ));
+    let store_path: PathBuf =
+        std::env::temp_dir().join(format!("rusty-server-pg-test-{}", uuid::Uuid::new_v4()));
     let config =
         ServerConfig::new("127.0.0.1:0".parse().unwrap(), store_path).with_postgres(database_url());
     router(registry, config)

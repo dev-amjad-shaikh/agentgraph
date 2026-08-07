@@ -15,7 +15,9 @@
   },
   "files": [
     "src",
-    "README.md"
+    "README.md",
+    "LICENSE-APACHE",
+    "LICENSE-MIT"
   ],
   "engines": {
     "node": ">=18"

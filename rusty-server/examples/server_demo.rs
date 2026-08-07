@@ -6,9 +6,9 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use rusty_agent_runtime::prelude::*;
 use rusty_server::{serve, GraphRegistry, ServerConfig};
-use async_trait::async_trait;
 use serde_json::{json, Value};
 
 /// A scripted model: pops one canned response per call; once the script is

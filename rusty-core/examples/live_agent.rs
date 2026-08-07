@@ -35,9 +35,9 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use rusty_agent_runtime::prelude::*;
 use rusty_agent_runtime::react::create_react_agent_streaming;
-use async_trait::async_trait;
 use serde_json::{json, Value};
 
 const DEFAULT_BASE_URL: &str = "http://localhost:11434/v1";
@@ -222,10 +222,8 @@ async fn main() -> Result<()> {
     println!("=== Rusty Core: LIVE ReAct agent demo (real LLM endpoint) ===\n");
 
     // 1. Endpoint configuration from the environment.
-    let base_url =
-        std::env::var("RUSTY_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
-    let api_key =
-        std::env::var("RUSTY_API_KEY").unwrap_or_else(|_| DEFAULT_API_KEY.to_string());
+    let base_url = std::env::var("RUSTY_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
+    let api_key = std::env::var("RUSTY_API_KEY").unwrap_or_else(|_| DEFAULT_API_KEY.to_string());
     let model = std::env::var("RUSTY_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
 
     println!("endpoint : {base_url}");

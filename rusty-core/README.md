@@ -4,14 +4,14 @@
 
 Rusty Core models agent workflows as **cyclic graphs over shared state**. Every state key is a versioned *channel* with per-key reducer semantics; nodes are async functions returning partial updates; execution follows a Pregel/BSP super-step model with first-class checkpoints, interrupts, streaming events, and dynamic fan-out. Dual-licensed under MIT OR Apache-2.0.
 
-> **Status: v0.4.0.** The public API surface — modules, types, and trait signatures in `src/` — is stable to build against. The state/reducer engine, graph builder + compile-time validation, Pregel/BSP executor super-step loop, in-memory, JSON-file, and Postgres checkpointers, checkpoint time travel (`get_by_id` / `fork_thread` / `RunConfig::with_checkpoint_id`), sandboxed `WasmNode` execution (`wasm` feature), `ChatModel` abstraction with token streaming, OpenAI-compatible client, parallel `ToolExecutor`, the prebuilt ReAct agent (`react::create_react_agent`), the MCP client, remote nodes (`RemoteNode`), and executor `tracing` instrumentation are implemented and tested, with four runnable examples under [`examples/`](examples/). An axum HTTP/SSE server lives in the sibling [`rusty-server`](../rusty-server) crate, and OpenTelemetry export in [`rusty-otel`](../rusty-otel). See the [roadmap](#roadmap) for what's next.
+> **Status: v0.4.0.** The public API surface — modules, types, and trait signatures in `src/` — is stable to build against. The state/reducer engine, the graph builder (validated when you call `GraphBuilder::compile()`), Pregel/BSP executor super-step loop, in-memory, JSON-file, and Postgres checkpointers, checkpoint time travel (`get_by_id` / `fork_thread` / `RunConfig::with_checkpoint_id`), sandboxed `WasmNode` execution (`wasm` feature), `ChatModel` abstraction with token streaming, OpenAI-compatible client, parallel `ToolExecutor`, the prebuilt ReAct agent (`react::create_react_agent`), the MCP client, remote nodes (`RemoteNode`), and executor `tracing` instrumentation are implemented and tested, with four runnable examples under [`examples/`](examples/). An axum HTTP/SSE server lives in the sibling [`rusty-server`](../rusty-server) crate, and OpenTelemetry export in [`rusty-otel`](../rusty-otel). See the [roadmap](#roadmap) for what's next.
 
 ## Why Rust?
 
 Production agent runtimes spend their lives juggling hundreds of concurrent LLM streams, tool calls, and checkpoint writes. Rust buys you:
 
 - **No GC pauses, no GIL** — deterministic streaming latency and true parallelism for concurrent tool calls on a single tokio runtime.
-- **Compile-time correctness** — graph topology is validated by `compile()` before any node (or paid LLM call) runs; channel conflicts like double-writing a `LastValue` channel surface as typed errors, not mid-conversation tracebacks.
+- **Validation before execution** — graph topology is validated when you call `compile()`, before any node (or paid LLM call) runs; channel conflicts like double-writing a `LastValue` channel surface as typed errors, not mid-conversation tracebacks.
 - **Single-binary deployment** — one static artifact, no interpreter, no dependency hell; a small, auditable dependency tree (tokio, serde, reqwest+rustls, thiserror).
 - **Memory footprint** — no interpreter and no GC keep the resident set small, which matters when you colocate thousands of agent threads.
 
@@ -274,23 +274,23 @@ See [`examples/README.md`](examples/README.md) for a guided tour of all four.
 
 ## Roadmap
 
-- [x] **Executor super-step loop** — the Pregel/BSP *plan → parallel → barrier → merge → route → checkpoint* algorithm in `executor.rs` ✅ shipped
-- [x] **`JsonFileCheckpointer`** — pure-`serde_json` durable file persistence ✅ shipped
-- [x] **Postgres checkpointer** — `sqlx`-backed `PostgresCheckpointer` behind the `postgres` cargo feature ✅ shipped in v0.2.0
-- [x] **Prebuilt ReAct agent** — one-call `react::create_react_agent(model, tools)` assembling the standard loop ✅ shipped
-- [x] **Token streaming** — `ChatModel::chat_stream` + `GraphEvent::Token` (the `messages` stream mode) ✅ shipped in v0.2.0
-- [x] **Live agent example** — `examples/live_agent.rs` against any OpenAI-compatible endpoint ✅ shipped in v0.2.0
-- [x] **MCP client** — call MCP tool servers (e.g. memory servers) from `Tool` impls over stdio ✅ shipped in v0.3.0
-- [x] **Remote nodes + `rusty-worker`** — `RemoteNode` executes nodes on remote worker services; HITL interrupts cross the wire ✅ shipped in v0.3.0
-- [x] **Executor tracing** — `tracing` spans through the super-step loop ✅ shipped in v0.3.0
-- [x] **Time travel** — `Checkpointer::get_by_id` / `fork_thread` + `RunConfig::with_checkpoint_id`; exposed over HTTP by `rusty-server` v0.3 (`POST /threads/{id}/fork`, checkpoint replay on run endpoints) ✅ shipped in v0.4.0
-- [x] **WASM nodes** — sandboxed `WasmNode` execution via Wasmtime behind the `wasm` cargo feature ✅ shipped in v0.4.0
-- [x] **OpenTelemetry** — OTLP export per super-step/node/LLM call via the [`rusty-otel`](../rusty-otel) crate ✅ shipped in v0.4.0 (`rusty-otel` v0.1.0)
+- [x] **Executor super-step loop** — the Pregel/BSP *plan → parallel → barrier → merge → route → checkpoint* algorithm in `executor.rs` ✅ implemented
+- [x] **`JsonFileCheckpointer`** — pure-`serde_json` durable file persistence ✅ implemented
+- [x] **Postgres checkpointer** — `sqlx`-backed `PostgresCheckpointer` behind the `postgres` cargo feature ✅ implemented in v0.2.0
+- [x] **Prebuilt ReAct agent** — one-call `react::create_react_agent(model, tools)` assembling the standard loop ✅ implemented
+- [x] **Token streaming** — `ChatModel::chat_stream` + `GraphEvent::Token` (the `messages` stream mode) ✅ implemented in v0.2.0
+- [x] **Live agent example** — `examples/live_agent.rs` against any OpenAI-compatible endpoint ✅ implemented in v0.2.0
+- [x] **MCP client** — call MCP tool servers (e.g. memory servers) from `Tool` impls over stdio ✅ implemented in v0.3.0
+- [x] **Remote nodes + `rusty-worker`** — `RemoteNode` executes nodes on remote worker services; HITL interrupts cross the wire ✅ implemented in v0.3.0
+- [x] **Executor tracing** — `tracing` spans through the super-step loop ✅ implemented in v0.3.0
+- [x] **Time travel** — `Checkpointer::get_by_id` / `fork_thread` + `RunConfig::with_checkpoint_id`; exposed over HTTP by `rusty-server` v0.3 (`POST /threads/{id}/fork`, checkpoint replay on run endpoints) ✅ implemented in v0.4.0
+- [x] **WASM nodes** — sandboxed `WasmNode` execution via Wasmtime behind the `wasm` cargo feature ✅ implemented in v0.4.0
+- [x] **OpenTelemetry** — OTLP export per super-step/node/LLM call via the [`rusty-otel`](../rusty-otel) crate ✅ implemented in v0.4.0 (`rusty-otel` v0.1.0)
 - [ ] **WASM target** — run graphs in the browser or edge runtimes (sans native checkpointers)
 - [ ] **Provider adapters** — thin `ChatModel` impls over Rig, `async-openai`, `genai`
 - [x] ~~**PyO3 / napi-rs bindings**~~ — **rejected**: the HTTP/SSE server is the polyglot interop layer; see [docs/roadmap.md](../docs/roadmap.md)
 
-The platform-wide roadmap — shipped phases, this cycle's workstreams, Phase C/D candidates — lives in [docs/roadmap.md](../docs/roadmap.md).
+The platform-wide roadmap — implemented phases, this cycle's workstreams, Phase C/D candidates — lives in [docs/roadmap.md](../docs/roadmap.md).
 
 ## Contributing
 

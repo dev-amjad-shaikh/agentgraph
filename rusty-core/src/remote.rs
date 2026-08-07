@@ -46,7 +46,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::error::{RustyError, Result};
+use crate::error::{Result, RustyError};
 use crate::llm::{backoff_delay, truncate_body};
 use crate::node::{Command, Node, NodeContext, NodeOutput};
 use crate::state::State;

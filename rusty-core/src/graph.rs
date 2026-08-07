@@ -1,4 +1,5 @@
-//! Graph definition and compile-time validation.
+//! Graph definition, plus structural validation when you call
+//! [`GraphBuilder::compile`].
 //!
 //! The public graph API is deliberately a thin builder ([`GraphBuilder`]);
 //! `compile()` freezes the graph into an immutable, cheaply-clonable
@@ -32,7 +33,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::error::{RustyError, Result};
+use crate::error::{Result, RustyError};
 use crate::node::Node;
 use crate::state::State;
 
@@ -237,8 +238,8 @@ impl GraphBuilder {
     /// super-step.
     ///
     /// [`GraphBuilder::compile`] rejects a node that has both static and
-    /// conditional edges — ambiguous routing is a compile-time error, not a
-    /// runtime surprise. Dynamic routing via `Command::goto` from a node
+    /// conditional edges — ambiguous routing fails when you call `compile()`,
+    /// not as a runtime surprise. Dynamic routing via `Command::goto` from a node
     /// that also has static edges remains a runtime rule: both paths
     /// execute.
     pub fn add_edge(&mut self, from: impl Into<String>, to: impl Into<String>) -> &mut Self {

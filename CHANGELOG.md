@@ -100,7 +100,7 @@ All notable changes to the Rusty platform. Format loosely follows [Keep a Change
 
 **Added**
 
-- **Execution core** — typed state channels with per-key `Reducer`s (`Overwrite`, `Append`, `DeepMerge`, `AddMessages`); `GraphBuilder` with compile-time topology validation; Pregel/BSP super-step executor (*plan → parallel over immutable snapshot → barrier → merge via reducers → route → checkpoint*) with `max_steps` guard.
+- **Execution core** — state channels with per-key `Reducer`s (`Overwrite`, `Append`, `DeepMerge`, `AddMessages`) over schema-declared, runtime-validated JSON state; `GraphBuilder` with topology validation when you call `compile()`; Pregel/BSP super-step executor (*plan → parallel over immutable snapshot → barrier → merge via reducers → route → checkpoint*) with `max_steps` guard.
 - **Checkpointing** — `Checkpointer` trait with `InMemoryCheckpointer` and durable `JsonFileCheckpointer` (pure `serde_json`); versioned, thread-scoped snapshots with time-travel listing.
 - **Human-in-the-loop** — `ctx.interrupt(payload)` suspends a run into `ExecutionOutcome::Interrupted`; resume with `RunConfig::with_resume(value)` and `ctx.resume_value()`.
 - **Routing** — static edges, conditional routers, `Route::Send` dynamic fan-out, and `Command::goto` node-driven control flow.

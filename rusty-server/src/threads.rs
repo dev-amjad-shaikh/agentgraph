@@ -109,10 +109,7 @@ mod tests {
 
     impl TestDir {
         fn new() -> Self {
-            Self(
-                std::env::temp_dir()
-                    .join(format!("rusty-threads-test-{}", uuid::Uuid::new_v4())),
-            )
+            Self(std::env::temp_dir().join(format!("rusty-threads-test-{}", uuid::Uuid::new_v4())))
         }
     }
 

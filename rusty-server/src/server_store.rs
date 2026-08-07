@@ -671,11 +671,14 @@ mod postgres {
 
         async fn cp(
             &self,
-        ) -> rusty_agent_runtime::error::Result<&rusty_agent_runtime::checkpoint_postgres::PostgresCheckpointer>
-        {
+        ) -> rusty_agent_runtime::error::Result<
+            &rusty_agent_runtime::checkpoint_postgres::PostgresCheckpointer,
+        > {
             self.inner
                 .get_or_try_init(|| {
-                    rusty_agent_runtime::checkpoint_postgres::PostgresCheckpointer::connect(&self.url)
+                    rusty_agent_runtime::checkpoint_postgres::PostgresCheckpointer::connect(
+                        &self.url,
+                    )
                 })
                 .await
         }
@@ -693,14 +696,16 @@ mod postgres {
         async fn get_latest(
             &self,
             thread_id: &str,
-        ) -> rusty_agent_runtime::error::Result<Option<rusty_agent_runtime::checkpoint::Checkpoint>> {
+        ) -> rusty_agent_runtime::error::Result<Option<rusty_agent_runtime::checkpoint::Checkpoint>>
+        {
             self.cp().await?.get_latest(thread_id).await
         }
 
         async fn list(
             &self,
             thread_id: &str,
-        ) -> rusty_agent_runtime::error::Result<Vec<rusty_agent_runtime::checkpoint::Checkpoint>> {
+        ) -> rusty_agent_runtime::error::Result<Vec<rusty_agent_runtime::checkpoint::Checkpoint>>
+        {
             self.cp().await?.list(thread_id).await
         }
 
@@ -708,7 +713,8 @@ mod postgres {
             &self,
             thread_id: &str,
             checkpoint_id: &str,
-        ) -> rusty_agent_runtime::error::Result<Option<rusty_agent_runtime::checkpoint::Checkpoint>> {
+        ) -> rusty_agent_runtime::error::Result<Option<rusty_agent_runtime::checkpoint::Checkpoint>>
+        {
             self.cp().await?.get_by_id(thread_id, checkpoint_id).await
         }
 

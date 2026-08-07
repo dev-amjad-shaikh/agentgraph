@@ -62,14 +62,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rusty_agent_runtime::error::RustyError;
-use rusty_agent_runtime::node::{Node, NodeContext};
-use rusty_agent_runtime::remote::{NodeTask, NodeTaskResponse, PROTOCOL_VERSION};
 use axum::extract::State as AxumState;
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::{get, post};
 use axum::Router;
+use rusty_agent_runtime::error::RustyError;
+use rusty_agent_runtime::node::{Node, NodeContext};
+use rusty_agent_runtime::remote::{NodeTask, NodeTaskResponse, PROTOCOL_VERSION};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tracing::Instrument;
@@ -250,9 +250,7 @@ async fn execute_task(
                 // Only reachable if the runtime is shutting down mid-request.
                 "handler task cancelled".to_owned()
             };
-            Err(RustyError::Node(format!(
-                "node `{node_name}` {detail}"
-            )))
+            Err(RustyError::Node(format!("node `{node_name}` {detail}")))
         }
     };
     match result {

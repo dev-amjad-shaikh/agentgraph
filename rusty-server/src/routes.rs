@@ -5,8 +5,6 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rusty_agent_runtime::checkpoint::{Checkpoint, Checkpointer, JsonFileCheckpointer};
-use rusty_agent_runtime::state::State;
 use axum::extract::{Path, State as AxumState};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -14,6 +12,8 @@ use axum::routing::{delete, get, post, put};
 use axum::{middleware, Extension, Json, Router};
 use chrono::Utc;
 use futures::Stream;
+use rusty_agent_runtime::checkpoint::{Checkpoint, Checkpointer, JsonFileCheckpointer};
+use rusty_agent_runtime::state::State;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;

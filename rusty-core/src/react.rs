@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use crate::error::{RustyError, Result};
+use crate::error::{Result, RustyError};
 use crate::executor::GraphEvent;
 use crate::graph::{Graph, GraphBuilder, Route};
 use crate::llm::{ChatMessage, ChatModel};

@@ -5,11 +5,11 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use rusty_agent_runtime::prelude::*;
-use rusty_server::{router, GraphRegistry, ServerConfig};
 use axum::body::{to_bytes, Body, Bytes};
 use axum::http::{Request, StatusCode};
 use axum::Router;
+use rusty_agent_runtime::prelude::*;
+use rusty_server::{router, GraphRegistry, ServerConfig};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -50,10 +50,7 @@ fn slow_graph() -> (Graph, StateSpec) {
 
 /// Unique temp store root, removed at the end of each test (best effort).
 fn temp_store() -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "rusty-server-v02-test-{}",
-        uuid::Uuid::new_v4()
-    ))
+    std::env::temp_dir().join(format!("rusty-server-v02-test-{}", uuid::Uuid::new_v4()))
 }
 
 fn test_app() -> (Router, PathBuf) {

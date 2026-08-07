@@ -14,8 +14,8 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use rusty_agent_runtime::prelude::*;
 use async_trait::async_trait;
+use rusty_agent_runtime::prelude::*;
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------

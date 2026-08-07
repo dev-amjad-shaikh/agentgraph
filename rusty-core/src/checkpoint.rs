@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::error::{RustyError, Result};
+use crate::error::{Result, RustyError};
 use crate::state::State;
 
 /// A versioned snapshot of one thread's state at a super-step boundary.
@@ -118,7 +118,7 @@ pub trait Checkpointer: Send + Sync {
     ///
     /// The default implementation re-`put`s each selected checkpoint with the
     /// destination thread id. This is correct for every implementation whose
-    /// `put` uniqueness scope is per-thread — including both shipped impls
+    /// `put` uniqueness scope is per-thread — including both built-in impls
     /// ([`InMemoryCheckpointer`] keys its map by thread, and
     /// [`JsonFileCheckpointer`] stores under `{dir}/{thread_id}/`), so reused
     /// ids cannot collide across threads. An implementation whose `put`
@@ -350,10 +350,7 @@ impl JsonFileCheckpointer {
             ))
         })?;
         serde_json::from_slice(&bytes).map_err(|e| {
-            RustyError::Checkpoint(format!(
-                "corrupt checkpoint file `{}`: {e}",
-                path.display()
-            ))
+            RustyError::Checkpoint(format!("corrupt checkpoint file `{}`: {e}", path.display()))
         })
     }
 
@@ -561,10 +558,10 @@ mod tests {
 
     impl TestDir {
         fn new() -> Self {
-            Self(std::env::temp_dir().join(format!(
-                "rusty-checkpoint-test-{}",
-                uuid::Uuid::new_v4()
-            )))
+            Self(
+                std::env::temp_dir()
+                    .join(format!("rusty-checkpoint-test-{}", uuid::Uuid::new_v4())),
+            )
         }
     }
 

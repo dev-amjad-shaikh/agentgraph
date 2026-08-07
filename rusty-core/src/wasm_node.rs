@@ -51,7 +51,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use wasmtime::{Config, Engine, Linker, Module, ResourceLimiter, Store};
 
-use crate::error::{RustyError, Result};
+use crate::error::{Result, RustyError};
 use crate::node::{Command, Node, NodeContext, NodeOutput};
 
 /// Per-call sandbox limits for a guest invocation.

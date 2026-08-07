@@ -6,7 +6,7 @@
 truth in `rusty-core/src/lib.rs`, `rusty-core/src/executor.rs`, `rusty-core/src/checkpoint.rs`,
 `rusty-core/examples/react_agent.rs`.
 
-`rusty-agent-runtime` today is a pure library: typed state channels with reducers, a Pregel/BSP
+`rusty-agent-runtime` today is a pure library: state channels with reducers over schema-declared, runtime-validated JSON state, a Pregel/BSP
 super-step executor, thread-scoped checkpoints (`InMemoryCheckpointer`,
 `JsonFileCheckpointer`), interrupts/HITL, `Send` fan-out, `GraphEvent` streaming over a
 tokio mpsc sink, a `ChatModel` abstraction, and a prebuilt ReAct agent. There is no
@@ -266,7 +266,7 @@ now and built later. The architectural rule that makes this cheap:
 hundreds of milliseconds to minutes. A 1–5 ms gRPC hop is **<1% overhead**; the classic
 objection to out-of-process execution evaporates. And because `rusty-agent-runtime`'s `State` is
 already a `serde_json::Value` map, the wire boundary serializes channels *losslessly* —
-the "typed channels flatten to JSON" cost that Pattern 2 usually pays is one we pay by
+the channel-serialization cost that Pattern 2 usually pays is one we pay by
 construction already.
 
 **Phase B split (Temporal's template).** The **server keeps checkpoints, super-step
@@ -358,23 +358,23 @@ Postgres checkpointer selected.
 
 ## Status (2026-08-05)
 
-**Phase A has shipped** as `rusty-server` v0.1.0 (library crate; `GraphRegistry`,
+**Phase A is implemented** as `rusty-server` v0.1.0 (library crate; `GraphRegistry`,
 `ServerConfig`, `serve()` / `router()`), alongside core `rusty-agent-runtime` v0.2.0 (Postgres
 checkpointer behind the `postgres` feature, token streaming via `ChatModel::chat_stream`
 + `GraphEvent::Token`). Implemented endpoint inventory:
 
 | Endpoint | Status |
 |---|---|
-| `GET /ok` | ✅ shipped |
-| `GET /info` | ✅ shipped (version, checkpointer kind, store path, graphs + channels) |
-| `POST /threads` | ✅ shipped (`201`; `{graph, metadata?, thread_id?}`) |
-| `GET /threads/{id}/state` | ✅ shipped (`{values, next, checkpoint}`) |
-| `POST /threads/{id}/state` | ✅ shipped (`update_state` analog; `201`) |
-| `POST /threads/{id}/history` | ✅ shipped (newest first, `limit` / `before`) |
-| `POST /threads/{id}/runs` | ✅ shipped (`202` + `{run_id, thread_id, status}`) |
-| `POST /threads/{id}/runs/wait` | ✅ shipped (terminal JSON: success / interrupted / error) |
-| `POST /threads/{id}/runs/stream` | ✅ shipped (SSE: `metadata`/`updates`/`values`/`messages`/`error`/`end`; frame ids `{checkpoint_id}:{step}:{seq}`; `Last-Event-ID` dedup over a per-run in-memory event log) |
-| `DELETE /threads/{id}/runs/{run_id}` | ✅ shipped (rollback: delete a finished run's checkpoints; `409` while active) |
+| `GET /ok` | ✅ implemented |
+| `GET /info` | ✅ implemented (version, checkpointer kind, store path, graphs + channels) |
+| `POST /threads` | ✅ implemented (`201`; `{graph, metadata?, thread_id?}`) |
+| `GET /threads/{id}/state` | ✅ implemented (`{values, next, checkpoint}`) |
+| `POST /threads/{id}/state` | ✅ implemented (`update_state` analog; `201`) |
+| `POST /threads/{id}/history` | ✅ implemented (newest first, `limit` / `before`) |
+| `POST /threads/{id}/runs` | ✅ implemented (`202` + `{run_id, thread_id, status}`) |
+| `POST /threads/{id}/runs/wait` | ✅ implemented (terminal JSON: success / interrupted / error) |
+| `POST /threads/{id}/runs/stream` | ✅ implemented (SSE: `metadata`/`updates`/`values`/`messages`/`error`/`end`; frame ids `{checkpoint_id}:{step}:{seq}`; `Last-Event-ID` dedup over a per-run in-memory event log) |
+| `DELETE /threads/{id}/runs/{run_id}` | ✅ implemented (rollback: delete a finished run's checkpoints; `409` while active) |
 | `GET /runs/{run_id}` (run polling) | ❌ not in Phase A — Phase C roadmap |
 | `GET`/`DELETE /threads…` (list/delete threads), `GET /graphs`, `GET /metrics` | ❌ not in Phase A — roadmap |
 
@@ -382,10 +382,10 @@ Deviations from the design draft as implemented: config is code-only
 (`ServerConfig::new(bind_addr, store_path)` + builders `with_api_key`,
 `with_max_concurrent_runs_per_thread`, `with_event_log_capacity`); no `from_env()` and
 no `RUSTY_*` env vars are read by the crate. The §2 sample has been corrected to
-the shipped `OpenAiCompatibleClient::from_env(base_url, api_key_env, model)` (three
+the implemented `OpenAiCompatibleClient::from_env(base_url, api_key_env, model)` (three
 arguments, returns `Self`, not `Result`). The checkpointer is wired from
 `ServerConfig::store_path` (`JsonFileCheckpointer`); there is no `with_checkpointer`
-builder. `multitask_strategy` ships as `enqueue` (default) / `reject`; LangGraph's
+builder. `multitask_strategy` is implemented as `enqueue` (default) / `reject`; LangGraph's
 `rollback` is an explicit `DELETE` on a finished run instead. Thread records are
 in-memory in v0.1 (checkpoints are durable on disk). SSE resume replays the per-run
 in-memory event log; durable cross-restart stream reconstruction from the checkpoint

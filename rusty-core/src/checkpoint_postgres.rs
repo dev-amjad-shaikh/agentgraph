@@ -31,7 +31,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
 use crate::checkpoint::{Checkpoint, Checkpointer};
-use crate::error::{RustyError, Result};
+use crate::error::{Result, RustyError};
 use crate::state::State;
 
 /// The table checkpoints are stored in.

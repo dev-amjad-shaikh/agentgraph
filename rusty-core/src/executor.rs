@@ -52,7 +52,7 @@ use tokio::task::JoinSet;
 use tracing::Instrument;
 
 use crate::checkpoint::{Checkpoint, Checkpointer};
-use crate::error::{RustyError, Result};
+use crate::error::{Result, RustyError};
 use crate::graph::{Edge, Graph, Route};
 use crate::node::{Command, NodeConfig, NodeContext, NodeOutput};
 use crate::state::{State, StateSpec};
@@ -480,11 +480,8 @@ impl Executor {
 
             // The step body runs in a dedicated method so the whole body is
             // one instrumented future under the per-step span.
-            let step_span = tracing::debug_span!(
-                "rusty.super_step",
-                step = step,
-                active_nodes = active.len(),
-            );
+            let step_span =
+                tracing::debug_span!("rusty.super_step", step = step, active_nodes = active.len(),);
 
             let transition = self
                 .execute_super_step(

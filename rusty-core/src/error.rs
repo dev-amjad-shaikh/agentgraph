@@ -15,8 +15,8 @@ use thiserror::Error;
 /// the control flow explicit in the type system.
 #[derive(Debug, Error)]
 pub enum RustyError {
-    /// Structural graph problems: invalid builder usage, compile-time
-    /// validation failures (unknown entry point, dangling edges), routing
+    /// Structural graph problems: invalid builder usage, validation failures
+    /// from `GraphBuilder::compile()` (unknown entry point, dangling edges), routing
     /// to unknown nodes at runtime, exceeded `max_steps`, etc.
     #[error("graph error: {0}")]
     Graph(String),

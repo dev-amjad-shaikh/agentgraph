@@ -9,13 +9,20 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Lint, test, and doc-build each crate of the virtual workspace. The four
+  # matrix legs are independent: a failure in one crate never cancels the
+  # others (fail-fast: false), and each crate reports its own check.
   rust:
-    name: ${{ matrix.crate }} (fmt, clippy, test)
+    name: rust / ${{ matrix.dir }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        crate: [rusty-core, rusty-server, rusty-worker, rusty-otel]
+        include:
+          - { dir: rusty-core, pkg: rusty-agent-runtime }
+          - { dir: rusty-server, pkg: rusty-server }
+          - { dir: rusty-worker, pkg: rusty-worker }
+          - { dir: rusty-otel, pkg: rusty-otel }
     steps:
       - uses: actions/checkout@v4
 
@@ -27,52 +34,93 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.crate }}
+          # All four crates share the workspace target dir; one shared cache
+          # avoids four legs overwriting each other's cache entry.
+          shared-key: rusty-workspace
+          key: ${{ matrix.pkg }}
 
       - name: Format
-        working-directory: ${{ matrix.crate }}
-        run: cargo fmt --all -- --check
+        run: cargo fmt -p ${{ matrix.pkg }} -- --check
 
       - name: Clippy (warnings are errors)
-        working-directory: ${{ matrix.crate }}
         run: |
-          cargo clippy --all-targets -- -D warnings
-          cargo clippy --all-targets --all-features -- -D warnings
+          cargo clippy -p ${{ matrix.pkg }} --all-targets -- -D warnings
+          cargo clippy -p ${{ matrix.pkg }} --all-targets --all-features -- -D warnings
 
       - name: Test
-        working-directory: ${{ matrix.crate }}
-        run: cargo test
+        run: cargo test -p ${{ matrix.pkg }}
 
-      - name: Check all features
-        working-directory: ${{ matrix.crate }}
-        run: cargo check --all-features
+      - name: Docs (warnings are errors)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps -p ${{ matrix.pkg }}
 
-  docs:
-    name: rustdoc (${{ matrix.crate }})
+  # MSRV: resolve each crate's effective `rust-version` at runtime via
+  # cargo metadata (this follows `rust-version.workspace = true` inheritance
+  # from the root [workspace.package] table), then check the crate with
+  # exactly that toolchain. No version is hardcoded here.
+  msrv:
+    name: msrv / ${{ matrix.dir }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        crate: [rusty-core, rusty-server, rusty-worker, rusty-otel]
+        include:
+          - { dir: rusty-core, pkg: rusty-agent-runtime }
+          - { dir: rusty-server, pkg: rusty-server }
+          - { dir: rusty-worker, pkg: rusty-worker }
+          - { dir: rusty-otel, pkg: rusty-otel }
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+      # Uses the runner's preinstalled cargo; runs before any toolchain setup.
+      - name: Read effective rust-version via cargo metadata
+        id: msrv
+        run: |
+          msrv=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r --arg pkg "${{ matrix.pkg }}" '.packages[] | select(.name == $pkg) | .rust_version')
+          if [ -z "$msrv" ] || [ "$msrv" = "null" ]; then
+            echo "::error::${{ matrix.pkg }} declares no rust-version (checked directly and via workspace inheritance)"
+            exit 1
+          fi
+          echo "Effective MSRV for ${{ matrix.pkg }}: $msrv"
+          echo "version=$msrv" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust ${{ steps.msrv.outputs.version }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.crate }}
+          shared-key: rusty-workspace-msrv
+          key: ${{ matrix.pkg }}
 
-      - name: Build docs (warnings are errors)
-        working-directory: ${{ matrix.crate }}
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps
+      - name: Check with MSRV toolchain
+        run: cargo check -p ${{ matrix.pkg }} --locked
 
-  sdk-e2e:
-    name: SDK end-to-end (Python + TypeScript)
+  # Advisory scan of the workspace Cargo.lock against the RustSec advisory DB.
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: cargo audit
+        run: cargo audit --deny warnings
+
+  # Python SDK e2e. The suite launches the real rusty-server demo binary
+  # (127.0.0.1:8100); it is prebuilt here so the test run does not spend its
+  # time compiling, and so a missing binary surfaces as a build failure in CI
+  # rather than a skipped test.
+  python:
+    name: python
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -83,24 +131,48 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
+          shared-key: rusty-workspace
           key: rusty-server
 
       - name: Build server demo binary
-        working-directory: rusty-server
-        run: cargo build --example server_demo
+        run: cargo build -p rusty-server --example server_demo
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Python SDK e2e
-        run: python3 -m unittest discover -s sdks/python/tests -v
+      - name: Install pytest
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Python SDK tests
+        run: python -m pytest sdks/python/tests -q
+
+  # TypeScript SDK e2e, against the same prebuilt demo binary. The package has
+  # no runtime dependencies, so no install step is required before npm test.
+  typescript:
+    name: typescript
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rusty-workspace
+          key: rusty-server
+
+      - name: Build server demo binary
+        run: cargo build -p rusty-server --example server_demo
 
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
           node-version: "24"
 
-      - name: TypeScript SDK e2e
-        run: node --test sdks/typescript/test/
+      - name: TypeScript SDK tests
+        working-directory: sdks/typescript
+        run: npm test

@@ -3,7 +3,7 @@
 **Author role:** Rust_Server_Patterns_Researcher
 **Date:** 2026-08-04
 **Workspace:** `/Users/amjad.shaikh/claude-work/claude-white-papers/05 - RUST`
-**Question:** In a compiled language, how does USER code (agent graphs/nodes) get into a server? Python's `langgraph.json` just imports modules at runtime — Rust cannot. This document surveys the six viable patterns, their real-world precedents, and ranks them for `rusty-server` (crate: `rusty-core/`, a LangGraph-style engine with typed channels/reducers, Pregel/BSP super-step execution, checkpoints, interrupts, and streaming).
+**Question:** In a compiled language, how does USER code (agent graphs/nodes) get into a server? Python's `langgraph.json` just imports modules at runtime — Rust cannot. This document surveys the six viable patterns, their real-world precedents, and ranks them for `rusty-server` (crate: `rusty-core/`, a LangGraph-style engine with schema-declared state channels and per-key reducers, Pregel/BSP super-step execution, checkpoints, interrupts, and streaming).
 
 ---
 
@@ -29,8 +29,8 @@ async fn main() {
 - **graph-flow / rig**: the two most relevant Rust agent-framework precedents both assume the embedded model — you write a Rust `main.rs`, compose your graph/agents, and run your own binary ([graph-flow repo](https://github.com/a-agmon/rs-graph-llm), [rig ecosystem](https://github.com/0xPlaygrounds/rig/blob/main/ECOSYSTEM.md)). Neither ships a standalone "agent server you load graphs into."
 
 **Pros.**
-- Full type safety end-to-end: state types, reducers, and node signatures are checked at compile time — this is `rusty-agent-runtime`'s core value proposition (typed channels).
-- Zero serialization boundary: node state stays as native Rust types; no JSON round-trip per super-step.
+- Graph wiring, reducers, and node signatures are checked by the Rust compiler; state itself is schema-declared JSON (`StateSpec`) validated at runtime — channel conflicts surface as typed errors at the super-step barrier.
+- Zero serialization boundary: node state stays in process; no JSON round-trip per super-step.
 - Best performance; LLM-token streaming can flow straight from node futures into the SSE response without intermediate encoding.
 - Operational simplicity: one binary, one deploy artifact, no version-skew between server and user code.
 - Async correctness: nodes are `async fn` with real `tokio` — no FFI/async impedance mismatch.
@@ -57,7 +57,7 @@ async fn main() {
 **Why it fits agent workloads specifically.** Agent nodes are dominated by LLM call latency (hundreds of ms to minutes per node). A gRPC hop of 1–5 ms is <1% overhead — the classic objection to out-of-process execution evaporates. Meanwhile the wins are large: **polyglot workers** (a Python worker can host the LangChain ecosystem while the Rust engine owns orchestration), independent scaling of GPU/tool-heavy nodes, crash isolation (a segfaulting tool node can't take down the checkpoint store), and per-node retry/timeout policy at the queue level. This is also the only pattern that gives a hosted multi-tenant platform story (LangGraph Cloud equivalent).
 
 **Cons.**
-- State must cross the wire: `rusty-agent-runtime`'s typed channels become serde-JSON at the worker boundary, losing compile-time state-type checking between server and worker (a versioned protobuf/JSON schema mitigates).
+- State must cross the wire: `rusty-agent-runtime`'s channels already hold serde-JSON in process, so the worker boundary adds no new encoding cost — but the server↔worker protocol becomes a versioned contract of its own (a versioned protobuf/JSON schema mitigates).
 - Streaming is harder: token-level SSE from a node must be relayed worker→server→client (Hatchet shows streaming step outputs are doable; Temporal notably does *not* stream activity output well).
 - Two artifacts to deploy; worker/server protocol versioning becomes a permanent maintenance surface.
 - Distributed checkpoint semantics (who owns reducer application?) must be designed carefully — Temporal's answer (server owns history, workers are dumb executors) is the right template.
@@ -101,7 +101,7 @@ async fn main() {
 **Cons.**
 - WASI's networking story is the friction point: direct HTTP from inside a module requires `wasi:http` (works but adds toolchain constraints); many hosts instead proxy LLM/tool calls through host functions, which is more code for the server team.
 - Component Model tooling, while real, is still rougher than native cargo builds; debugging a WASM node is materially worse than debugging native Rust.
-- State must still serialize across the boundary (WIT-defined types); `rusty-agent-runtime`'s rich typed channels flatten to WIT records.
+- State must still serialize across the boundary (WIT-defined types); `rusty-agent-runtime`'s free-form JSON channel values must map onto WIT records.
 - Async/streaming across the WASM boundary is workable (`wasi:http` streaming bodies) but adds engineering effort to get token-level SSE through.
 
 **Verdict:** **Adopt selectively.** Not the default authoring path, but the right answer for untrusted/community nodes and a future node marketplace. Position as a `Node` trait implementation (`WasmNode`) — Pattern 1 graphs can embed WASM nodes without architectural upheaval.
@@ -169,7 +169,7 @@ Regardless of pattern, the serving layer norms are settled (sources: [axum SSE d
 
 ## Ranked Recommendation for `rusty-server`
 
-1. **Pattern 1 — Library-embedded server (primary, ship first).** It is the idiomatic Rust answer, matches every comparable precedent (axum, DataFusion, rig, graph-flow), preserves `rusty-agent-runtime`'s typed-channel compile-time guarantees, and gives the best SSE streaming path. Deliverable: `rusty-server` crate exposing `GraphRegistry` + `serve()` over axum, with an rmcp-style "JSON or SSE" run endpoint and checkpoint-resumable streams.
+1. **Pattern 1 — Library-embedded server (primary, ship first).** It is the idiomatic Rust answer, matches every comparable precedent (axum, DataFusion, rig, graph-flow), preserves `rusty-agent-runtime`'s compile-time-checked graph wiring and node signatures, and gives the best SSE streaming path. Deliverable: `rusty-server` crate exposing `GraphRegistry` + `serve()` over axum, with an rmcp-style "JSON or SSE" run endpoint and checkpoint-resumable streams.
 2. **Pattern 2 — Worker/delegate (design for it now, build second).** Define the `Node` execution contract and wire protocol (gRPC + versioned JSON/protobuf state) so the same `Node` trait has both an in-process and a remote implementation. LLM latency makes the hop free; Temporal/Inngest/Hatchet prove the shape; it's the only route to polyglot workers and a hosted platform. The key architectural rule: **the server owns checkpoints and scheduling; workers are stateless executors** — copied directly from Temporal's History/Worker split.
 3. **Pattern 4 — WASM (scoped adoption).** Add a `WasmNode` behind the same `Node` trait when (and only when) untrusted/community nodes or a node marketplace become a goal. wasmtime/Extism are production-ready in 2026; MCP-component distribution (Wassette model) is the emerging norm.
 4. **Pattern 6 — Rhai scripting (cheap DX garnish).** For routing predicates and prompt assembly inside otherwise-compiled graphs. Sandboxed by default, trivial to embed.

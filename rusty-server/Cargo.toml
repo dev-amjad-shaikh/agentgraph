@@ -1,10 +1,14 @@
 [package]
 name = "rusty-server"
 version = "0.4.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/rusty-server"
+readme = "README.md"
 description = "The durable agent runtime built in Rust — HTTP/SSE server: an Agent-Protocol subset with threads, background runs, checkpoints, and resumable streaming."
-repository = "https://github.com/dev-amjad-shaikh/rusty"
 keywords = ["agent", "graph", "llm", "server", "langgraph"]
 categories = ["asynchronous", "network-programming"]
 
@@ -15,7 +19,7 @@ categories = ["asynchronous", "network-programming"]
 postgres = ["dep:sqlx", "rusty-agent-runtime/postgres"]
 
 [dependencies]
-rusty-agent-runtime = { path = "../rusty-core" }
+rusty-agent-runtime = { path = "../rusty-core", version = "0.4" }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
 
-use crate::error::{RustyError, Result};
+use crate::error::{Result, RustyError};
 
 /// Maximum characters of an HTTP error body embedded in an error message:
 /// enough for diagnosis, bounded so a verbose server cannot bloat logs.
@@ -905,14 +905,16 @@ impl ChatModel for OpenAiCompatibleClient {
             })
             .await?;
 
-        let wire: WireResponse = response.json().await.map_err(|e| {
-            RustyError::Llm(format!("malformed chat completions response: {e}"))
-        })?;
+        let wire: WireResponse = response
+            .json()
+            .await
+            .map_err(|e| RustyError::Llm(format!("malformed chat completions response: {e}")))?;
 
-        let choice =
-            wire.choices.into_iter().next().ok_or_else(|| {
-                RustyError::Llm("chat completions returned zero choices".into())
-            })?;
+        let choice = wire
+            .choices
+            .into_iter()
+            .next()
+            .ok_or_else(|| RustyError::Llm("chat completions returned zero choices".into()))?;
 
         Ok(ChatResponse {
             message: choice.message,
