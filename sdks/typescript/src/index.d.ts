@@ -161,6 +161,207 @@ export interface StreamFrame {
   retry?: number;
 }
 
+// ---------------------------------------------------------------------
+// Flight Recorder (GET /runs/{run_id}/events)
+// ---------------------------------------------------------------------
+
+/** The effect taxonomy: what a journaled event did to the world. */
+export type Effect =
+  | 'pure'
+  | 'read_only'
+  | 'idempotent'
+  | 'compensatable'
+  | 'non_idempotent';
+
+/** What a {@link RunEvent} records (closed set). */
+export type RunEventKind =
+  | 'super_step_start'
+  | 'super_step_end'
+  | 'node_input'
+  | 'node_output'
+  | 'model_call'
+  | 'tool_call'
+  | 'remote_call'
+  | 'wasm_call'
+  | 'interrupt'
+  | 'resume'
+  | 'routing_decision'
+  | 'checkpoint_written';
+
+/** The outcome status of a journaled event. */
+export type EventStatus = 'ok' | 'error' | 'interrupted';
+
+/** A content-addressed reference to an oversized payload. */
+export interface ArtifactRef {
+  /** Lowercase hex SHA-256 of the payload's canonical JSON serialization. */
+  sha256: string;
+  /** Serialized size of the payload in bytes. */
+  bytes: number;
+}
+
+/** How an event's input or output payload is carried (adjacently tagged). */
+export type PayloadRef =
+  | { kind: 'inline'; value: JsonValue }
+  | { kind: 'artifact'; value: ArtifactRef };
+
+/** Token usage reported for a model call. */
+export interface TokenUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+
+/**
+ * One recorded fact about a run: the Flight Recorder's atomic evidence.
+ * Events form a total order via `seq` and a causal chain via `parent`;
+ * ids are deterministic (`{run_id}:{seq}`).
+ */
+export interface RunEvent {
+  id: string;
+  run_id: string;
+  thread_id: string;
+  node_id: string | null;
+  seq: number;
+  kind: RunEventKind;
+  effect: Effect;
+  input: PayloadRef | null;
+  output: PayloadRef | null;
+  latency_ms: number | null;
+  tokens: TokenUsage | null;
+  cost_usd: number | null;
+  status: EventStatus;
+  parent: string | null;
+  recorded_at: string;
+}
+
+/** `GET /runs/{run_id}/events` response. */
+export interface RunEventsResponse {
+  run_id: string;
+  /** The journaled events in `seq` order. */
+  events: RunEvent[];
+  /**
+   * `true` once the run is terminal — the served snapshot is the final
+   * journal. While active it trails the live journal by at most one
+   * checkpoint boundary.
+   */
+  complete: boolean;
+}
+
+/** A checkpoint as carried by a replay fixture (`thread_id` is external). */
+export interface FixtureCheckpoint {
+  id: string;
+  thread_id: string;
+  step: number;
+  state: Record<string, JsonValue>;
+  next_nodes: string[];
+  created_at: string;
+  [key: string]: unknown;
+}
+
+/** Provenance and determinism metadata of a {@link ReplayFixture}. */
+export interface FixtureMetadata {
+  /** Human-readable fixture name. */
+  name: string;
+  /** The recorded run's logical-clock parameters (CI replay only). */
+  clock?: { start_ms: number; tick_ms: number };
+  /** The recorded run's RNG seed (CI replay only). */
+  rng_seed?: number;
+}
+
+/**
+ * `GET /runs/{run_id}/fixture` response: a portable exact-replay bundle
+ * (core's `ReplayFixture` envelope). Feed the JSON to
+ * `ReplayFixture::import` to re-drive the run in CI.
+ */
+export interface ReplayFixture {
+  /** Fixture envelope version (`1` for anything written now). */
+  format_version: number;
+  /** SHA-256 of the recorded graph's topology. */
+  graph_hash: string;
+  /** The application-declared graph version of the recorded run. */
+  graph_version: string;
+  /** The recorded run's complete journal. */
+  journal: {
+    run_id: string;
+    thread_id: string;
+    events: RunEvent[];
+    artifacts: Record<string, JsonValue>;
+    head_hash: string;
+  };
+  /** The recorded run's final checkpoint, when it ran with a checkpointer. */
+  final_checkpoint: FixtureCheckpoint | null;
+  metadata: FixtureMetadata;
+}
+
+/**
+ * `POST /runs/replay` response (exact shape — consumers, including the
+ * Studio, key off these five fields).
+ */
+export interface ReplayReport {
+  run_id: string;
+  /**
+   * `true` when the replayed evidence reproduces the recorded journal:
+   * same kinds, nodes, sequences, effect classes, statuses, and payloads
+   * (per-run minted checkpoint ids and wall-clock measurements excluded).
+   */
+  verified: boolean;
+  /** Number of events in the recorded journal. */
+  expected_events: number;
+  /** Number of events the replay journaled. */
+  actual_events: number;
+  /** The `seq` of the first disagreeing event, or `null` when identical. */
+  first_divergence: number | null;
+}
+
+/** Token and cost totals of one branch of a {@link BranchDiff}. */
+export interface BranchTotals {
+  /** Number of events in the branch. */
+  events: number;
+  /** Summed token usage across the branch's model calls. */
+  tokens: TokenUsage;
+  /** Summed recorded cost in USD across the branch's events. */
+  cost_usd: number;
+}
+
+/** One channel's differing value at one super-step of a {@link BranchDiff}. */
+export interface ChannelDiff {
+  /** The state channel that differs. */
+  channel: string;
+  /** The post-reducer value in the base branch, when present. */
+  base: JsonValue | null;
+  /** The post-reducer value in the branch, when present. */
+  branch: JsonValue | null;
+}
+
+/** The state-channel differences of one super-step between two branches. */
+export interface StepDiff {
+  /** The super-step index. */
+  step: number;
+  /** Channels whose post-reducer values differ, sorted by name. */
+  channels: ChannelDiff[];
+}
+
+/**
+ * `GET /runs/diff?base=&branch=` response (core's `BranchDiff` serde
+ * shape): the structural diff of two runs' journals. Events compare
+ * logically — identity and timing fields excluded — so branches forked
+ * from one point show their shared prefix as equal.
+ */
+export interface BranchDiff {
+  /** The first `seq` where the branches differ, or `null` when identical. */
+  first_divergent_seq: number | null;
+  /** Branch events at and after the divergence point (its new work). */
+  added: RunEvent[];
+  /** Base events at and after the divergence point (the replaced work). */
+  removed: RunEvent[];
+  /** State-channel differences per super-step (steps with diffs only). */
+  step_diffs: StepDiff[];
+  /** Totals over the whole base journal. */
+  base_totals: BranchTotals;
+  /** Totals over the whole branch journal. */
+  branch_totals: BranchTotals;
+}
+
 /** Assistant record: a named graph + config alias. */
 export interface Assistant {
   assistant_id: string;
@@ -325,6 +526,18 @@ export declare class RustyClient {
 
   /** Poll a run's status. */
   runStatus(runId: string, opts?: RequestOptions): Promise<RunStatus>;
+
+  /** Fetch a run's Flight Recorder journal (`{run_id, events, complete}`). */
+  runEvents(runId: string, opts?: RequestOptions): Promise<RunEventsResponse>;
+
+  /** Download a run as a portable replay fixture (`ReplayFixture` envelope). */
+  getFixture(runId: string, opts?: RequestOptions): Promise<ReplayFixture>;
+
+  /** Re-drive a journaled run server-side and verify the replayed evidence. */
+  replayRun(runId: string, opts?: RequestOptions): Promise<ReplayReport>;
+
+  /** Structural diff of two runs' journals (core's `BranchDiff` shape). */
+  diffRuns(base: string, branch: string, opts?: RequestOptions): Promise<BranchDiff>;
 
   /** Roll back a finished run's checkpoints. */
   deleteRun(threadId: string, runId: string, opts?: RequestOptions): Promise<unknown>;

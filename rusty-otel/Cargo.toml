@@ -13,7 +13,7 @@ keywords = ["opentelemetry", "tracing", "observability", "agent", "otlp"]
 categories = ["asynchronous", "network-programming"]
 
 [dependencies]
-rusty-agent-runtime = { path = "../rusty-core", version = "0.4" }
+rusty-agent-runtime = { path = "../rusty-core", version = "0.5" }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "registry"] }

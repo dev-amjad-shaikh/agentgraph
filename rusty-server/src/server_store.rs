@@ -7,10 +7,12 @@
 //! - [`JsonFileStore`] — the default. Existing v0.2 behavior, extracted:
 //!   assistants, crons, and threads live in an in-memory index persisted as
 //!   one JSON file per record under `{store_path}/{assistants,crons,threads}/`;
-//!   KV items are pure file-backed reads/writes under `{store_path}/store/`.
+//!   KV items are pure file-backed reads/writes under `{store_path}/store/`;
+//!   Flight Recorder journals are one file per run under
+//!   `{store_path}/journals/`.
 //! - [`PostgresStore`] (feature `postgres`) — tables `server_assistants`,
-//!   `server_crons`, `server_threads`, and `server_kv` with JSONB payloads,
-//!   auto-migrated on (lazy) connect. Selected via
+//!   `server_crons`, `server_threads`, `server_kv`, and `server_journals`
+//!   with JSONB payloads, auto-migrated on (lazy) connect. Selected via
 //!   `ServerConfig::with_postgres(url)`.
 //!
 //! All trait errors are plain `String`s; routes map them to 500s — no store
@@ -19,11 +21,13 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use rusty_agent_runtime::journal::JournalSnapshot;
 use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::assistants::{self, AssistantRecord};
 use crate::crons::{self, CronRecord};
+use crate::journals;
 use crate::store::{self, StoreItem};
 use crate::threads::{self, ThreadRecord};
 
@@ -80,6 +84,15 @@ pub(crate) trait ServerStore: Send + Sync {
     /// All items in one namespace, sorted by key (empty for unknown
     /// namespaces).
     async fn kv_list(&self, namespace: &str) -> StoreResult<Vec<StoreItem>>;
+
+    /// Persist a run's Flight Recorder journal snapshot, replacing any
+    /// earlier snapshot of the same run (the journal grows at every
+    /// checkpoint boundary; the final write lands at run completion).
+    async fn put_journal(&self, snapshot: &JournalSnapshot) -> StoreResult<()>;
+    /// Fetch the journal snapshot stored for `run_id` (`None` when none was
+    /// persisted — e.g. a queued run, or one that failed before its first
+    /// checkpoint boundary).
+    async fn get_journal(&self, run_id: &str) -> StoreResult<Option<JournalSnapshot>>;
 }
 
 // --------------------------------------------------------------------- //
@@ -239,6 +252,18 @@ impl ServerStore for JsonFileStore {
             .await
             .map_err(io_err("list store namespace"))
     }
+
+    async fn put_journal(&self, snapshot: &JournalSnapshot) -> StoreResult<()> {
+        journals::persist(&self.root, snapshot)
+            .await
+            .map_err(io_err("persist journal"))
+    }
+
+    async fn get_journal(&self, run_id: &str) -> StoreResult<Option<JournalSnapshot>> {
+        journals::get(&self.root, run_id)
+            .await
+            .map_err(io_err("get journal"))
+    }
 }
 
 // --------------------------------------------------------------------- //
@@ -248,6 +273,7 @@ impl ServerStore for JsonFileStore {
 #[cfg(feature = "postgres")]
 mod postgres {
     use chrono::{DateTime, Utc};
+    use rusty_agent_runtime::journal::JournalSnapshot;
     use serde_json::Value;
     use sqlx::{PgPool, Row};
     use tokio::sync::OnceCell;
@@ -296,12 +322,24 @@ mod postgres {
             PRIMARY KEY (namespace, "key")
         )"#;
 
+    /// `server_journals`: one row per run, the Flight Recorder journal
+    /// snapshot as JSONB (`updated_at` tracks the journal's growth across
+    /// checkpoint boundaries).
+    pub(crate) const CREATE_JOURNALS_SQL: &str = "
+        CREATE TABLE IF NOT EXISTS server_journals (
+            run_id     TEXT PRIMARY KEY,
+            payload    JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )";
+
     /// All idempotent migration statements, executed in order on connect.
     pub(crate) const MIGRATION_SQL: &[&str] = &[
         CREATE_ASSISTANTS_SQL,
         CREATE_CRONS_SQL,
         CREATE_THREADS_SQL,
         CREATE_KV_SQL,
+        CREATE_JOURNALS_SQL,
     ];
 
     /// Transaction-scoped advisory lock key serializing concurrent
@@ -376,6 +414,17 @@ mod postgres {
     pub(crate) const LIST_KV_SQL: &str = r#"
         SELECT "key", value, created_at, updated_at
         FROM server_kv WHERE namespace = $1 ORDER BY "key""#;
+
+    /// Journal upsert: the snapshot is rewritten at every checkpoint
+    /// boundary, so `updated_at` moves while `created_at` is preserved.
+    pub(crate) const UPSERT_JOURNAL_SQL: &str = "
+        INSERT INTO server_journals (run_id, payload)
+        VALUES ($1, $2)
+        ON CONFLICT (run_id) DO UPDATE
+            SET payload = EXCLUDED.payload, updated_at = now()";
+
+    pub(crate) const SELECT_JOURNAL_SQL: &str =
+        "SELECT payload FROM server_journals WHERE run_id = $1";
 
     // -- Row <-> record mapping (unit-tested without a database) -------- //
 
@@ -649,6 +698,27 @@ mod postgres {
                 })
                 .collect())
         }
+
+        async fn put_journal(&self, snapshot: &JournalSnapshot) -> StoreResult<()> {
+            let payload = record_to_payload(snapshot)?;
+            sqlx::query(UPSERT_JOURNAL_SQL)
+                .bind(&snapshot.run_id)
+                .bind(payload)
+                .execute(self.pool().await?)
+                .await
+                .map_err(db_err("upsert journal"))?;
+            Ok(())
+        }
+
+        async fn get_journal(&self, run_id: &str) -> StoreResult<Option<JournalSnapshot>> {
+            let row = sqlx::query(SELECT_JOURNAL_SQL)
+                .bind(run_id)
+                .fetch_optional(self.pool().await?)
+                .await
+                .map_err(db_err("select journal"))?;
+            row.map(|r| record_from_payload("journal", r.get::<Value, _>("payload")))
+                .transpose()
+        }
     }
 
     /// Lazily-connecting [`Checkpointer`] facade over core's
@@ -738,7 +808,7 @@ mod postgres {
 
         #[test]
         fn migration_sql_creates_all_tables_idempotently() {
-            assert_eq!(MIGRATION_SQL.len(), 4);
+            assert_eq!(MIGRATION_SQL.len(), 5);
             for stmt in MIGRATION_SQL {
                 assert!(
                     stmt.contains("CREATE TABLE IF NOT EXISTS"),
@@ -754,6 +824,32 @@ mod postgres {
             assert!(CREATE_KV_SQL.contains("server_kv"));
             assert!(CREATE_KV_SQL.contains("JSONB"));
             assert!(CREATE_KV_SQL.contains("PRIMARY KEY (namespace"));
+            assert!(CREATE_JOURNALS_SQL.contains("server_journals"));
+            assert!(CREATE_JOURNALS_SQL.contains("JSONB"));
+            assert!(CREATE_JOURNALS_SQL.contains("TEXT PRIMARY KEY"));
+        }
+
+        #[test]
+        fn journal_upsert_sql_overwrites_payload_and_bumps_updated_at() {
+            assert!(UPSERT_JOURNAL_SQL.contains("ON CONFLICT (run_id) DO UPDATE"));
+            assert!(UPSERT_JOURNAL_SQL.contains("payload = EXCLUDED.payload"));
+            assert!(UPSERT_JOURNAL_SQL.contains("updated_at = now()"));
+        }
+
+        #[test]
+        fn journal_payload_round_trip() {
+            use rusty_agent_runtime::journal::{Clock, EventDraft, Journal};
+            use rusty_agent_runtime::record::{Effect, RunEventKind};
+
+            let journal = Journal::new("run-1", "thread-1", Clock::System);
+            journal.record(EventDraft::new(RunEventKind::SuperStepStart, Effect::Pure));
+            let snapshot = journal.snapshot();
+            let payload = record_to_payload(&snapshot).unwrap();
+            let back: JournalSnapshot = record_from_payload("journal", payload).unwrap();
+            assert_eq!(back.run_id, snapshot.run_id);
+            assert_eq!(back.thread_id, snapshot.thread_id);
+            assert_eq!(back.events, snapshot.events);
+            assert_eq!(back.head_hash, snapshot.head_hash);
         }
 
         #[test]

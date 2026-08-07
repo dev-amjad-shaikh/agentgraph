@@ -52,6 +52,10 @@ for await (const frame of client.runStream(thread_id, { input: { /* … */ } }))
 | `runWait(threadId, payload, { timeout? })` | `POST /threads/{id}/runs/wait` | terminal JSON (`status`, `output` ‖ `interrupt`) |
 | `runStream(threadId, payload, options)` | `POST /threads/{id}/runs/stream` | async generator of SSE frames |
 | `runStatus(runId)` | `GET /runs/{run_id}` | run status (+ `output`/`error`/`interrupt` when terminal) |
+| `runEvents(runId)` | `GET /runs/{id}/events` | `{ run_id, events, complete }` (Flight Recorder journal) |
+| `getFixture(runId)` | `GET /runs/{id}/fixture` | portable `ReplayFixture` bundle for CI replay |
+| `replayRun(runId)` | `POST /runs/replay` | `{ run_id, verified, expected_events, actual_events, first_divergence }` |
+| `diffRuns(base, branch)` | `GET /runs/diff?base=…&branch=…` | `BranchDiff` (`first_divergent_seq`, `added`, `removed`, `step_diffs`, totals) |
 | `deleteRun(threadId, runId)` | `DELETE /threads/{id}/runs/{run_id}` | rollback a finished run's checkpoints |
 | `createAssistant({ name, graph, config?, metadata?, assistantId? })` | `POST /assistants` | assistant record |
 | `listAssistants()` / `getAssistant(id)` | `GET /assistants[/{id}]` | assistant list / record |

@@ -429,6 +429,75 @@ export class RustyClient {
   }
 
   /**
+   * Fetch a run's Flight Recorder journal: the journaled `RunEvent`s in
+   * `seq` order plus a `complete` flag (`true` once the run is terminal,
+   * i.e. the served snapshot is the final journal; while active it trails
+   * the live journal by at most one checkpoint boundary).
+   * @param {string} runId
+   * @param {object} [opts]
+   * @param {AbortSignal} [opts.signal]
+   * @returns {Promise<import('./index.d.ts').RunEventsResponse>}
+   */
+  async runEvents(runId, opts = {}) {
+    return this.#request('GET', `/runs/${encodeURIComponent(runId)}/events`, {
+      signal: opts.signal,
+    });
+  }
+
+  /**
+   * Download a run as a portable replay fixture: the integrity-verified
+   * journal, the graph's topology hash, the final checkpoint, and provenance
+   * metadata — feed it to `ReplayFixture::import` to re-drive the run in CI.
+   * (`404` unknown run; `409` before the first persisted journal.)
+   * @param {string} runId
+   * @param {object} [opts]
+   * @param {AbortSignal} [opts.signal]
+   * @returns {Promise<import('./index.d.ts').ReplayFixture>}
+   */
+  async getFixture(runId, opts = {}) {
+    return this.#request('GET', `/runs/${encodeURIComponent(runId)}/fixture`, {
+      signal: opts.signal,
+    });
+  }
+
+  /**
+   * Re-drive a journaled run server-side and verify the replayed evidence:
+   * the server re-executes the run's registered graph against the persisted
+   * journal (zero outbound calls) and compares it event-for-event against
+   * the recording. (`404` unknown run; `409` no persisted journal or the run
+   * is still executing; `422` the graph is not registered in the server
+   * process, or the journal carries recorded model/tool calls — those
+   * replay through the CI fixture instead.)
+   * @param {string} runId
+   * @param {object} [opts]
+   * @param {AbortSignal} [opts.signal]
+   * @returns {Promise<import('./index.d.ts').ReplayReport>}
+   */
+  async replayRun(runId, opts = {}) {
+    return this.#request('POST', '/runs/replay', {
+      body: { run_id: runId },
+      signal: opts.signal,
+    });
+  }
+
+  /**
+   * Structural diff of two runs' journals — typically two branches forked
+   * from one point. Events compare logically (identity/timing excluded), so
+   * the shared prefix reads as equal; a run diffed against itself reports
+   * `first_divergent_seq: null`. (`404` unknown run on either side; `409`
+   * when either run has no persisted journal yet.)
+   * @param {string} base base run id (the branch is diffed against it)
+   * @param {string} branch branch run id
+   * @param {object} [opts]
+   * @param {AbortSignal} [opts.signal]
+   * @returns {Promise<import('./index.d.ts').BranchDiff>}
+   */
+  async diffRuns(base, branch, opts = {}) {
+    const query = new URLSearchParams({ base, branch });
+    return this.#request('GET', `/runs/diff?${query}`, { signal: opts.signal });
+  }
+
+  /**
    * Roll back a finished run: delete its checkpoints and re-anchor the thread
    * to the pre-run checkpoint. (`409` while the run is active.)
    * @param {string} threadId

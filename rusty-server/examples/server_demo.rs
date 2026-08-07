@@ -1,6 +1,11 @@
 //! Demo server: a two-node pipeline graph plus a ReAct agent (scripted
 //! `ChatModel` — no network), served on `127.0.0.1:8100`.
 //!
+//! Every run is journaled by the Flight Recorder: the server attaches a
+//! journal to the executor at run start and persists its snapshot at every
+//! checkpoint boundary and at completion, so any demo run's evidence can be
+//! fetched back over `GET /runs/{run_id}/events`.
+//!
 //! Run with: `cargo run --example server_demo`
 
 use std::collections::VecDeque;
@@ -121,6 +126,15 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("  curl -s localhost:8100/threads/$THREAD/state | jq");
     println!("  curl -s -X POST localhost:8100/threads/$THREAD/history \\");
     println!("    -H 'content-type: application/json' -d '{{}}' | jq\n");
+    println!("  # Flight Recorder: the run's journaled evidence (run_id is in the");
+    println!("  # runs/wait terminal JSON, or poll GET /runs/$RUN_ID)");
+    println!("  curl -s localhost:8100/runs/$RUN_ID/events | jq");
+    println!("  curl -s localhost:8100/runs/$RUN_ID/fixture -o fixture.json  # CI replay bundle\n");
+    println!("  # server-side exact replay (verified:true = evidence reproduced),");
+    println!("  # and branch diff of two runs' journals");
+    println!("  curl -s -X POST localhost:8100/runs/replay \\");
+    println!("    -H 'content-type: application/json' -d '{{\"run_id\": \"'$RUN_ID'\"}}' | jq");
+    println!("  curl -s 'localhost:8100/runs/diff?base='$RUN_ID'&branch='$FORK_RUN_ID'' | jq\n");
     println!("  # ReAct agent (scripted model; no network)");
     println!("  REACT=$(curl -s -X POST localhost:8100/threads \\");
     println!("    -H 'content-type: application/json' \\");

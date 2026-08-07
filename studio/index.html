@@ -188,6 +188,111 @@
   .hist-item .hid { font-family: var(--mono); font-size: 10.5px; color: var(--text-faint); word-break: break-all; }
   .hist-item .hnext { font-family: var(--mono); font-size: 11px; color: var(--text-dim); }
 
+  /* ---------- flight recorder ---------- */
+  .rec-controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+  .rec-controls input {
+    flex: 1; min-width: 220px; background: var(--bg-inset); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 5px 8px; font-family: var(--mono); font-size: 11.5px;
+  }
+  .rec-scrub { display: flex; gap: 10px; align-items: center; margin: 4px 0 10px; }
+  .rec-scrub input[type=range] { flex: 1; accent-color: var(--accent); }
+  .rec-split { display: flex; gap: 14px; align-items: flex-start; }
+  #rec-body { flex: 1; min-width: 0; overflow-x: auto; }
+  #rec-detail { flex: 0 0 340px; }
+  .rec-tl { display: grid; font-size: 11px; }
+  .rec-lane-name {
+    font-family: var(--mono); font-size: 10.5px; color: var(--text-dim);
+    text-transform: uppercase; letter-spacing: .6px; padding: 4px 6px;
+    border-bottom: 1px solid var(--border-hi); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .rec-ss {
+    grid-column: 1 / -1; background: var(--bg-raised); border: 1px solid var(--border);
+    border-radius: 6px; margin: 8px 0 2px; padding: 4px 10px;
+    font-family: var(--mono); font-size: 11px; color: var(--accent);
+    display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap;
+  }
+  .rec-ss .ss-meta { color: var(--text-faint); font-size: 10.5px; }
+  .rec-seq {
+    color: var(--text-faint); font-family: var(--mono); font-size: 10.5px;
+    padding: 4px 6px; border-bottom: 1px solid #26221c;
+  }
+  .rec-cell { padding: 2px 6px; border-bottom: 1px solid #26221c; min-height: 24px; }
+  .rec-m {
+    display: inline-flex; align-items: center; gap: 5px; padding: 2px 7px;
+    border-radius: 999px; border: 1px solid var(--border-hi); background: var(--bg-inset);
+    cursor: pointer; font-family: var(--mono); font-size: 10.5px; white-space: nowrap;
+  }
+  .rec-m .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--kcol, var(--pending)); flex: 0 0 8px; }
+  .rec-m:hover { border-color: var(--accent-dim); color: #fff; }
+  .rec-m.selected { border-color: var(--accent); background: #2e2a20; }
+  .rec-m.causal { box-shadow: 0 0 0 2px var(--accent-dim); }
+  .rec-m.st-error { border-color: var(--err); }
+  .rec-m.st-interrupted { border-color: var(--interrupt); }
+  .rec-detail-card { background: var(--bg-inset); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+  .rec-detail-card h3 {
+    margin: 0 0 6px; font-family: var(--mono); font-size: 12px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: .8px; display: flex; gap: 7px; align-items: center;
+  }
+  .rec-kv { display: grid; grid-template-columns: 88px 1fr; gap: 3px 10px; font-size: 12px; margin: 8px 0; }
+  .rec-kv .k { color: var(--text-faint); font-size: 10.5px; text-transform: uppercase; letter-spacing: .6px; padding-top: 1px; }
+  .rec-kv .v { font-family: var(--mono); font-size: 11.5px; word-break: break-all; }
+  .rec-parent-link { color: var(--accent); cursor: pointer; }
+  .rec-parent-link:hover { text-decoration: underline; }
+  .rec-eff-note { font-size: 11px; color: var(--text-dim); margin: 2px 0 8px; }
+  .rec-payload-label {
+    font-family: var(--mono); font-size: 10.5px; color: var(--accent);
+    text-transform: uppercase; letter-spacing: 1px; margin: 8px 0 2px;
+  }
+  .badge.eff-pure           { color: #cfe3c6; background: #26301f; border-color: #3d5136; }
+  .badge.eff-read_only      { color: #cfe3c6; background: #26301f; border-color: #3d5136; }
+  .badge.eff-idempotent     { color: #d6cebe; background: #35312a; border-color: #4a4437; }
+  .badge.eff-compensatable  { color: #efdfae; background: #3a3325; border-color: var(--accent-dim); }
+  .badge.eff-non_idempotent { color: #eac5c0; background: #341f1c; border-color: #5a322c; }
+
+  /* ---------- recorder replay banner & fork compare ---------- */
+  .rec-banner {
+    border: 1px solid var(--border-hi); border-left-width: 3px; border-radius: 6px;
+    padding: 8px 12px; font-size: 12.5px; margin: 8px 0;
+  }
+  .rec-banner.ok   { border-left-color: var(--ok); background: #222b1d; color: #cfe3c6; }
+  .rec-banner.err  { border-left-color: var(--err); background: #2b1e1c; color: #eac5c0; }
+  .rec-banner.warn { border-left-color: var(--accent-dim); background: var(--bg-raised); color: #e8dcb8; }
+  .rec-banner .rec-parent-link { color: inherit; text-decoration: underline; }
+  .rec-compare-controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 4px 0 8px; }
+  .rec-compare-controls input {
+    flex: 1; min-width: 180px; background: var(--bg-inset); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 5px 8px; font-family: var(--mono); font-size: 11.5px;
+  }
+  .cmp-grid { display: grid; grid-template-columns: minmax(0,1fr) 92px minmax(0,1fr); font-size: 11px; }
+  .cmp-col-head {
+    font-family: var(--mono); font-size: 10.5px; color: var(--text-dim);
+    padding: 4px 8px; border-bottom: 1px solid var(--border-hi);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .cmp-col-head.mid { text-align: center; }
+  .cmp-totals { color: var(--text-faint); font-size: 10.5px; padding: 2px 8px 6px; border-bottom: 1px solid var(--border); }
+  .cmp-side { padding: 3px 8px; border-bottom: 1px solid #26221c; min-height: 22px; }
+  .cmp-seq {
+    text-align: center; color: var(--text-faint); font-family: var(--mono);
+    font-size: 10.5px; padding: 3px 0; border-bottom: 1px solid #26221c;
+  }
+  .cmp-side.same    { opacity: .35; }
+  .cmp-side.removed { background: #2b1e1c; }
+  .cmp-side.added   { background: #222b1d; }
+  .cmp-ev { display: inline-flex; align-items: center; gap: 5px; font-family: var(--mono); font-size: 10.5px; white-space: nowrap; }
+  .cmp-ev .dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 8px; }
+  .cmp-ev .cnode { color: var(--text-dim); }
+  .cmp-ev .cerr { color: var(--err); }
+  .cmp-tag { font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .6px; }
+  .cmp-tag.removed { color: var(--err); }
+  .cmp-tag.added { color: var(--ok); }
+  .cmp-divnote {
+    grid-column: 1 / -1; text-align: center; font-family: var(--mono); font-size: 10.5px;
+    color: var(--interrupt); padding: 4px 0; border-bottom: 1px solid var(--border);
+  }
+
   .empty { color: var(--text-faint); font-style: italic; padding: 24px 0; text-align: center; }
   .note {
     border: 1px solid var(--border-hi); border-left: 3px solid var(--accent-dim);
@@ -291,6 +396,40 @@
 
         <div class="card">
           <h2 class="section" style="margin-top:0">
+            Flight Recorder
+            <button class="small" id="btn-rec-refresh" style="float:right">reload</button>
+          </h2>
+          <div class="rec-controls">
+            <input id="inp-rec-run" type="text" spellcheck="false" placeholder="run id — auto-filled when you start a run…">
+            <button class="small primary" id="btn-rec-load">Load events</button>
+            <button class="small" id="btn-rec-replay" title="POST /runs/replay — re-drive this run from its persisted journal and verify the evidence reproduces">Replay</button>
+            <label style="font-size:12px; color:var(--text-dim); display:inline-flex; gap:4px; align-items:center; cursor:pointer">
+              <input type="checkbox" id="rec-causal"> causal path
+            </label>
+            <span class="muted tiny" id="rec-statusline"></span>
+          </div>
+          <div class="rec-scrub" id="rec-scrub" style="display:none">
+            <input type="range" id="rec-scrubber" min="0" max="0" value="0">
+            <span class="muted tiny" id="rec-scrub-label"></span>
+          </div>
+          <div class="rec-split">
+            <div id="rec-body"><div class="empty">No journal loaded — start a run, or paste a run id and Load events.</div></div>
+            <div id="rec-detail" style="display:none"></div>
+          </div>
+          <div id="rec-replay-banner"></div>
+
+          <h2 class="section" style="margin-top:16px">Fork compare</h2>
+          <div class="rec-compare-controls">
+            <input id="inp-cmp-base" type="text" spellcheck="false" placeholder="base run id…">
+            <span class="muted tiny">vs</span>
+            <input id="inp-cmp-branch" type="text" spellcheck="false" placeholder="branch run id…">
+            <button class="small primary" id="btn-rec-compare" title="GET /runs/diff?base=…&branch=… — side-by-side timelines with the identical prefix dimmed">Compare</button>
+          </div>
+          <div id="rec-compare-view"></div>
+        </div>
+
+        <div class="card">
+          <h2 class="section" style="margin-top:0">
             Current state
             <button class="small" id="btn-refresh-state" style="float:right">refresh</button>
           </h2>
@@ -350,6 +489,9 @@ const store = {
   selectedCp: null,    // selected checkpoint (history item)
   pollTimer: null,     // background-run poll timer
   streamAbort: null,   // AbortController for an active SSE fetch
+  recorder: null,      // { runId, events, complete, selected, error } for the Flight Recorder view
+  recUnsupported: false, // server build has no GET /runs/{id}/events route (pre-R0.5 server wave)
+  compare: null,       // { baseId, branchId, baseEvents, branchEvents, diff, partial } for fork compare
 };
 
 /* ---------------- persistence ---------------- */
@@ -584,6 +726,7 @@ function renderMain() {
   abortStream();
   store.history = [];
   store.selectedCp = null;
+  store.recorder = null;
   hideInterrupt();
   $("th-id").textContent = t.thread_id;
   $("th-graph").textContent = t.graph;
@@ -593,6 +736,11 @@ function renderMain() {
   $("feed").innerHTML = `<div class="empty">No events yet — start a streamed run.</div>`;
   $("run-result").innerHTML = `<div class="empty">No run result yet.</div>`;
   $("inp-payload").value = defaultPayload(t.graph);
+  $("inp-rec-run").value = "";
+  store.compare = null;
+  $("rec-replay-banner").innerHTML = "";
+  $("rec-compare-view").innerHTML = "";
+  recRender();
   refreshState();
   refreshHistory();
 }
@@ -639,6 +787,7 @@ async function runBackground() {
     const res = await api("POST", `/threads/${t.thread_id}/runs`, withRunOpts(payload));
     toast(`run ${shortId(res.run_id)} started`, "ok");
     setRunStatus(res.status, `run ${shortId(res.run_id)}`);
+    noteRunId(res.run_id);
     pollRun(res.run_id);
   } catch (e) { toast(e.message, "err"); }
 }
@@ -656,6 +805,7 @@ function pollRun(runId) {
         showRunResult(info);
         refreshState();
         refreshHistory();
+        recAutoLoad(runId);
         return;
       }
     } catch (e) {
@@ -686,6 +836,7 @@ async function runWait(payloadOverride) {
     showRunResult(res);
     refreshState();
     refreshHistory();
+    recAutoLoad(res.run_id);
   } catch (e) {
     setRunStatus(null);
     toast(e.message, "err");
@@ -707,6 +858,7 @@ async function runStream(payloadOverride) {
   abortStream();
   const ctrl = new AbortController();
   store.streamAbort = ctrl;
+  store.streamRunId = null;
   clearFeed();
   feedEvent("metadata", { note: `POST /threads/${t.thread_id}/runs/stream`, stream_mode: payload.stream_mode }, "-");
   setRunStatus("running", "streaming");
@@ -775,6 +927,7 @@ async function runStream(payloadOverride) {
   }
   refreshState();
   refreshHistory();
+  if (store.streamRunId) recAutoLoad(store.streamRunId);
 }
 
 function abortStream() {
@@ -807,6 +960,12 @@ function feedEvent(kind, data, id) {
   const feed = $("feed");
   const empty = feed.querySelector(".empty");
   if (empty) empty.remove();
+  // The metadata frame opens every stream and carries the run id — capture it
+  // for the Flight Recorder auto-load at stream end.
+  if (kind === "metadata" && data && typeof data === "object" && data.run_id) {
+    store.streamRunId = data.run_id;
+    noteRunId(data.run_id);
+  }
   const cls = ["metadata","updates","values","messages","error","end"].includes(kind) ? kind : "metadata";
   const div = document.createElement("div");
   div.className = `evt ${cls}`;
@@ -1014,7 +1173,540 @@ async function replayFromSelected() {
   } catch (e) { toast(e.message, "err"); }
 }
 
-/* ---------------- wiring ---------------- */
+/* ---------------- flight recorder ----------------
+ * Timeline view over `GET /runs/{run_id}/events` (R0.5 Flight Recorder).
+ * Wire contract: { run_id, events: RunEvent[], complete }. RunEvent fields
+ * are read defensively — every field except `kind` is treated as optional so
+ * the view keeps working against partial server implementations. The pure
+ * helpers below take data and return data/HTML strings; `studio/test-recorder.mjs`
+ * exercises them under node.
+ * ------------------------------------------------------------------------- */
+
+/* Marker color per RunEventKind (snake_case wire values). Unknown future
+ * kinds fall back to the faint grey so new server versions never break the view. */
+const REC_KIND_COLORS = {
+  super_step_start:   "#6b6252",
+  super_step_end:     "#575045",
+  node_input:         "#c9a227",
+  node_output:        "#7fa671",
+  model_call:         "#b9724f",
+  tool_call:          "#a89573",
+  remote_call:        "#7e8f9e",
+  wasm_call:          "#8f819e",
+  interrupt:          "#c05f4f",
+  resume:             "#5f8a6d",
+  routing_decision:   "#8a7322",
+  checkpoint_written: "#978d7b",
+};
+
+/* Short lane labels per kind, kept terse so markers stay chip-sized. */
+const REC_KIND_SHORT = {
+  super_step_start:   "step+",
+  super_step_end:     "step−",
+  node_input:         "in",
+  node_output:        "out",
+  model_call:         "model",
+  tool_call:          "tool",
+  remote_call:        "remote",
+  wasm_call:          "wasm",
+  interrupt:          "intr",
+  resume:             "resume",
+  routing_decision:   "route",
+  checkpoint_written: "ckpt",
+};
+
+/* Effect taxonomy (rusty-core record.rs): badge tone + one-line meaning,
+ * mirroring the severity ladder in docs/flight-recorder-design.md. */
+const REC_EFFECT_INFO = {
+  pure:            { tone: "eff-pure",            blurb: "no external effect — re-execution is always safe and equivalent" },
+  read_only:       { tone: "eff-read_only",       blurb: "reads the world, writes nothing — safe to re-run; exact replay serves the journaled output" },
+  idempotent:      { tone: "eff-idempotent",      blurb: "repeatable write under a stable key — safe to retry" },
+  compensatable:   { tone: "eff-compensatable",   blurb: "duplicating write with a declared compensation — retry only with care" },
+  non_idempotent:  { tone: "eff-non_idempotent",  blurb: "unsafe to repeat — never silently retried or replayed; re-execution is explicit" },
+};
+
+function recSortEvents(events) {
+  // seq is the total order; fall back to array position when a partial
+  // server omits it, and keep the sort stable either way.
+  return (Array.isArray(events) ? events : [])
+    .map((ev, i) => ({ ev, i }))
+    .sort((a, b) => (((a.ev && a.ev.seq) ?? a.i) - ((b.ev && b.ev.seq) ?? b.i)) || (a.i - b.i))
+    .map((x) => x.ev);
+}
+
+function recKindColor(kind) { return REC_KIND_COLORS[kind] || "#6b6252"; }
+function recKindShort(kind) { return REC_KIND_SHORT[kind] || String(kind || "?"); }
+
+/* Lane name for an event: its node, or the run-wide lane for super-step
+ * boundaries, routing decisions, and checkpoint writes (node_id null). */
+function recLaneOf(ev) { return (ev && ev.node_id) || "run"; }
+
+function recLanes(events) {
+  const seen = [];
+  for (const ev of events) {
+    const lane = recLaneOf(ev);
+    if (!seen.includes(lane)) seen.push(lane);
+  }
+  // Run-wide lane first, then node lanes in first-appearance order.
+  return seen.filter((l) => l === "run").concat(seen.filter((l) => l !== "run"));
+}
+
+/* Group events under their super-step. A super_step_start opens a new group
+ * (numbered 1-based in start order); events before the first start form an
+ * unnumbered prelude group with no header row. */
+function recGroups(events) {
+  const groups = [];
+  let cur = { n: 0, start: null, events: [] };
+  for (const ev of events) {
+    if (ev && ev.kind === "super_step_start") {
+      if (cur.events.length) groups.push(cur);
+      cur = { n: groups.filter((g) => g.start).length + 1, start: ev, events: [ev] };
+    } else {
+      cur.events.push(ev);
+    }
+  }
+  if (cur.events.length) groups.push(cur);
+  return groups;
+}
+
+/* The selected event plus every ancestor reachable through `parent` links.
+ * Cycle-guarded: a malformed journal cannot loop the UI. */
+function recCausalChain(events, id) {
+  const byId = new Map();
+  for (const ev of events) { if (ev && ev.id) byId.set(ev.id, ev); }
+  const chain = new Set();
+  let cur = byId.get(id);
+  while (cur) {
+    if (chain.has(cur.id)) break;
+    chain.add(cur.id);
+    cur = cur.parent ? byId.get(cur.parent) : null;
+  }
+  return chain;
+}
+
+function recFormatUsd(v) {
+  if (v === null || v === undefined || typeof v !== "number") return "—";
+  if (v === 0) return "$0";
+  return "$" + (Math.abs(v) < 0.01 ? v.toPrecision(2) : v.toFixed(4));
+}
+
+function recFormatTokens(t) {
+  if (!t || typeof t !== "object") return t == null ? "—" : pretty(t);
+  const p = t.prompt_tokens ?? "?", c = t.completion_tokens ?? "?", tot = t.total_tokens ?? "?";
+  return `${p} prompt + ${c} completion = ${tot} total`;
+}
+
+/* PayloadRef is adjacently tagged: {kind:"inline", value} renders the value;
+ * {kind:"artifact", value:{sha256,bytes}} renders the content reference — the
+ * bytes live in the journal snapshot's artifact map, not on the wire here. */
+function recPayloadHtml(ref) {
+  if (!ref) return `<span class="muted">—</span>`;
+  if (ref.kind === "inline") return `<pre class="json">${escapeHtml(pretty(ref.value))}</pre>`;
+  if (ref.kind === "artifact") {
+    const a = ref.value || {};
+    return `<div>artifact ref · sha256 <code>${escapeHtml(a.sha256 || "?")}</code> · ${a.bytes ?? "?"} bytes</div>` +
+      `<div class="muted tiny">payload over 4 KiB is content-addressed; bytes resolve from the journal snapshot's artifact map</div>`;
+  }
+  // Unknown future tag: show the raw reference rather than dropping it.
+  return `<pre class="json">${escapeHtml(pretty(ref))}</pre>`;
+}
+
+function recEffectHtml(effect) {
+  const info = REC_EFFECT_INFO[effect];
+  if (!info) return `<span class="badge pending">${escapeHtml(effect || "unknown")}</span>`;
+  return `<span class="badge ${info.tone}">${escapeHtml(effect)}</span>` +
+    `<div class="rec-eff-note">${escapeHtml(info.blurb)}</div>`;
+}
+
+function recMarkerHtml(ev) {
+  const st = ev.status === "error" ? " st-error" : ev.status === "interrupted" ? " st-interrupted" : "";
+  const kind = ev.kind || "?";
+  return `<span class="rec-m${st}" data-eid="${escapeHtml(ev.id || "")}" ` +
+    `style="--kcol:${recKindColor(kind)}" title="${escapeHtml(kind)} · seq ${ev.seq ?? "?"}">` +
+    `<span class="dot"></span>${escapeHtml(recKindShort(kind))}&nbsp;${ev.seq ?? "?"}</span>`;
+}
+
+/* Detail panel for the selected event. Parent is rendered as a jump link
+ * (data-eid); the container's delegated click handler selects it. */
+function recDetailHtml(ev) {
+  const status = ev.status === "ok" ? "success" : (ev.status || "pending");
+  const parent = ev.parent
+    ? `<span class="rec-parent-link" data-eid="${escapeHtml(ev.parent)}" title="jump to causal parent">${escapeHtml(ev.parent)}</span>`
+    : `<span class="muted">—</span>`;
+  const rows = [
+    ["event", ev.id || "?"],
+    ["node", ev.node_id || "(run-wide)"],
+    ["seq", ev.seq ?? "?"],
+    ["status", null],
+    ["effect", null],
+    ["parent", null],
+    ["latency", ev.latency_ms != null ? ev.latency_ms + " ms" : "—"],
+    ["tokens", recFormatTokens(ev.tokens)],
+    ["cost", recFormatUsd(ev.cost_usd)],
+    ["recorded", ev.recorded_at || "—"],
+  ];
+  let html = `<div class="rec-detail-card"><h3>` +
+    `<span class="dot" style="width:9px;height:9px;border-radius:50%;background:${recKindColor(ev.kind)};display:inline-block"></span>` +
+    `${escapeHtml(ev.kind || "?")}</h3><div class="rec-kv">`;
+  for (const [k, v] of rows) {
+    let val;
+    if (k === "status") val = badge(status);
+    else if (k === "effect") val = recEffectHtml(ev.effect);
+    else if (k === "parent") val = parent;
+    else val = escapeHtml(v);
+    html += `<span class="k">${k}</span><span class="v">${val}</span>`;
+  }
+  html += `</div>` +
+    `<div class="rec-payload-label">input</div>${recPayloadHtml(ev.input)}` +
+    `<div class="rec-payload-label">output</div>${recPayloadHtml(ev.output)}` +
+    `</div>`;
+  return html;
+}
+
+async function recLoad(runId, quiet) {
+  runId = (runId || "").trim();
+  if (!runId) { if (!quiet) toast("Enter a run id.", "err"); return; }
+  $("rec-statusline").textContent = "loading…";
+  try {
+    const res = await api("GET", `/runs/${encodeURIComponent(runId)}/events`);
+    store.recorder = {
+      runId: res.run_id || runId,
+      events: recSortEvents(res.events),
+      complete: res.complete !== false,
+      selected: null,
+      error: null,
+    };
+    store.recUnsupported = false;
+    // A fresh journal invalidates any replay verdict shown for a previous run.
+    $("rec-replay-banner").innerHTML = "";
+    if (!$("inp-cmp-base").value.trim()) $("inp-cmp-base").value = store.recorder.runId;
+  } catch (e) {
+    // A 404 with a non-JSON body means a server build without the route at
+    // all (the Flight Recorder server API is a later R0.5 wave); a JSON 404
+    // means the run is genuinely unknown — surface that one.
+    const noRoute = e.status === 404 && !(e.body && e.body.error);
+    if (noRoute) store.recUnsupported = true;
+    store.recorder = {
+      runId, events: [], complete: false, selected: null,
+      error: noRoute
+        ? "This server build has no GET /runs/{run_id}/events route yet — the Flight Recorder " +
+          "server API lands in a later R0.5 wave. Rebuild rusty-server from the R0.5 branch to use this view."
+        : e.message,
+    };
+    if (!quiet && !noRoute) toast(e.message, "err");
+  }
+  recRender();
+}
+
+/* Remember the latest run id (auto-fill) and quietly refresh the timeline
+ * when a run reaches a terminal state. Quiet: on a pre-R0.5 server the
+ * missing route shows up as a panel note, never as toast spam. */
+function noteRunId(runId) {
+  if (!runId) return;
+  $("inp-rec-run").value = runId;
+}
+
+function recAutoLoad(runId) {
+  noteRunId(runId);
+  if (store.recUnsupported || !currentThread()) return;
+  recLoad(runId, true);
+}
+
+function recRender() {
+  const body = $("rec-body"), detail = $("rec-detail"), scrub = $("rec-scrub");
+  const r = store.recorder;
+  detail.style.display = "none";
+  detail.innerHTML = "";
+  if (!r) {
+    $("rec-statusline").textContent = "";
+    scrub.style.display = "none";
+    body.innerHTML = `<div class="empty">No journal loaded — start a run, or paste a run id and Load events.</div>`;
+    return;
+  }
+  if (r.error) {
+    $("rec-statusline").textContent = "";
+    scrub.style.display = "none";
+    body.innerHTML = `<div class="note">${escapeHtml(r.error)}</div>`;
+    return;
+  }
+  if (!r.events.length) {
+    $("rec-statusline").textContent = "0 events";
+    scrub.style.display = "none";
+    body.innerHTML = `<div class="empty">The journal for run ${escapeHtml(shortId(r.runId))} is empty.</div>`;
+    return;
+  }
+
+  const events = r.events;
+  $("rec-statusline").textContent =
+    `${events.length} event(s) · ${r.complete ? "complete journal" : "partial — run may still be in flight"}`;
+
+  const lanes = recLanes(events);
+  let html = `<div class="rec-tl" style="grid-template-columns:52px repeat(${lanes.length}, minmax(96px, 1fr))">`;
+  html += `<div class="rec-lane-name">seq</div>` +
+    lanes.map((l) => `<div class="rec-lane-name" title="${escapeHtml(l)}">${escapeHtml(l)}</div>`).join("");
+  for (const group of recGroups(events)) {
+    if (group.start) {
+      const first = group.events[0], last = group.events[group.events.length - 1];
+      html += `<div class="rec-ss"><span>super-step ${group.n}</span>` +
+        `<span class="ss-meta">seq ${first.seq ?? "?"}–${last.seq ?? "?"} · ${group.events.length} event(s)</span></div>`;
+    }
+    for (const ev of group.events) {
+      html += `<div class="rec-seq">${ev.seq ?? "·"}</div>`;
+      for (const lane of lanes) {
+        html += `<div class="rec-cell">${recLaneOf(ev) === lane ? recMarkerHtml(ev) : ""}</div>`;
+      }
+    }
+  }
+  html += `</div>`;
+  body.innerHTML = html;
+
+  const scrubber = $("rec-scrubber");
+  scrub.style.display = "flex";
+  scrubber.max = String(events.length - 1);
+  scrubber.value = "0";
+  $("rec-scrub-label").textContent = `${events.length} events — drag to scrub`;
+}
+
+function recApplyCausal() {
+  const r = store.recorder;
+  const on = $("rec-causal").checked && r && r.selected;
+  const chain = on ? recCausalChain(r.events, r.selected) : new Set();
+  $("rec-body").querySelectorAll(".rec-m").forEach((m) => {
+    const eid = m.getAttribute("data-eid");
+    m.classList.toggle("causal", chain.has(eid) && eid !== r.selected);
+  });
+}
+
+function recSelect(id, scroll) {
+  const r = store.recorder;
+  if (!r || !r.events.length) return;
+  const ev = r.events.find((e) => e && e.id === id);
+  if (!ev) return;
+  r.selected = id;
+  $("rec-body").querySelectorAll(".rec-m").forEach((m) => {
+    m.classList.toggle("selected", m.getAttribute("data-eid") === id);
+  });
+  recApplyCausal();
+  const idx = r.events.indexOf(ev);
+  $("rec-scrubber").value = String(idx);
+  $("rec-scrub-label").textContent = `seq ${ev.seq ?? "?"} · ${idx + 1}/${r.events.length}`;
+  const detail = $("rec-detail");
+  detail.style.display = "block";
+  detail.innerHTML = recDetailHtml(ev);
+  if (scroll) {
+    const marker = $("rec-body").querySelector(`[data-eid="${CSS.escape(id)}"]`);
+    if (marker) marker.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
+}
+
+/* ---------------- recorder: exact replay & fork compare ----------------
+ * Server contracts (R0.5 server wave — coded defensively: on older builds the
+ * routes 404 with a non-JSON body, which maps to a route-missing note):
+ *   POST /runs/replay  {"run_id": "…"} →
+ *     {run_id, verified, expected_events, actual_events, first_divergence}
+ *     404 unknown run · 409 no persisted journal · 422 graph not registered
+ *   GET /runs/diff?base=<id>&branch=<id> → BranchDiff JSON (rusty-core
+ *     replay.rs: first_divergent_seq, added, removed, step_diffs,
+ *     base_totals, branch_totals — totals {events, tokens, cost_usd})
+ * ------------------------------------------------------------------------- */
+
+/* Banner for a POST /runs/replay 200 response. Verified runs report the
+ * reproduced event count; mismatches report expected vs actual and link the
+ * first divergent seq back into the loaded timeline (data-jump-seq). Every
+ * field is optional on the wire — a partial server must still render. */
+function recReplayBannerHtml(result) {
+  const r = result || {};
+  if (r.verified === true) {
+    const n = r.actual_events ?? r.expected_events ?? "?";
+    return `<div class="rec-banner ok">exact replay <b>verified</b> — the replayed run reproduced all ` +
+      `${escapeHtml(String(n))} journaled event(s) byte-for-byte.</div>`;
+  }
+  let html = `<div class="rec-banner err">exact replay <b>mismatch</b> — expected ` +
+    `${escapeHtml(String(r.expected_events ?? "?"))} event(s), replayed ` +
+    `${escapeHtml(String(r.actual_events ?? "?"))}.`;
+  if (r.first_divergence !== null && r.first_divergence !== undefined) {
+    const seq = escapeHtml(String(r.first_divergence));
+    html += ` First divergence at seq <span class="rec-parent-link" data-jump-seq="${seq}" ` +
+      `title="jump to that position in the loaded timeline">${seq}</span>.`;
+  }
+  return html + `</div>`;
+}
+
+/* Failure note for the replay/diff endpoints, one tone per distinct cause:
+ * route-missing (older server build), unknown run (404), no persisted journal
+ * (409), graph not registered (422), anything else verbatim. */
+function recApiErrorBannerHtml(route, status, body) {
+  const msg = escapeHtml((body && body.message) || `HTTP ${status || "?"}`);
+  if (status === 404 && !(body && body.error)) {
+    return `<div class="rec-banner warn">This server build has no <code>${escapeHtml(route)}</code> route yet — ` +
+      `it lands with the R0.5 server wave. Rebuild rusty-server from the R0.5 branch to use it.</div>`;
+  }
+  if (status === 404) {
+    return `<div class="rec-banner err"><b>Unknown run (404).</b> ${msg} — the run registry is in-memory, ` +
+      `so runs from before a server restart are gone.</div>`;
+  }
+  if (status === 409) {
+    return `<div class="rec-banner err"><b>No persisted journal (409).</b> ${msg} — the run executed, but its ` +
+      `journal was not persisted, so there is no evidence to replay or diff.</div>`;
+  }
+  if (status === 422) {
+    return `<div class="rec-banner err"><b>Graph not registered (422).</b> ${msg} — the run was recorded against ` +
+      `a graph this server does not register, so it cannot be re-driven.</div>`;
+  }
+  return `<div class="rec-banner err">${msg}</div>`;
+}
+
+/* One-line totals for a BranchTotals value ({events, tokens, cost_usd}). */
+function recTotalsHtml(totals) {
+  if (!totals || typeof totals !== "object") return `<span class="muted">totals unavailable</span>`;
+  return `${escapeHtml(String(totals.events ?? "?"))} event(s) · ` +
+    `${escapeHtml(recFormatTokens(totals.tokens))} · ${escapeHtml(recFormatUsd(totals.cost_usd))}`;
+}
+
+/* Align two branches' events by seq against a BranchDiff. Rows are
+ * {seq, base, branch, cls} with cls "same" (identical prefix — rendered
+ * dimmed), "divergent" (both sides present at/after the fork), "removed"
+ * (base only), or "added" (branch only). The fork point comes from
+ * diff.first_divergent_seq; when the diff is missing or partial it is derived
+ * from presence alone (the first seq only one side holds) — content-only
+ * divergence needs the real diff, presence divergence does not. Events
+ * without a numeric seq sort after numbered ones and align by position. */
+function recCompareRows(baseEvents, branchEvents, diff) {
+  const keyOf = (ev, i) => (ev && typeof ev.seq === "number") ? ev.seq : `~${i}`;
+  const baseByKey = new Map(), branchByKey = new Map();
+  recSortEvents(baseEvents).forEach((ev, i) => baseByKey.set(keyOf(ev, i), ev));
+  recSortEvents(branchEvents).forEach((ev, i) => branchByKey.set(keyOf(ev, i), ev));
+  const keys = [...new Set([...baseByKey.keys(), ...branchByKey.keys()])].sort((a, b) => {
+    const na = typeof a === "number", nb = typeof b === "number";
+    if (na && nb) return a - b;
+    if (na) return -1;
+    if (nb) return 1;
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+  let divergence = (diff && typeof diff.first_divergent_seq === "number") ? diff.first_divergent_seq : null;
+  if (divergence === null) {
+    const first = keys.find((k) => !baseByKey.has(k) || !branchByKey.has(k));
+    divergence = typeof first === "number" ? first : null;
+  }
+  return keys.map((k) => {
+    const b = baseByKey.get(k) || null, f = branchByKey.get(k) || null;
+    let cls;
+    if (b && f) {
+      cls = (divergence !== null && (typeof k !== "number" || k >= divergence)) ? "divergent" : "same";
+    } else {
+      cls = b ? "removed" : "added";
+    }
+    return { seq: k, base: b, branch: f, cls };
+  });
+}
+
+/* Compact event chip for a compare cell: kind dot + short label + node,
+ * tagged removed/added on the side the event is unique to. */
+function recCmpEventHtml(ev, cls) {
+  if (!ev) return "";
+  const kind = ev.kind || "?";
+  const tag = cls === "removed" ? ` <span class="cmp-tag removed">removed</span>`
+    : cls === "added" ? ` <span class="cmp-tag added">added</span>` : "";
+  return `<span class="cmp-ev" title="${escapeHtml(kind)} · seq ${ev.seq ?? "?"}">` +
+    `<span class="dot" style="background:${recKindColor(kind)}"></span>${escapeHtml(recKindShort(kind))}` +
+    (ev.node_id ? ` <span class="cnode">${escapeHtml(ev.node_id)}</span>` : "") +
+    (ev.status === "error" ? ` <span class="cerr">error</span>` : "") +
+    `</span>${tag}`;
+}
+
+/* The full compare view: run-id headers with per-branch totals, then both
+ * timelines aligned by seq — identical prefix dimmed, the fork point marked,
+ * added/removed events highlighted on their side. */
+function recCompareHtml(baseId, branchId, baseEvents, branchEvents, diff) {
+  const rows = recCompareRows(baseEvents, branchEvents, diff);
+  const d = diff || {};
+  const firstBreak = rows.find((r) => r.cls !== "same" && typeof r.seq === "number");
+  let html = `<div class="cmp-grid">` +
+    `<div class="cmp-col-head" title="${escapeHtml(baseId)}">base ${escapeHtml(shortId(baseId))}</div>` +
+    `<div class="cmp-col-head mid">seq</div>` +
+    `<div class="cmp-col-head" title="${escapeHtml(branchId)}">branch ${escapeHtml(shortId(branchId))}</div>` +
+    `<div class="cmp-totals">${recTotalsHtml(d.base_totals)}</div><div></div>` +
+    `<div class="cmp-totals">${recTotalsHtml(d.branch_totals)}</div>`;
+  if (!firstBreak) {
+    html += `<div class="cmp-divnote">branches are logically identical — no divergence</div>`;
+  }
+  let marked = false;
+  for (const row of rows) {
+    if (!marked && row.cls !== "same" && typeof row.seq === "number") {
+      html += `<div class="cmp-divnote">first divergence — seq ${escapeHtml(String(row.seq))}</div>`;
+      marked = true;
+    }
+    html += `<div class="cmp-side ${row.cls}">${recCmpEventHtml(row.base, row.cls)}</div>` +
+      `<div class="cmp-seq">${typeof row.seq === "number" ? escapeHtml(String(row.seq)) : "·"}</div>` +
+      `<div class="cmp-side ${row.cls}">${recCmpEventHtml(row.branch, row.cls)}</div>`;
+  }
+  return html + `</div>`;
+}
+
+/* Re-drive the loaded run from its persisted journal (POST /runs/replay) and
+ * show the verdict as a banner; the banner's divergence link jumps into the
+ * timeline via the delegated data-jump-seq handler in init(). */
+async function recReplay() {
+  const runId = ((store.recorder && store.recorder.runId) || $("inp-rec-run").value || "").trim();
+  const el = $("rec-replay-banner");
+  if (!runId) { toast("Load a journal first, or paste a run id.", "err"); return; }
+  $("btn-rec-replay").disabled = true;
+  el.innerHTML = `<div class="rec-banner warn">replaying run ${escapeHtml(shortId(runId))} from its persisted journal…</div>`;
+  try {
+    const res = await api("POST", "/runs/replay", { run_id: runId });
+    el.innerHTML = recReplayBannerHtml(res);
+  } catch (e) {
+    el.innerHTML = recApiErrorBannerHtml("POST /runs/replay", e.status, e.body);
+  } finally {
+    $("btn-rec-replay").disabled = false;
+  }
+}
+
+/* Diff two runs (GET /runs/diff) and render both journals side by side. The
+ * timelines come from GET /runs/{id}/events; if those fail after the diff
+ * succeeded, the diff's own added/removed events are rendered with a
+ * partial-view note instead of dropping the result. */
+async function recCompare() {
+  const baseId = $("inp-cmp-base").value.trim(), branchId = $("inp-cmp-branch").value.trim();
+  const view = $("rec-compare-view");
+  if (!baseId || !branchId) { toast("Enter both run ids to compare.", "err"); return; }
+  if (baseId === branchId) { toast("Base and branch are the same run.", "warn"); return; }
+  $("btn-rec-compare").disabled = true;
+  view.innerHTML = `<div class="muted tiny">diffing ${escapeHtml(shortId(baseId))} vs ${escapeHtml(shortId(branchId))}…</div>`;
+  store.compare = null;
+  let diff;
+  try {
+    diff = await api("GET", `/runs/diff?base=${encodeURIComponent(baseId)}&branch=${encodeURIComponent(branchId)}`);
+  } catch (e) {
+    view.innerHTML = recApiErrorBannerHtml("GET /runs/diff", e.status, e.body);
+    $("btn-rec-compare").disabled = false;
+    return;
+  }
+  let baseEvents, branchEvents, partial = false;
+  try {
+    const [baseRes, branchRes] = await Promise.all([
+      api("GET", `/runs/${encodeURIComponent(baseId)}/events`),
+      api("GET", `/runs/${encodeURIComponent(branchId)}/events`),
+    ]);
+    baseEvents = recSortEvents(baseRes && baseRes.events);
+    branchEvents = recSortEvents(branchRes && branchRes.events);
+  } catch {
+    // The diff succeeded but the timelines did not: render the divergence
+    // region the diff itself carries rather than dropping the result.
+    partial = true;
+    baseEvents = recSortEvents(diff && diff.removed);
+    branchEvents = recSortEvents(diff && diff.added);
+  }
+  store.compare = { baseId, branchId, baseEvents, branchEvents, diff, partial };
+  const note = partial
+    ? `<div class="note tiny">Full timelines unavailable (GET /runs/{id}/events failed) — ` +
+      `showing only the divergence region carried by the diff.</div>`
+    : "";
+  view.innerHTML = note + recCompareHtml(baseId, branchId, baseEvents, branchEvents, diff);
+  $("btn-rec-compare").disabled = false;
+}
+
+
 
 function init() {
   loadConn();
@@ -1034,6 +1726,47 @@ function init() {
   $("btn-refresh-history").onclick = refreshHistory;
   $("btn-fork").onclick = forkAtSelected;
   $("btn-replay").onclick = replayFromSelected;
+
+  // Flight Recorder: load/reload, scrub, causal toggle, and one delegated
+  // click handler for both marker chips and the detail panel's parent link.
+  $("btn-rec-load").onclick = () => recLoad($("inp-rec-run").value, false);
+  $("btn-rec-refresh").onclick = () => {
+    const id = (store.recorder && store.recorder.runId) || $("inp-rec-run").value;
+    recLoad(id, false);
+  };
+  $("inp-rec-run").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") recLoad($("inp-rec-run").value, false);
+  });
+  $("rec-causal").onchange = recApplyCausal;
+  $("rec-scrubber").addEventListener("input", () => {
+    const r = store.recorder;
+    if (!r || !r.events.length) return;
+    const ev = r.events[Number($("rec-scrubber").value)];
+    if (ev && ev.id && ev.id !== r.selected) recSelect(ev.id, true);
+  });
+  const recClick = (e) => {
+    const target = e.target.closest("[data-eid]");
+    if (target) recSelect(target.getAttribute("data-eid"), true);
+  };
+  $("rec-body").addEventListener("click", recClick);
+  $("rec-detail").addEventListener("click", recClick);
+
+  // Replay & fork compare. The banner's divergence seq is a jump link into
+  // the loaded timeline (when that seq is in it).
+  $("btn-rec-replay").onclick = recReplay;
+  $("btn-rec-compare").onclick = recCompare;
+  const cmpEnter = (e) => { if (e.key === "Enter") recCompare(); };
+  $("inp-cmp-base").addEventListener("keydown", cmpEnter);
+  $("inp-cmp-branch").addEventListener("keydown", cmpEnter);
+  $("rec-replay-banner").addEventListener("click", (e) => {
+    const target = e.target.closest("[data-jump-seq]");
+    if (!target) return;
+    const seq = Number(target.getAttribute("data-jump-seq"));
+    const r = store.recorder;
+    const ev = r && r.events.find((x) => x && x.seq === seq);
+    if (ev && ev.id) recSelect(ev.id, true);
+    else toast(`seq ${seq} is not in the loaded timeline`, "warn");
+  });
 
   if (store.conn) {
     loadThreads();

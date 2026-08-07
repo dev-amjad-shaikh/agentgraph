@@ -359,6 +359,154 @@ test('crons: create/list/delete with 404 after delete', async () => {
   );
 });
 
+test('runEvents() fetches the Flight Recorder journal of a completed run', async () => {
+  const tid = await pipelineThread();
+  const terminal = await client.runWait(tid, {});
+  assert.equal(terminal.status, 'success');
+  assert.ok(terminal.run_id, 'terminal JSON carries run_id');
+
+  const body = await client.runEvents(terminal.run_id);
+  assert.equal(body.run_id, terminal.run_id);
+  assert.equal(body.complete, true);
+  assert.ok(body.events.length > 0, 'a journaled run must have events');
+
+  // Total order + deterministic ids: seq is 0..n, id is {run_id}:{seq}.
+  body.events.forEach((event, seq) => {
+    for (const field of [
+      'id', 'run_id', 'thread_id', 'node_id', 'seq', 'kind', 'effect',
+      'input', 'output', 'latency_ms', 'tokens', 'cost_usd', 'status',
+      'parent', 'recorded_at',
+    ]) {
+      assert.ok(field in event, `event missing \`${field}\``);
+    }
+    assert.equal(event.seq, seq);
+    assert.equal(event.id, `${terminal.run_id}:${seq}`);
+    assert.equal(event.run_id, terminal.run_id);
+    assert.equal(event.thread_id, tid);
+  });
+
+  // The executor journaled the full lifecycle, in the golden wire shape.
+  const kinds = body.events.map((e) => e.kind);
+  for (const expected of [
+    'super_step_start',
+    'super_step_end',
+    'node_input',
+    'node_output',
+    'routing_decision',
+    'checkpoint_written',
+  ]) {
+    assert.ok(kinds.includes(expected), `missing \`${expected}\` event`);
+  }
+  assert.equal(kinds[0], 'super_step_start');
+
+  // Payload refs are adjacently tagged; demo pipeline nodes are pure.
+  const nodeInput = body.events.find((e) => e.kind === 'node_input');
+  assert.equal(nodeInput.input.kind, 'inline');
+  assert.equal(nodeInput.effect, 'pure');
+  // Causal parentage: a node input's parent is its super-step start.
+  const parent = body.events.find((e) => e.id === nodeInput.parent);
+  assert.equal(parent.kind, 'super_step_start');
+});
+
+test('runEvents() 404s for an unknown run', async () => {
+  await assert.rejects(
+    () => client.runEvents(crypto.randomUUID()),
+    (err) => err instanceof RustyError && err.status === 404,
+  );
+});
+
+test('replayRun() verifies a journaled pipeline run, exact response shape', async () => {
+  const tid = await pipelineThread();
+  const terminal = await client.runWait(tid, {});
+  assert.equal(terminal.status, 'success');
+  const eventCount = (await client.runEvents(terminal.run_id)).events.length;
+
+  const report = await client.replayRun(terminal.run_id);
+  assert.deepEqual(
+    Object.keys(report).sort(),
+    ['actual_events', 'expected_events', 'first_divergence', 'run_id', 'verified'],
+  );
+  assert.equal(report.run_id, terminal.run_id);
+  assert.equal(report.verified, true);
+  assert.equal(report.expected_events, eventCount);
+  assert.equal(report.actual_events, eventCount);
+  assert.equal(report.first_divergence, null);
+});
+
+test('replayRun() 404s for an unknown run', async () => {
+  await assert.rejects(
+    () => client.replayRun(crypto.randomUUID()),
+    (err) => err instanceof RustyError && err.status === 404,
+  );
+});
+
+test('diffRuns() shows divergence between a run and its fork with different input', async () => {
+  const tid = await pipelineThread();
+  const baseRun = (await client.runWait(tid, { input: { seed: 1 } })).run_id;
+
+  const fork = await client.fork(tid);
+  const branchRun = (await client.runWait(fork.thread_id, { input: { seed: 2 } })).run_id;
+
+  const diff = await client.diffRuns(baseRun, branchRun);
+  for (const field of [
+    'first_divergent_seq',
+    'added',
+    'removed',
+    'step_diffs',
+    'base_totals',
+    'branch_totals',
+  ]) {
+    assert.ok(field in diff, `diff missing \`${field}\``);
+  }
+  assert.notEqual(
+    diff.first_divergent_seq,
+    null,
+    'forks with different inputs must diverge',
+  );
+  assert.ok(diff.added.length > 0);
+  assert.ok(diff.removed.length > 0);
+  // Same graph, same step count: content differs, not length.
+  assert.equal(diff.base_totals.events, diff.branch_totals.events);
+
+  // A run diffed against itself is logically identical.
+  const same = await client.diffRuns(baseRun, baseRun);
+  assert.equal(same.first_divergent_seq, null);
+  assert.equal(same.added.length, 0);
+  assert.equal(same.removed.length, 0);
+});
+
+test('diffRuns() 404s for an unknown run on either side', async () => {
+  const tid = await pipelineThread();
+  const runId = (await client.runWait(tid, {})).run_id;
+  await assert.rejects(
+    () => client.diffRuns(runId, crypto.randomUUID()),
+    (err) => err instanceof RustyError && err.status === 404,
+  );
+  await assert.rejects(
+    () => client.diffRuns(crypto.randomUUID(), runId),
+    (err) => err instanceof RustyError && err.status === 404,
+  );
+});
+
+test('getFixture() downloads a portable replay bundle', async () => {
+  const tid = await pipelineThread();
+  const terminal = await client.runWait(tid, {});
+
+  const fixture = await client.getFixture(terminal.run_id);
+  assert.equal(fixture.format_version, 1);
+  assert.ok(fixture.graph_hash.length > 0);
+  assert.equal(fixture.journal.run_id, terminal.run_id);
+  assert.equal(fixture.journal.thread_id, tid);
+  assert.ok(fixture.journal.events.length > 0);
+  // The demo run wrote checkpoints, so the bundle carries the final one.
+  assert.equal(fixture.final_checkpoint.thread_id, tid);
+
+  await assert.rejects(
+    () => client.getFixture(crypto.randomUUID()),
+    (err) => err instanceof RustyError && err.status === 404,
+  );
+});
+
 test('unknown thread surfaces RustyError with status and body', async () => {
   await assert.rejects(
     () => client.getState('no-such-thread'),

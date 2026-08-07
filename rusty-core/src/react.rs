@@ -28,21 +28,46 @@
 //! declaring `messages` with `Reducer::AddMessages` and an initial state
 //! seeding the conversation (see `examples/react_agent.rs`).
 //!
-//! Two flavors exist: [`create_react_agent`] (the agent node calls
-//! [`ChatModel::chat`]; no [`crate::executor::GraphEvent::Token`] events) and
+//! Four flavors exist: [`create_react_agent`] (the agent node calls
+//! [`ChatModel::chat`]; no [`crate::executor::GraphEvent::Token`] events),
 //! [`create_react_agent_streaming`] (the agent node calls
 //! [`ChatModel::chat_stream`] and forwards deltas as
-//! [`crate::executor::GraphEvent::Token`]s into the run's event channel).
+//! [`crate::executor::GraphEvent::Token`]s into the run's event channel),
+//! and the Flight Recorder pair [`create_react_agent_with_recording`] /
+//! [`create_react_agent_replaying`].
+//!
+//! # Flight Recorder
+//!
+//! [`create_react_agent_with_recording`] wires the run's [`Journal`] into
+//! both nodes: every model call is journaled through
+//! [`crate::replay::RecordingChatModel`] and every tool call through
+//! [`crate::replay::RecordingTool`], in the canonical
+//! [`crate::replay::model_call_request`] / [`crate::replay::tool_call_request`]
+//! payload shapes, parented per iteration to the invocation's node-input
+//! event (the executor hands its id over via
+//! [`crate::journal::PARENT_EVENT_KEY`]). Attach the same journal to the run
+//! with [`crate::executor::RunConfig::with_journal`].
+//! [`create_react_agent_replaying`] is the mirror image for exact replay:
+//! the same topology with [`crate::replay::ReplayingChatModel`] /
+//! [`crate::replay::ReplayingTool`] answering from the recorded journal —
+//! zero outbound calls, so the wrapped model and tools may be
+//! panic-on-call sentinels. See `examples/react_record_replay.rs` for the
+//! full record → replay loop.
 
 use std::sync::Arc;
 
+use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::error::{Result, RustyError};
 use crate::executor::GraphEvent;
 use crate::graph::{Graph, GraphBuilder, Route};
+use crate::journal::{Journal, PARENT_EVENT_KEY};
 use crate::llm::{ChatMessage, ChatModel};
 use crate::node::NodeOutput;
+use crate::replay::{
+    RecordingChatModel, RecordingTool, ReplaySource, ReplayingChatModel, ReplayingTool,
+};
 use crate::tool::{ToolExecutor, ToolRegistry};
 
 /// The state channel the ReAct loop reads from and appends to. Declare it
@@ -65,6 +90,71 @@ fn read_messages(state: &crate::state::State) -> Result<Vec<ChatMessage>> {
         .unwrap_or_default())
 }
 
+/// How the prebuilt agent's model and tool calls relate to the Flight
+/// Recorder: not at all (the default), journaled live (record mode), or
+/// served from a recorded journal (exact-replay mode).
+#[derive(Debug, Clone)]
+enum EvidenceMode {
+    /// No recording — the pre-R0.5 behavior, byte-identical by construction
+    /// (the wrappers are never built and no parent key is read).
+    None,
+
+    /// Journal every model/tool call through the recording wrappers.
+    Record(Journal),
+
+    /// Answer every model/tool call from the recorded journal; the wrapped
+    /// implementations are carried for identity and never invoked.
+    Replay {
+        /// The serving cursor over the recorded run's effects.
+        source: ReplaySource,
+        /// The replay run's own journal (the recorded run's identity).
+        journal: Journal,
+    },
+}
+
+/// The causal parent for effects a node invocation records: the id of the
+/// invocation's node-input journal event, delivered by the executor under
+/// [`PARENT_EVENT_KEY`]. A missing key means the graph is being driven by
+/// something other than [`crate::executor::Executor::run`] (a hand-rolled
+/// harness, a unit test) — evidence recorded without its causal anchor
+/// would misrepresent the run, so this is a hard error rather than a
+/// silently unparented event.
+fn invocation_parent(ctx: &crate::node::NodeContext, node: &str) -> Result<String> {
+    ctx.config()
+        .extra
+        .get(PARENT_EVENT_KEY)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            RustyError::Node(format!(
+                "node `{node}` is wired for Flight Recorder evidence but the run supplied no \
+                 `{PARENT_EVENT_KEY}` — drive the graph through `Executor::run`, which hands each \
+                 invocation its node-input event id as the causal parent"
+            ))
+        })
+}
+
+/// The registry's OpenAI-format tool schemas in a canonical order.
+///
+/// [`ToolRegistry`] is `HashMap`-backed, so [`ToolRegistry::schemas`] order
+/// is process-random — harmless for a live call, but the Flight Recorder
+/// hashes the model-call request payload and exact replay matches on that
+/// hash, so the schema list must serialize identically in the recording and
+/// replaying graphs (two distinct registry instances). Sorting by tool name
+/// makes the request canonical across processes. Applied to every flavor so
+/// all variants of the prebuilt agent put identical content on the wire.
+fn sorted_tool_schemas(tools: &ToolRegistry) -> Vec<Value> {
+    fn tool_name(schema: &Value) -> &str {
+        schema
+            .pointer("/function/name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+    }
+    let mut schemas = tools.schemas();
+    schemas.sort_by(|a, b| tool_name(a).cmp(tool_name(b)));
+    schemas
+}
+
 /// Build a prebuilt ReAct agent graph over `model` and `tools`.
 ///
 /// The returned graph has exactly two nodes ([`AGENT_NODE`], [`TOOLS_NODE`]),
@@ -79,7 +169,7 @@ fn read_messages(state: &crate::state::State) -> Result<Vec<ChatMessage>> {
 /// [`ChatModel::chat`]. Use [`create_react_agent_streaming`] to stream token
 /// deltas into the run's event channel.
 pub fn create_react_agent(model: Arc<dyn ChatModel>, tools: ToolRegistry) -> Result<Graph> {
-    build_react_agent(model, tools, None)
+    build_react_agent(model, tools, None, EvidenceMode::None)
 }
 
 /// Build a prebuilt ReAct agent graph whose `agent` node streams token
@@ -101,25 +191,106 @@ pub fn create_react_agent_streaming(
     tools: ToolRegistry,
     token_tx: mpsc::Sender<GraphEvent>,
 ) -> Result<Graph> {
-    build_react_agent(model, tools, Some(token_tx))
+    build_react_agent(model, tools, Some(token_tx), EvidenceMode::None)
+}
+
+/// Build a prebuilt ReAct agent graph that journals every model and tool
+/// call into `journal` (Flight Recorder, R0.5).
+///
+/// Identical to [`create_react_agent`] in topology and behavior; the only
+/// delta is evidence: the `agent` node wraps the model in
+/// [`crate::replay::RecordingChatModel`] and the `tools` node wraps each
+/// dispatched tool in [`crate::replay::RecordingTool`], so the journal
+/// gains `model_call` / `tool_call` events in the canonical
+/// [`crate::replay::model_call_request`] / [`crate::replay::tool_call_request`]
+/// shapes. Each event's causal parent is the invocation's node-input event
+/// ([`PARENT_EVENT_KEY`]), so iteration *N*'s model call hangs off iteration
+/// *N*'s `agent` input, and each tool call off its `tools` input.
+///
+/// Attach the same journal to the run ([`crate::executor::RunConfig::with_journal`])
+/// so node and executor evidence share one journal; for a byte-identical
+/// replay later, record under the determinism seams
+/// ([`crate::journal::Clock::logical`] + [`crate::journal::RngSource::seeded`]).
+/// Replay the recorded run with [`create_react_agent_replaying`] under
+/// [`crate::replay::ExactReplay`].
+///
+/// There is deliberately no streaming recording flavor: the streaming
+/// variant's token forwarding is a live-observability concern, and the
+/// recording wrappers record through [`ChatModel::chat`].
+pub fn create_react_agent_with_recording(
+    model: Arc<dyn ChatModel>,
+    tools: ToolRegistry,
+    journal: Journal,
+) -> Result<Graph> {
+    build_react_agent(model, tools, None, EvidenceMode::Record(journal))
+}
+
+/// Build a prebuilt ReAct agent graph that answers every model and tool
+/// call from a recorded journal instead of executing it (exact replay).
+///
+/// The replaying analogue of [`create_react_agent_with_recording`]: same
+/// topology, but the nodes wrap `model` and `tools` in
+/// [`crate::replay::ReplayingChatModel`] / [`crate::replay::ReplayingTool`],
+/// which serve each call from `source` (matched by sequence + canonical
+/// request hash) and re-journal it into `journal`. **The wrapped model and
+/// tools are never invoked** — carry them for their identity (effect class,
+/// tool schemas) and pass panic-on-call sentinels to prove the
+/// zero-outbound guarantee. The registry must offer the same tool
+/// identities (name, description, parameter schema) as the recorded run's:
+/// schema content feeds the model-call request hash.
+///
+/// Build `source` and `journal` from an [`crate::replay::ExactReplay`]
+/// session (`source()` / `fresh_journal()`) and drive the graph via
+/// [`crate::replay::ExactReplay::run_and_verify`]; see
+/// `examples/react_record_replay.rs`.
+pub fn create_react_agent_replaying(
+    model: Arc<dyn ChatModel>,
+    tools: ToolRegistry,
+    source: ReplaySource,
+    journal: Journal,
+) -> Result<Graph> {
+    build_react_agent(model, tools, None, EvidenceMode::Replay { source, journal })
 }
 
 fn build_react_agent(
     model: Arc<dyn ChatModel>,
     tools: ToolRegistry,
     token_tx: Option<mpsc::Sender<GraphEvent>>,
+    evidence: EvidenceMode,
 ) -> Result<Graph> {
-    let tool_schemas = tools.schemas();
+    let tool_schemas = sorted_tool_schemas(&tools);
     let tool_executor = ToolExecutor::new(tools);
 
     let agent_node = {
         let model = Arc::clone(&model);
+        let evidence = evidence.clone();
         move |ctx: crate::node::NodeContext| {
             let model = Arc::clone(&model);
+            let evidence = evidence.clone();
             let tool_schemas = tool_schemas.clone();
             let token_tx = token_tx.clone();
             async move {
                 let messages = read_messages(ctx.state())?;
+                // Evidence wiring is per invocation: the recording/replaying
+                // wrappers carry the invocation's causal parent, which only
+                // exists once the executor has journaled the node input.
+                let model: Arc<dyn ChatModel> = match &evidence {
+                    EvidenceMode::None => model,
+                    EvidenceMode::Record(journal) => Arc::new(
+                        RecordingChatModel::new(
+                            model,
+                            journal.clone(),
+                            invocation_parent(&ctx, AGENT_NODE)?,
+                        )
+                        .node(AGENT_NODE),
+                    ),
+                    EvidenceMode::Replay { source, journal } => Arc::new(ReplayingChatModel::new(
+                        model,
+                        source.clone(),
+                        journal.clone(),
+                        invocation_parent(&ctx, AGENT_NODE)?,
+                    )),
+                };
                 tracing::debug!(
                     node = AGENT_NODE,
                     messages = messages.len(),
@@ -151,6 +322,7 @@ fn build_react_agent(
 
     let tools_node = move |ctx: crate::node::NodeContext| {
         let tool_executor = tool_executor.clone();
+        let evidence = evidence.clone();
         async move {
             let messages = read_messages(ctx.state())?;
             let last = messages.last().ok_or_else(|| {
@@ -174,6 +346,44 @@ fn build_react_agent(
                 tools = ?tool_names,
                 "dispatching tool calls"
             );
+            // Evidence wiring is per invocation, like the agent node's: in
+            // record/replay mode each tool is wrapped with the invocation's
+            // causal parent, then dispatched through the same batch executor
+            // (parallel, order-preserving, panic-containing).
+            let tool_executor =
+                match &evidence {
+                    EvidenceMode::None => tool_executor,
+                    EvidenceMode::Record(journal) => {
+                        let parent = invocation_parent(&ctx, TOOLS_NODE)?;
+                        let mut wrapped = ToolRegistry::new();
+                        for name in tool_executor.registry().names() {
+                            let tool = tool_executor.registry().get(name).expect(
+                                "tool names iterated from a registry resolve in that registry",
+                            );
+                            wrapped.register_shared(Arc::new(
+                                RecordingTool::new(tool, journal.clone(), parent.clone())
+                                    .node(TOOLS_NODE),
+                            ));
+                        }
+                        ToolExecutor::new(wrapped)
+                    }
+                    EvidenceMode::Replay { source, journal } => {
+                        let parent = invocation_parent(&ctx, TOOLS_NODE)?;
+                        let mut wrapped = ToolRegistry::new();
+                        for name in tool_executor.registry().names() {
+                            let tool = tool_executor.registry().get(name).expect(
+                                "tool names iterated from a registry resolve in that registry",
+                            );
+                            wrapped.register_shared(Arc::new(ReplayingTool::new(
+                                tool,
+                                source.clone(),
+                                journal.clone(),
+                                parent.clone(),
+                            )));
+                        }
+                        ToolExecutor::new(wrapped)
+                    }
+                };
             // Per-call error policy: see ToolExecutor::execute_batch docs.
             let results = tool_executor.execute_batch(&last.tool_calls).await;
             let appended = serde_json::to_value(&results)?;
@@ -512,5 +722,158 @@ mod tests {
         let msgs: Vec<ChatMessage> = state.get_as(MESSAGES_CHANNEL).unwrap().unwrap();
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[3].content.as_deref(), Some("echoed: hello"));
+    }
+
+    // ---- Flight Recorder wiring (record / replay flavors) ----
+
+    use crate::journal::{Clock, Journal};
+    use crate::replay::ReplaySource;
+
+    fn recording_journal() -> Journal {
+        Journal::new("run-react-test", "thread-react-test", Clock::System)
+    }
+
+    #[test]
+    fn recording_and_replaying_variants_share_the_react_topology() {
+        let model: Arc<dyn ChatModel> = Arc::new(ScriptedModel::new(vec![]));
+        let journal = recording_journal();
+        let source = ReplaySource::new(&journal.snapshot());
+        let recording =
+            create_react_agent_with_recording(model.clone(), registry(), journal.clone()).unwrap();
+        let replaying =
+            create_react_agent_replaying(model.clone(), registry(), source, journal).unwrap();
+
+        for graph in [recording, replaying] {
+            assert_eq!(graph.node_count(), 2);
+            assert_eq!(graph.entry_point(), AGENT_NODE);
+            let agent_edges = graph.outgoing_edges(AGENT_NODE);
+            assert_eq!(agent_edges.len(), 1);
+            assert!(matches!(agent_edges[0], Edge::Conditional { .. }));
+            let tools_edges = graph.outgoing_edges(TOOLS_NODE);
+            assert_eq!(tools_edges.len(), 1);
+            assert!(matches!(
+                tools_edges[0],
+                Edge::Direct { from, to } if from == TOOLS_NODE && to == AGENT_NODE
+            ));
+        }
+    }
+
+    /// Node closures driven outside `Executor::run` have no
+    /// `PARENT_EVENT_KEY`; recording without a causal anchor must fail
+    /// loudly, not journal an unparented event.
+    #[tokio::test]
+    async fn recording_nodes_error_without_the_executor_parent_event() {
+        let model: Arc<dyn ChatModel> =
+            Arc::new(ScriptedModel::new(vec![ChatMessage::assistant("done")]));
+        let graph =
+            create_react_agent_with_recording(model, registry(), recording_journal()).unwrap();
+
+        let state = State::from_value(json!({
+            MESSAGES_CHANNEL: [serde_json::to_value(ChatMessage::user("hi")).unwrap()]
+        }))
+        .unwrap();
+        let err = graph
+            .node(AGENT_NODE)
+            .unwrap()
+            .run(NodeContext::new(state, NodeConfig::default()))
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(matches!(err, RustyError::Node(_)), "got: {message}");
+        assert!(message.contains(PARENT_EVENT_KEY), "got: {message}");
+
+        // The tools node fails the same way, after its input validation.
+        let state = State::from_value(json!({
+            MESSAGES_CHANNEL: [serde_json::to_value(ChatMessage::assistant_tool_calls(vec![
+                ToolCall::new("c1", "echo", json!({"text": "x"})),
+            ]))
+            .unwrap()]
+        }))
+        .unwrap();
+        let err = graph
+            .node(TOOLS_NODE)
+            .unwrap()
+            .run(NodeContext::new(state, NodeConfig::default()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(PARENT_EVENT_KEY), "got: {err}");
+    }
+
+    /// A model that captures the tool names it was offered, in order.
+    struct SchemaRecorder {
+        seen: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ChatModel for SchemaRecorder {
+        async fn chat(&self, _messages: &[ChatMessage], tools: &[Value]) -> Result<ChatResponse> {
+            *self.seen.lock().unwrap() = tools
+                .iter()
+                .map(|schema| {
+                    schema
+                        .pointer("/function/name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned()
+                })
+                .collect();
+            Ok(ChatResponse {
+                message: ChatMessage::assistant("done"),
+                model: None,
+                usage: None,
+            })
+        }
+    }
+
+    struct Zeta;
+
+    #[async_trait]
+    impl Tool for Zeta {
+        fn name(&self) -> &str {
+            "zeta"
+        }
+        fn description(&self) -> &str {
+            "Alphabetically after echo."
+        }
+        fn parameters_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        async fn call(&self, _args: Value) -> Result<Value> {
+            Ok(Value::Null)
+        }
+    }
+
+    /// Registries are HashMap-backed (random iteration order); the prebuilt
+    /// agent sorts schemas by tool name so the model request — which exact
+    /// replay hashes — is canonical across registry instances and processes.
+    /// All flavors share this via `build_react_agent`.
+    #[tokio::test]
+    async fn tool_schemas_reach_the_model_in_canonical_name_order() {
+        let model = Arc::new(SchemaRecorder {
+            seen: Mutex::new(Vec::new()),
+        });
+
+        // Two registries, same tools, opposite insertion orders.
+        let mut forward = ToolRegistry::new();
+        forward.register(Echo);
+        forward.register(Zeta);
+        let mut reverse = ToolRegistry::new();
+        reverse.register(Zeta);
+        reverse.register(Echo);
+
+        for registry in [forward, reverse] {
+            let graph = create_react_agent(model.clone(), registry).unwrap();
+            let state = State::from_value(json!({
+                MESSAGES_CHANNEL: [serde_json::to_value(ChatMessage::user("hi")).unwrap()]
+            }))
+            .unwrap();
+            graph
+                .node(AGENT_NODE)
+                .unwrap()
+                .run(NodeContext::new(state, NodeConfig::default()))
+                .await
+                .unwrap();
+            assert_eq!(model.seen.lock().unwrap().as_slice(), ["echo", "zeta"]);
+        }
     }
 }

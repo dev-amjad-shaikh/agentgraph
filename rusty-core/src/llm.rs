@@ -311,6 +311,18 @@ pub trait ChatModel: Send + Sync {
     /// Produce the next assistant message for the conversation.
     async fn chat(&self, messages: &[ChatMessage], tools: &[Value]) -> Result<ChatResponse>;
 
+    /// The declared effect classification of calling this model (Flight
+    /// Recorder, R0.5): recorded on model-call journal events and used by
+    /// retry/replay policy.
+    ///
+    /// The default is [`crate::record::Effect::NonIdempotent`]: a provider
+    /// call is billable and unverifiable, so the restrictive class applies.
+    /// Override only with justification (e.g. a local deterministic model
+    /// could argue for `ReadOnly`; cached completions for `Idempotent`).
+    fn effect(&self) -> crate::record::Effect {
+        crate::record::Effect::NonIdempotent
+    }
+
     /// Produce the next assistant message, streaming token deltas through
     /// `on_token` as they arrive.
     ///

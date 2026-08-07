@@ -25,6 +25,8 @@ If you want a batteries-included Python ecosystem or a fully managed control pla
 
 Rusty is **v0.x** under active development. Packages version independently — see [docs/versioning.md](docs/versioning.md) for the scheme and [docs/stability.md](docs/stability.md) for what each package promises not to break. The crates are implemented but **not yet published to any registry** — crates.io / npm / PyPI publishing is on the R1.0 roadmap. History lives in [CHANGELOG.md](CHANGELOG.md); the plan lives in [docs/roadmap.md](docs/roadmap.md).
 
+Latest release: **R0.5 — Flight Recorder** (2026-08-07) — every run is journaled as replayable evidence (canonical `RunEvent` contracts, causal effect journal, tamper-evident head hash), and exact replay re-drives a recorded run with zero outbound calls, verified event-for-event. Portable fixtures replay any recorded run in CI.
+
 ## Install
 
 Registry publishing is pending, so depend on the git repo for now (Cargo resolves the crate from `rusty-core/` in the repo):
@@ -81,11 +83,11 @@ The graph topology is validated when you call `GraphBuilder::compile()` — `cre
 
 | Piece | Path | What it is |
 |---|---|---|
-| Rusty Core | [`rusty-core/`](rusty-core/) (`rusty-agent-runtime`) | The engine: state channels + reducers, graph builder, super-step executor, checkpoints (memory / JSON file / Postgres), interrupts, `Send` fan-out, prebuilt ReAct agent, MCP client, remote nodes, WASM nodes. No HTTP. |
-| Rusty Server | [`rusty-server/`](rusty-server/) | axum HTTP/SSE server: threads, background / blocking / streaming runs, checkpoint history, fork + replay, assistants, crons, KV store, multi-tenant API-key auth. |
+| Rusty Core | [`rusty-core/`](rusty-core/) (`rusty-agent-runtime`) | The engine: state channels + reducers, graph builder, super-step executor, checkpoints (memory / JSON file / Postgres), interrupts, `Send` fan-out, prebuilt ReAct agent, MCP client, remote nodes, WASM nodes, Flight Recorder (run journal + exact replay). No HTTP. |
+| Rusty Server | [`rusty-server/`](rusty-server/) | axum HTTP/SSE server: threads, background / blocking / streaming runs, checkpoint history, fork + replay, run journals + fixture download, assistants, crons, KV store, multi-tenant API-key auth. |
 | Rusty Worker | [`rusty-worker/`](rusty-worker/) | Worker SDK: serves your node handlers over HTTP so `RemoteNode` can execute them remotely. |
 | Rusty OTel | [`rusty-otel/`](rusty-otel/) | One-call `tracing` subscriber setup with optional OTLP span export. |
-| Rusty Studio | [`studio/`](studio/) | Zero-build debug UI: connect, run, stream, inspect state and checkpoint history, fork and replay. |
+| Rusty Studio | [`studio/`](studio/) | Zero-build debug UI: connect, run, stream, inspect state and checkpoint history, fork and replay, Flight Recorder timeline with causal path and branch compare. |
 | Rusty SDKs | [`sdks/python/`](sdks/python/) · [`sdks/typescript/`](sdks/typescript/) | Zero-dependency `rusty_client` (Python) and `@rusty-runtime/client` (TypeScript) clients for the server API. |
 
 ## How Rusty compares

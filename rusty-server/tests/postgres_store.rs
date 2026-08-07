@@ -408,3 +408,41 @@ async fn postgres_threads_survive_router_rebuild_and_rollback_is_409() {
         "Postgres rollback must be 409: {v}"
     );
 }
+
+// --------------------------------------------------------------------- //
+// Flight Recorder journals (server_journals table)
+// --------------------------------------------------------------------- //
+
+#[tokio::test]
+#[ignore = "requires a live Postgres (DATABASE_URL)"]
+async fn postgres_run_journal_is_persisted_and_served() {
+    let app = postgres_app();
+
+    let (status, v) = call(&app, "POST", "/threads", Some(json!({"graph": "pipeline"}))).await;
+    assert_eq!(status, StatusCode::CREATED, "thread create failed: {v}");
+    let thread = v["thread_id"].as_str().unwrap().to_string();
+    let (status, v) = call(
+        &app,
+        "POST",
+        &format!("/threads/{thread}/runs/wait"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "run failed: {v}");
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+
+    // The completed run's journal is served from server_journals.
+    let (status, v) = call(&app, "GET", &format!("/runs/{run_id}/events"), None).await;
+    assert_eq!(status, StatusCode::OK, "events fetch failed: {v}");
+    assert_eq!(v["run_id"], json!(run_id));
+    assert_eq!(v["complete"], json!(true));
+    let events = v["events"].as_array().unwrap();
+    assert!(!events.is_empty(), "journaled run must have events");
+    for (seq, event) in events.iter().enumerate() {
+        assert_eq!(event["seq"], json!(seq as u64));
+        assert_eq!(event["id"], json!(format!("{run_id}:{seq}")));
+        assert_eq!(event["thread_id"], json!(thread));
+    }
+    let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    assert!(kinds.contains(&"checkpoint_written"));
+}

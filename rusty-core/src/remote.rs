@@ -399,6 +399,14 @@ impl Node for RemoteNode {
         &self.node_name
     }
 
+    fn effect(&self) -> crate::record::Effect {
+        // A remote invocation crosses a process boundary and performs work
+        // the runtime cannot inspect; the restrictive class applies until
+        // workers declare narrower effects (a worker manifest field is the
+        // R0.6+ mechanism for that).
+        crate::record::Effect::NonIdempotent
+    }
+
     async fn run(&self, ctx: NodeContext) -> Result<NodeOutput> {
         let task = NodeTask {
             protocol_version: PROTOCOL_VERSION,

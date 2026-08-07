@@ -316,6 +316,13 @@ impl Node for WasmNode {
         &self.name
     }
 
+    fn effect(&self) -> crate::record::Effect {
+        // The guest is arbitrary code behind a sandbox boundary; the
+        // restrictive class applies until capsule manifests (R0.9) declare
+        // the guest's real effect surface.
+        crate::record::Effect::NonIdempotent
+    }
+
     async fn run(&self, ctx: NodeContext) -> Result<NodeOutput> {
         let input = serde_json::json!({
             "state": ctx.state().to_value(),

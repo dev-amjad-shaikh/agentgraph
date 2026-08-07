@@ -36,6 +36,13 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, "bad_request", message)
     }
 
+    /// 422 — the request is well-formed but cannot be processed: replaying a
+    /// run whose graph is not registered in this process, or whose journal
+    /// carries evidence server-side replay cannot re-drive.
+    pub fn unprocessable(message: String) -> Self {
+        Self::new(StatusCode::UNPROCESSABLE_ENTITY, "unprocessable", message)
+    }
+
     /// 500 — checkpointer IO failures and other internal errors.
     pub fn internal(message: String) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)

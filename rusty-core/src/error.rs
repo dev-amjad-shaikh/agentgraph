@@ -50,6 +50,14 @@ pub enum RustyError {
     #[error("tool error: {0}")]
     Tool(String),
 
+    /// Exact-replay failures (Flight Recorder, R0.5): the run diverged from
+    /// the journaled evidence (request-hash mismatch, effect-order violation,
+    /// unserved recorded effects), a journal snapshot or fixture failed
+    /// integrity verification, or a replay was requested against an
+    /// incompatible graph, fixture, or resumed-run journal.
+    #[error("replay error: {0}")]
+    Replay(String),
+
     /// JSON (de)serialization failures.
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),

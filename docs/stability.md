@@ -10,8 +10,8 @@ Version numbers and the compatibility matrix live in
 
 ## Stable today
 
-Two surfaces carry a stability guarantee at v0.x. Breaking either one is
-treated as a protocol-level event, not a routine release note.
+Three surfaces carry a stability guarantee at v0.x. Breaking any one of
+them is treated as a protocol-level event, not a routine release note.
 
 **1. The remote-execution wire protocol (v1).**
 The `NodeTask` / `TaskResult` exchange between a `RemoteNode` and a
@@ -40,6 +40,31 @@ are serde-JSON serializations of the `Checkpoint` struct
   migration path where one exists. There is no guarantee that a newer
   runtime reads older checkpoints, and no guarantee in the other
   direction either.
+
+**3. The Flight Recorder evidence formats (format_version 1).**
+The wire shapes defined in `rusty-core/src/record.rs` — `RunEvent` (with
+`RunEventKind`, `EventStatus`, `PayloadRef`, `ArtifactRef`), the
+`Effect` taxonomy, `DecisionEvent`, and the `CheckpointHeader` stamped
+into every checkpoint — together with the `JournalSnapshot` export form
+(`rusty-core/src/journal.rs`) and the `ReplayFixture` envelope
+(`rusty-core/src/replay.rs`, `FIXTURE_FORMAT_VERSION` = 1) are pinned by
+golden-file tests (`rusty-core/tests/golden/`); accidental drift fails
+CI. The guarantee mirrors the checkpoint guarantee, within a minor
+version line:
+
+- Within a `rusty-agent-runtime` `0.x.*` minor line, these shapes evolve
+  additively via serde defaults: journals, fixtures, and checkpoint
+  headers written by one release in the line deserialize under every
+  other release in the line. Pre-R0.5 checkpoints (no header)
+  deserialize into `CheckpointHeader::default()` — that fallback is part
+  of the contract.
+- `ReplayFixture::import` rejects an unsupported `format_version` at the
+  boundary rather than misreading it; the same boundary-rejection rule
+  applies to checkpoint headers if `CURRENT_FORMAT_VERSION` ever leaves
+  1.
+- A non-additive change to any of these shapes (a field removal,
+  rename, or meaning change) is a minor-release event recorded in the
+  CHANGELOG with a migration path where one exists.
 
 ## Not stable — may change in any 0.x minor release
 

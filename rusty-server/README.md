@@ -2,9 +2,9 @@
 
 **The network face of [`rusty-agent-runtime`](../rusty-core)** — serve your agent graphs over HTTP + SSE from a single static binary. No interpreter, no Postgres, no Redis. Dual-licensed under MIT OR Apache-2.0.
 
-> **Status: v0.4, under active development.** The crate ships as a *library*: you call `rusty_server::serve()` from your own `main.rs`. The endpoint set, streaming semantics, and config surface follow the architecture document in [`docs/rusty-server-design.md`](../docs/rusty-server-design.md). The core `rusty-agent-runtime` crate is untouched — it has no HTTP, no axum, no server dependencies, and never learns that a server exists.
+> **Status: v0.5, under active development.** The crate ships as a *library*: you call `rusty_server::serve()` from your own `main.rs`. The endpoint set, streaming semantics, and config surface follow the architecture document in [`docs/rusty-server-design.md`](../docs/rusty-server-design.md). The core `rusty-agent-runtime` crate is untouched — it has no HTTP, no axum, no server dependencies, and never learns that a server exists.
 
-> **Minor breaking changes in this version.** (1) `RunManager` is no longer re-exported from the crate root — run bookkeeping is crate-private; interact with runs over HTTP (`GET /runs/{id}`, `GET /runs/{id}/stream`). (2) `POST /threads/{id}/history` with an unknown `before` cursor now answers `400` instead of silently returning the full history (a silent reset sent paginating clients into infinite loops).
+> **New in v0.5 — the Flight Recorder surface.** Every run is journaled (core R0.5 kernel): the server attaches a journal to the executor at run start, persists its snapshot at every checkpoint boundary and at run completion (`{store_path}/journals/{run_id}.json`, or the auto-migrated `server_journals` table on Postgres), and serves it read-only via `GET /runs/{run_id}/events` — fetchable by run id even after the run's in-memory record is evicted or the process restarts. On top of that: `GET /runs/{run_id}/fixture` (portable CI replay bundle), `POST /runs/replay` (server-side exact replay with evidence verification), and `GET /runs/diff` (branch diff of two runs' journals). Fully additive — no breaking changes in this version.
 
 ## Why one binary instead of three containers
 
@@ -29,7 +29,7 @@ LangGraph's `langgraph.json` exists because Python can import user modules at ru
 ```toml
 [dependencies]
 rusty-agent-runtime = "0.4"
-rusty-server = "0.4"
+rusty-server = "0.5"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 tracing-subscriber = "0.3"
@@ -86,7 +86,7 @@ A `GraphRegistry` entry is a name plus the two things the executor needs — a `
 
 ## HTTP API
 
-An Agent-Protocol-compatible subset — wire-compatible with the core run/thread shapes LangGraph Platform uses, without the commercial surface. This table is the v0.4 endpoint inventory; everything listed here is implemented and covered by integration tests.
+An Agent-Protocol-compatible subset — wire-compatible with the core run/thread shapes LangGraph Platform uses, without the commercial surface. This table is the v0.5 endpoint inventory; everything listed here is implemented and covered by integration tests.
 
 | Endpoint | Description |
 |---|---|
@@ -101,6 +101,10 @@ An Agent-Protocol-compatible subset — wire-compatible with the core run/thread
 | `POST /threads/{id}/runs/wait` | Run to completion; returns the terminal JSON (`{status, output \|\| interrupt, …}`); server-side wait ceiling of 3600 s → `504` on timeout (the run keeps executing — poll `GET /runs/{id}`) |
 | `POST /threads/{id}/runs/stream` | Run with [SSE streaming](#streaming-sse); a fresh run starts a new frame sequence, so `Last-Event-ID` is **ignored** here |
 | `GET /runs/{id}/stream` | Attach to an existing run's SSE stream: replay the event log — **honoring `Last-Event-ID`** — then follow live frames until `end`; `404` for unknown or cross-tenant runs |
+| `GET /runs/{id}/events` | [Flight Recorder](#flight-recorder-run-journals): the run's journaled `RunEvent`s → `{run_id, events, complete}`; `404` for unknown or cross-tenant runs; stays fetchable by run id after run eviction/restart via the persisted journal |
+| `GET /runs/{id}/fixture` | [Flight Recorder](#flight-recorder-run-journals): download the run as a portable `ReplayFixture` bundle (journal + graph topology hash + final checkpoint) for CI replay; `409` before the first persisted snapshot |
+| `POST /runs/replay` | [Flight Recorder](#flight-recorder-run-journals): re-drive a journaled run against its registered graph (zero outbound) and verify the replayed evidence → `{run_id, verified, expected_events, actual_events, first_divergence}`; `404` unknown/cross-tenant, `409` no journal or still executing, `422` graph not registered in this process / effect-carrying or resumed journal |
+| `GET /runs/diff?base=&branch=` | [Flight Recorder](#flight-recorder-run-journals): structural diff of two runs' journals (core's `BranchDiff` shape); `404` unknown/cross-tenant either side, `409` when either run has no persisted journal |
 | `DELETE /threads/{id}/runs/{run_id}` | Rollback: delete a **finished** run's checkpoints, re-anchoring the thread to the pre-run checkpoint (`409` while the run is active, while the thread is busy, when the run's checkpoints are no longer the history tail, or on the Postgres backend) |
 | `GET /runs/{run_id}` | Poll a run: `{run_id, thread_id, graph, attempt, status}`; once terminal the body also carries the run's `output` / `error` / `interrupt` fields (up to 1024 terminal runs retained per process, oldest evicted beyond that) |
 | `POST /assistants` | Create a named graph alias: `{name, graph, config?, metadata?, assistant_id?}` → `201` (persisted under `{store_path}/assistants/`) |
@@ -111,7 +115,7 @@ An Agent-Protocol-compatible subset — wire-compatible with the core run/thread
 | `GET /store/{ns}/{key}` / `DELETE /store/{ns}/{key}` | Fetch / delete one item (`404` when absent) |
 | `GET /store/{ns}` | List a namespace's items, sorted by key (empty array for an unwritten namespace) |
 
-Not in v0.4 (roadmap, see below): thread listing/deletion endpoints, `/metrics`, `/graphs`, and the gRPC worker protocol. Thread records **are** durable: each thread persists as one JSON file under `{store_path}/threads/` (or in the `server_threads` table with [Postgres persistence](#postgres-persistence-feature-postgres)) and reloads on startup — persistence is what makes the checkpoint durability story reachable through the API, since a restart that forgot the thread records would 404 every pre-restart thread while its checkpoints sat orphaned on disk. Assistants, crons, and store items are likewise durable (JSON files under `store_path`, or the `server_*` tables) and reload on startup.
+Not in v0.5 (roadmap, see below): thread listing/deletion endpoints, `/metrics`, `/graphs`, the replay-POST Flight Recorder endpoint, and the gRPC worker protocol. Thread records **are** durable: each thread persists as one JSON file under `{store_path}/threads/` (or in the `server_threads` table with [Postgres persistence](#postgres-persistence-feature-postgres)) and reloads on startup — persistence is what makes the checkpoint durability story reachable through the API, since a restart that forgot the thread records would 404 every pre-restart thread while its checkpoints sat orphaned on disk. Assistants, crons, and store items are likewise durable (JSON files under `store_path`, or the `server_*` tables) and reload on startup.
 
 **Run-create payload** (subset of LangGraph's shape):
 
@@ -135,11 +139,57 @@ Not in v0.4 (roadmap, see below): thread listing/deletion endpoints, `/metrics`,
 - `stream_mode` selects which frame families the SSE endpoint emits; default `["values", "updates"]`. `metadata`, `error`, and `end` frames are always emitted. Add `"messages"` for LLM token deltas.
 - `multitask_strategy` — one active run per thread: `enqueue` (default) queues onto the per-thread run queue (depth-capped by `ServerConfig::max_concurrent_runs_per_thread`), `reject` returns `409 Conflict`. LangGraph's `rollback` strategy is instead an explicit operation: `DELETE /threads/{id}/runs/{run_id}` on a finished run.
 
-**Client-chosen ids.** `thread_id` / `new_thread_id` / `assistant_id` / `cron_id` (including `assistant_id` in run bodies) must be non-empty, ≤ 256 chars, free of path separators (`/`, `\`), not all dots, and not one of the reserved layout names — `assistants`, `crons`, `store`, `threads`, `latest` — which already name directories at the store root (or the `latest` pointer file inside each checkpoint dir); claiming one would write checkpoints into platform directories. Violations answer `400`. Tenant ids in `with_tenant_key` follow the same reserved-name rule with a 64-char cap, enforced at startup.
+**Client-chosen ids.** `thread_id` / `new_thread_id` / `assistant_id` / `cron_id` (including `assistant_id` in run bodies) must be non-empty, ≤ 256 chars, free of path separators (`/`, `\`), not all dots, and not one of the reserved layout names — `assistants`, `crons`, `journals`, `store`, `threads`, `latest` — which already name directories at the store root (or the `latest` pointer file inside each checkpoint dir); claiming one would write checkpoints into platform directories. Violations answer `400`. Tenant ids in `with_tenant_key` follow the same reserved-name rule with a 64-char cap, enforced at startup.
 
 **Auth.** A single static API key checked against the `X-Api-Key` header (the LangSmith managed-deployment convention), set via `ServerConfig::with_api_key("…")`. With no key configured (the default), the server runs in dev mode with auth disabled.
 
 **CORS.** `router()` layers `tower_http::cors::CorsLayer::permissive()` as the outermost middleware: every response carries `access-control-allow-origin: *`, and OPTIONS preflights are answered before the auth middleware runs. That makes browser clients — like the zero-build [Studio](../studio/) — work out of the box from any origin, including `file://`. **Production deployments should restrict this**: call `router()` and layer your own restrictive `CorsLayer` policy on top in your binary (allowed origins, methods, and headers narrowed to your frontend), or terminate CORS at a reverse proxy.
+
+## Flight Recorder: run journals
+
+Every run is journaled by the core Flight Recorder (R0.5): super-step boundaries, node inputs/outputs (with declared effect classes and measured latencies), model/tool/remote/WASM calls recorded by node code, interrupts, resumes, routing decisions, and checkpoint writes land in an append-only, hash-chained `Journal` — one per run, keyed by the server-minted run id. The server attaches that journal to the executor at run start and persists its `JournalSnapshot`:
+
+- **at every checkpoint boundary** (flushed from the `CheckpointSaved` event path), so stored evidence trails the live journal by at most one super-step, and
+- **at run completion** — success, interrupt, or error; evidence of a failed run is still evidence.
+
+Snapshots persist as one JSON file per run under `{store_path}/journals/` (or the `server_journals` table with [Postgres persistence](#postgres-persistence-feature-postgres)) and are served read-only:
+
+```bash
+curl localhost:8080/runs/$RUN_ID/events
+# {
+#   "run_id": "7c1e…",
+#   "events": [
+#     {"id": "7c1e…:0", "run_id": "7c1e…", "thread_id": "3f2b…",
+#      "node_id": null, "seq": 0, "kind": "super_step_start",
+#      "effect": "pure", "input": {"kind": "inline", "value": …},
+#      "output": null, "latency_ms": null, "tokens": null,
+#      "cost_usd": null, "status": "ok", "parent": null,
+#      "recorded_at": "2026-08-07T…Z"},
+#     …
+#   ],
+#   "complete": true
+# }
+```
+
+The `events` are core's `RunEvent`s in `seq` order, in the exact golden-pinned wire shape (`rusty-core/tests/golden/run_event.json`); event ids are deterministic (`{run_id}:{seq}`) and `parent` forms the causal chain. `complete` is `true` once the run is terminal — the served snapshot is the final journal. Guardrails: the stored snapshot's chained head hash is re-verified on every read (tampered evidence answers `500`, not a plausible-looking lie), and 404/tenant-isolation semantics are identical to `GET /runs/{id}` — a cross-tenant run is invisible here too. **Reachability:** journal reads resolve the run through the live run manager first and fall back to the persisted journal — so `/events`, `/fixture`, `/replay`, and `/diff` keep answering by run id after the run's in-memory record is evicted (past the 1024-run retention cap) or the process restarts, for as long as the store holds the journal; store-fallback reads are served as `complete` (no live writer remains). Both SDKs expose this endpoint as `run_events(run_id)` (Python) / `runEvents(runId)` (TypeScript).
+
+**Fixture download** — `GET /runs/{run_id}/fixture` bundles the run for portable replay: the integrity-verified journal snapshot, the graph's topology hash, the run's final checkpoint, and provenance metadata, in core's `ReplayFixture` envelope (`format_version: 1`). Feed the JSON to `ReplayFixture::import` to re-drive the run in CI. A run with no persisted journal yet (queued, or before its first checkpoint) answers `409`; 404 and tenant-isolation semantics match `GET /runs/{id}`, and the served checkpoint's `thread_id` is always the external one. Server runs record under the system clock and OS entropy, so fixtures carry no logical-clock/RNG-seed parameters — byte-identical CI replay is for runs recorded with determinism seams. SDKs: `get_fixture(run_id)` / `getFixture(runId)`.
+
+**Server-side replay** — `POST /runs/replay` with body `{"run_id": "…"}` re-drives the journaled run against the graph code registered in this process (zero outbound calls: node code re-executes, but any journaled model/tool/remote/WASM effects make the endpoint refuse — see below) over a throwaway in-memory checkpointer, and verifies the replayed evidence against the recorded journal:
+
+```bash
+curl -X POST localhost:8080/runs/replay \
+  -H 'Content-Type: application/json' \
+  -d '{"run_id": "'$RUN_ID'"}'
+# {"run_id": "7c1e…", "verified": true, "expected_events": 12,
+#  "actual_events": 12, "first_divergence": null}
+```
+
+`verified` compares the two journals on the evidence axes — kinds, nodes, sequences, effect classes, statuses, and resolved payloads — excluding per-run minted checkpoint ids and wall-clock measurements (server runs record under the system clock and OS entropy, so byte-identity is the CI-fixture story, not this one). `first_divergence` is the journal `seq` of the first disagreeing event (or of the first recorded event the replay never produced). Statuses: `404` unknown or cross-tenant run; `409` no persisted journal yet, or the run is still executing (replay verifies a final journal); `422` when the run's graph is not registered in this process, when the journal carries recorded model/tool/remote/WASM calls (server-side replay cannot serve them — download the fixture and replay it in CI), or when the run resumed from a checkpoint. SDKs: `replay_run(run_id)` / `replayRun(runId)`.
+
+**Branch diff** — `GET /runs/diff?base=<run_id>&branch=<run_id>` returns the structural diff of two runs' journals in core's `BranchDiff` serde shape as-is: `first_divergent_seq`, the events `added` (branch) and `removed` (base) at and after the divergence point, per-super-step state-channel `step_diffs`, and token/cost `base_totals` / `branch_totals`. Events compare logically (identity and timing fields excluded), so two runs forked from one point show their shared prefix as equal; a run diffed against itself reports `first_divergent_seq: null`. `404` for an unknown or cross-tenant run on either side, `409` when either run has no persisted journal yet. SDKs: `diff_runs(base, branch)` / `diffRuns(base, branch)`.
+
+The Studio's compare/replay UI consumes both endpoints with exactly these response shapes; the Python and TypeScript SDKs expose all four Flight Recorder endpoints (`run_events`/`get_fixture`/`replay_run`/`diff_runs`, camelCase in TypeScript).
 
 ## Time travel: fork & checkpoint replay
 
@@ -216,7 +266,7 @@ The default deployment needs no infrastructure — checkpoints, assistants, cron
 
 ```toml
 [dependencies]
-rusty-server = { version = "0.4", features = ["postgres"] }
+rusty-server = { version = "0.5", features = ["postgres"] }
 ```
 
 ```rust
@@ -234,8 +284,9 @@ let config = ServerConfig::new("0.0.0.0:8080".parse()?, "./data/checkpoints")
 | Assistants | `{store_path}/assistants/*.json` | table `server_assistants` (record as JSONB `payload`) |
 | Crons | `{store_path}/crons/*.json` | table `server_crons` (record as JSONB `payload`) |
 | KV store | `{store_path}/store/{ns}/{key}.json` | table `server_kv` (`namespace` + `"key"` primary key, JSONB `value`, `created_at`/`updated_at`) |
+| Run journals | `{store_path}/journals/{run_id}.json` | table `server_journals` (`run_id` primary key, JSONB snapshot, `created_at`/`updated_at`) |
 
-All five schemas (`rusty_checkpoints` plus the four `server_*` tables) are **auto-migrated** (`CREATE TABLE IF NOT EXISTS …`) on connect; connections are established lazily on first use, so `router()` stays synchronous and the server starts even if the database is briefly unreachable (first-touch failures surface as `500`s until Postgres is back). The HTTP surface is identical either way — `GET /info` reports `"checkpointer": "postgres"` when enabled — with one deliberate exception: rollback (`DELETE /threads/{id}/runs/{run_id}`) answers `409` on the Postgres backend rather than silently deleting nothing (the `Checkpointer` trait has no delete operation, so removal goes through the JSON-file layout directly). Everything else — fork, replay, crons, thread durability across restarts, and the KV store — runs the same code paths against the `ServerStore` / `Checkpointer` traits.
+All six schemas (`rusty_checkpoints` plus the five `server_*` tables) are **auto-migrated** (`CREATE TABLE IF NOT EXISTS …`) on connect; connections are established lazily on first use, so `router()` stays synchronous and the server starts even if the database is briefly unreachable (first-touch failures surface as `500`s until Postgres is back). The HTTP surface is identical either way — `GET /info` reports `"checkpointer": "postgres"` when enabled — with one deliberate exception: rollback (`DELETE /threads/{id}/runs/{run_id}`) answers `409` on the Postgres backend rather than silently deleting nothing (the `Checkpointer` trait has no delete operation, so removal goes through the JSON-file layout directly). Everything else — fork, replay, crons, thread durability across restarts, the KV store, and journal persistence — runs the same code paths against the `ServerStore` / `Checkpointer` traits.
 
 The live-Postgres integration tests are gated and skipped by default; run them against a scratch database with:
 
@@ -330,7 +381,7 @@ With the server running locally in dev mode (no API key configured):
 curl localhost:8080/ok
 # {"ok":true}
 curl localhost:8080/info
-# {"service":"rusty-server","version":"0.4.0","checkpointer":"json_file",
+# {"service":"rusty-server","version":"0.5.0","checkpointer":"json_file",
 #  "store_path":"./data/checkpoints",
 #  "graphs":[{"name":"react_agent","channels":["messages"]}]}
 
@@ -380,6 +431,16 @@ curl -X POST localhost:8080/threads/9c1e…/runs/wait \
 # Poll a background run's status (terminal runs carry output/error)
 curl localhost:8080/runs/$RUN_ID
 
+# Flight Recorder: the run's journaled evidence (RunEvents, seq order)
+curl localhost:8080/runs/$RUN_ID/events
+# …or download the run as a portable replay fixture for CI
+curl localhost:8080/runs/$RUN_ID/fixture
+# …or re-drive it server-side and verify the replayed evidence
+curl -X POST localhost:8080/runs/replay \
+  -H 'Content-Type: application/json' -d '{"run_id": "'$RUN_ID'"}'
+# …or diff two runs' journals (e.g. a run vs its fork)
+curl "localhost:8080/runs/diff?base=$RUN_ID&branch=$FORK_RUN_ID"
+
 # Attach to a background run's SSE stream; reconnect with Last-Event-ID
 # to skip frames you have already seen
 curl -N localhost:8080/runs/$RUN_ID/stream
@@ -419,6 +480,7 @@ With auth configured, add `-H "X-Api-Key: $KEY"` to every call. For a full walkt
 - [x] **Phase C (continued) — permissive CORS (v0.3).** `router()` layers `tower_http::cors::CorsLayer::permissive()`, so browser clients (the [Studio](../studio/)) call the API cross-origin; preflights are answered before auth. Restrict for production — see [CORS](#http-api). *Implemented.*
 - [x] **Phase C (continued) — multi-tenancy (v0.4).** API keys map to tenants (`with_tenant_key(tenant, key)`; legacy `with_api_key` = the `default` tenant); threads + checkpoints, runs, assistants, crons, and KV namespaces are fully isolated via internal `{tenant}/` id prefixing, with cross-tenant access answering 404 (never 403). Open mode and the default tenant keep the legacy flat storage layout. See [Multi-tenancy](#multi-tenancy-api-keys--tenants-with-full-isolation). *Implemented.*
 - [x] **Phase C (continued) — hardening (v0.4).** Durable thread records (`threads/` JSON files / `server_threads` table — pre-restart checkpoints stay reachable through the API), the SSE attach endpoint (`GET /runs/{id}/stream` with `Last-Event-ID` replay), rollback guards (`409` on the Postgres backend, on busy threads, and on mid-history suffix violations), the cron `interval_secs` clamp (≤ 1 year) + one-shot tombstones, reserved layout names rejected as client-chosen ids, the 1024-run retention cap, the 3600 s blocking-wait ceiling (`504`), and `400` for unknown history `before` cursors. *Implemented.*
+- [x] **R0.5 — Flight Recorder read surface (v0.5).** Every run is journaled by the executor (core R0.5 kernel); the server persists the journal snapshot at every checkpoint boundary and at run completion (`{store_path}/journals/{run_id}.json`, or the auto-migrated `server_journals` table on Postgres) and serves it via `GET /runs/{run_id}/events` → `{run_id, events, complete}` in the golden-pinned `RunEvent` wire shape, with head-hash re-verification on read and 404/tenant-isolation semantics identical to `GET /runs/{id}`. `GET /runs/{run_id}/fixture` downloads the run as a portable `ReplayFixture` for CI replay. SDK parity: `run_events(run_id)` (Python) / `runEvents(runId)` (TypeScript). *Implemented — the replay-POST endpoint lands in a later R0.5 wave.*
 - [ ] **Phase B — gRPC worker protocol (`rusty-proto`).** `RemoteNode`: a gRPC client behind the same `Node` trait, delegating node execution to stateless out-of-process workers that long-poll named node-queues. The server keeps checkpoints, super-step scheduling, interrupts, and stream fan-out. Agent nodes are dominated by LLM latency (hundreds of ms to minutes), so a 1–5 ms gRPC hop is <1% overhead — and since `State` is already a JSON map, the wire boundary is lossless. Crash isolation, polyglot workers (a Python worker can host the LangChain ecosystem while Rust owns orchestration), and independent scaling of tool-heavy nodes follow.
 - [ ] **Phase C (remainder).** Thread listing/deletion endpoints, `/metrics`, and `/graphs`. (`WasmNode` is implemented in core `rusty-agent-runtime` v0.4 behind the `wasm` feature — register a Wasm-backed graph and this crate serves it unchanged.)
 

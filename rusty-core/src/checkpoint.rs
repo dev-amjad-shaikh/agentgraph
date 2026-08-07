@@ -20,6 +20,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, RustyError};
+use crate::record::{CheckpointHeader, JournalRef};
 use crate::state::State;
 
 /// A versioned snapshot of one thread's state at a super-step boundary.
@@ -45,10 +46,32 @@ pub struct Checkpoint {
 
     /// Wall-clock creation time (UTC).
     pub created_at: DateTime<Utc>,
+
+    /// Flight Recorder provenance (R0.5): checkpoint format version, graph
+    /// version/content hash, active policy version, and the run's logical
+    /// clock value at creation. See [`CheckpointHeader`] for the semantics.
+    ///
+    /// `#[serde(default)]` keeps checkpoints written before R0.5 (which have
+    /// no header field) deserializable: they load with
+    /// [`CheckpointHeader::default`] — current format version, unversioned
+    /// graph, static policy.
+    #[serde(default)]
+    pub header: CheckpointHeader,
+
+    /// The journal head at this boundary (`None` pre-R0.5), binding this
+    /// state snapshot to the run evidence that produced it.
+    #[serde(default)]
+    pub journal_ref: Option<JournalRef>,
 }
 
 impl Checkpoint {
     /// A new checkpoint with a fresh UUID v4 id and current timestamp.
+    ///
+    /// Convenience constructor used by tests and pre-R0.5 call paths: the
+    /// header falls back to [`CheckpointHeader::default`] and no journal
+    /// reference is stamped. The executor mints checkpoints field-by-field
+    /// instead, sourcing id/timestamp from the run's determinism seams and
+    /// stamping the real header and journal head.
     pub fn new(
         thread_id: impl Into<String>,
         step: usize,
@@ -62,6 +85,8 @@ impl Checkpoint {
             state,
             next_nodes,
             created_at: Utc::now(),
+            header: CheckpointHeader::default(),
+            journal_ref: None,
         }
     }
 }

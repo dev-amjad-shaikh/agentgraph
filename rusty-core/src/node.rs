@@ -281,6 +281,20 @@ pub trait Node: Send + Sync {
         "anonymous"
     }
 
+    /// The declared default effect classification of this node (Flight
+    /// Recorder, R0.5): recorded on the node's journal events and used by
+    /// retry/replay policy.
+    ///
+    /// The default is [`crate::record::Effect::Pure`] — a plain compute node
+    /// over its state snapshot. **Override honestly**: a node that performs
+    /// I/O or side effects inside `run` is not `Pure`, and misdeclaring it
+    /// weakens replay fidelity (the journal will claim an effect was
+    /// re-derivable when it was not). [`crate::remote::RemoteNode`] and the
+    /// `wasm`-feature `WasmNode` override to `NonIdempotent`.
+    fn effect(&self) -> crate::record::Effect {
+        crate::record::Effect::Pure
+    }
+
     /// Execute the node against a super-step state snapshot.
     async fn run(&self, ctx: NodeContext) -> Result<NodeOutput>;
 }

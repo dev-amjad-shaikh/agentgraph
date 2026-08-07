@@ -5,8 +5,9 @@ JS + CSS, no npm, no framework, no bundler — open it and point it at a running
 
 ```
 studio/
-├── index.html   ← the entire UI (open this)
-└── serve.py     ← optional same-origin static host + API proxy
+├── index.html         ← the entire UI (open this)
+├── serve.py           ← optional same-origin static host + API proxy
+└── test-recorder.mjs  ← node unit tests for the Flight Recorder timeline helpers
 ```
 
 ## What it does
@@ -46,6 +47,34 @@ studio/
   - **Interrupt / resume helper** — when any run ends `interrupted`, the interrupt payload is shown with a
     resume input; the value is sent back as `{"command": {"resume": <value>}}` (parsed as JSON when
     possible, otherwise sent as a plain string), via *wait* or *stream*.
+  - **Flight Recorder timeline** — `GET /runs/{run_id}/events` (R0.5) rendered as a scrubbable timeline of
+    the run's journaled evidence: one lane per node (plus a run-wide lane for super-step boundaries,
+    routing decisions, and checkpoint writes), event chips colored by `kind`, and super-step grouping
+    header rows. The run id auto-fills from any run you start (background, wait, or stream) and the
+    timeline auto-loads when the run reaches a terminal state; you can also paste any run id and
+    **Load events**. Click an event for the detail panel: effect classification badge with its retry/replay
+    meaning, status, causal parent (click to jump), latency, token usage, cost, timestamps, and the
+    input/output payloads — inline values rendered as JSON, artifact refs shown as `sha256` + byte size
+    (payloads over 4 KiB are content-addressed; the bytes resolve from the journal snapshot's artifact
+    map, not this endpoint). The **causal path** toggle highlights the selected event's ancestor chain
+    via `parent` links; the scrub slider walks the journal in `seq` order. The status line shows the
+    event count and whether the journal is `complete` (run terminal) or partial. On a server build
+    without the route (pre-R0.5 server wave) the card explains the missing endpoint instead of
+    erroring; event fields are read defensively, so partial implementations still render.
+  - **Exact replay** — the **Replay** button calls `POST /runs/replay` with the loaded run id and renders
+    the verdict as a banner: *verified* (the replayed run reproduced every journaled event byte-for-byte,
+    with the event count) or *mismatch* (expected vs actual event counts, plus the `first_divergence` seq
+    as a jump link into the loaded timeline). Failures are shown distinctly: unknown run (404), no
+    persisted journal (409), graph not registered (422), and route-missing (older server build, non-JSON
+    404) each get their own note.
+  - **Fork compare** — enter two run ids (the base auto-fills from the loaded journal) and **Compare**
+    calls `GET /runs/diff?base=…&branch=…`, then renders both journals (via `GET /runs/{id}/events`)
+    side by side, aligned by `seq`: the identical prefix is dimmed, the first divergent seq is marked,
+    and events unique to one side are highlighted as *removed* (base) or *added* (branch). Column
+    headers carry per-branch totals from the diff's `base_totals` / `branch_totals` (event count, token
+    usage, cost). When the diff's `first_divergent_seq` is absent, the fork point is derived from event
+    presence alone; when the timeline fetches fail after a successful diff, the divergence region
+    carried by the diff itself (`added` / `removed`) is shown with a partial-view note.
 - **Status badges** — `pending` / `running` / `success` / `interrupted` / `error`, mapped from the wire
   values returned by `GET /runs/{run_id}`, `runs/wait`, and SSE `end` frames.
 
@@ -111,6 +140,13 @@ no network) and `react_agent` (channel `messages`, scripted model + echo tool, n
    appends `second` again; the badge flips `running → success` via live polling.
 6. Create a thread on **react_agent**. The payload textarea pre-fills with a `messages` input —
    **Run & wait** returns the terminal JSON with the scripted agent's tool-call transcript in `output`.
+   When the run finishes, the **Flight Recorder** card auto-loads the run's journal: three super-steps
+   on the `agent` / `tools` lanes, causal parent chains from each node input back to its super-step
+   start, and `checkpoint_written` events classified `idempotent`. Click a `node_output` chip, toggle
+   **causal path**, and the ancestor chain lights up; drag the scrub slider to walk the journal in
+   `seq` order. With the R0.5 replay endpoints on the server, **Replay** re-drives the run and shows the
+   verified banner; for compare, run the same thread twice with different inputs and diff the two run
+   ids — the shared prefix dims and the fork point is marked.
 7. **Interrupt/resume** (needs a graph that interrupts — the demo graphs don't; see
    [`docs/server-quickstart.md`](../docs/server-quickstart.md) for a graph with `ctx.interrupt()`): when a
    run ends interrupted, the interrupt payload card appears; type `{"approved": true}`, click
@@ -130,6 +166,18 @@ no network) and `react_agent` (channel `messages`, scripted model + echo tool, n
   execute from the latest state — upgrade the server for real replay.
 - **SSE resume (`Last-Event-ID`)** is implemented server-side but not surfaced in the UI — reload the page
   and the live feed starts fresh (state/history re-fetch on select).
+- **Flight Recorder requires an R0.5 server build.** `GET /runs/{run_id}/events` lands with the R0.5
+  server wave; against older builds the Recorder card says the route is missing and stays inert
+  (auto-load is suppressed after the first route-less 404). Artifact-ref payloads are shown by
+  reference (`sha256` + size) — resolving the bytes themselves needs the journal snapshot export,
+  which is not on the HTTP surface yet. Runs from before a server restart 404 here exactly like
+  `GET /runs/{id}` (the run registry is in-memory).
+- **Replay and fork compare need the R0.5 replay endpoints.** `POST /runs/replay` and `GET /runs/diff`
+  land in the same server wave as journal persistence; on older builds both surface the route-missing
+  note (a non-JSON 404) and stay inert. Exact replay only works for runs whose journal was persisted
+  and whose graph is still registered — the 409 and 422 banners say which. Replay of *resumed* runs is
+  rejected by the replay engine itself (`ExactReplay` refuses journals that begin with a resume event);
+  replay the original run instead.
 - **Static verification only.** The page was syntax-checked (see below) but not exercised in a real browser
   in this workspace; visual/behavioral bugs are possible. The API shapes it targets were read from
   `rusty-server/src/routes.rs` + `src/runs.rs`, not guessed.
@@ -139,10 +187,32 @@ no network) and `react_agent` (channel `messages`, scripted model + echo tool, n
 ## Verification performed
 
 - `node --check` on the extracted `<script>` block — syntax OK.
+- `node studio/test-recorder.mjs` — 71 unit tests over the Flight Recorder timeline helpers (extracted
+  from the same `<script>` block, run under `vm`): `seq` ordering with missing-field fallbacks,
+  super-step grouping, lane derivation, causal-chain walking (including a parent-cycle guard), marker
+  and detail-panel HTML (effect badges, parent jump links, token/cost formatting), payload rendering
+  (inline escaping, artifact `sha256` + bytes, unknown future tags), and coverage of all 12 frozen
+  `RunEventKind`s and all 5 `Effect` classes; plus the replay banner states (verified / mismatch with
+  divergence jump link / partial response), the 404 / 409 / 422 / route-missing error mapping, and
+  fork-compare alignment (dimmed prefix, divergence marking, added/removed classes, presence-derived
+  fallback for partial diffs, per-branch totals, HTML escaping). 71 passed, 0 failed.
+- The replay and fork-compare helpers were verified against **fixture-shaped JSON** built from the
+  documented contracts (`{run_id, verified, expected_events, actual_events, first_divergence}` and the
+  `BranchDiff` serde shape in `rusty-core/src/replay.rs`): the replay/diff server endpoints had not
+  landed in this workspace and no server was reachable, so live verification against `server_demo` is
+  still outstanding and should happen once the server wave lands.
+- Live against `cargo run -p rusty-server --example server_demo`: real journaled runs of both demo
+  graphs (`pipeline`, `react_agent`) fetched through `GET /runs/{run_id}/events` and fed through the
+  extracted render helpers — correct super-step grouping (2 and 3 steps), node lanes, zero dangling
+  `parent` links, every marker and detail panel rendered, causal chains reaching a super-step start.
+  Unknown-run 404 confirmed to be the JSON error shape (drives the "run not found" toast path, distinct
+  from the route-missing fallback). `studio/serve.py` confirmed to serve the page and proxy the new
+  route unchanged.
 - `python3 -m py_compile studio/serve.py` — syntax OK.
 - All endpoint paths, payload fields, response shapes, SSE frame kinds, and status strings cross-checked
   against `rusty-server/src/routes.rs`, `src/runs.rs`, `src/sse.rs`, and `examples/server_demo.rs`;
   fork/replay and the CORS preflight are covered by server integration tests (`tests/time_travel.rs`,
-  `tests/cors.rs`).
-- No browser is available in this environment, so no live end-to-end test was run — the honest next step is
-  the Option-A demo flow above.
+  `tests/cors.rs`). The Flight Recorder wire shape matches `rusty-core/tests/golden/run_event.json`.
+- No browser is available in this environment, so DOM interaction was verified by unit-testing the
+  render functions under node (above) rather than by clicking through — the honest next step is the
+  Option-A demo flow.

@@ -15,6 +15,11 @@
 //! [`MAX_RETAINED_RUNS`] per process; the oldest terminal runs are evicted
 //! beyond that (active and queued runs are never evicted). Run history is
 //! in-memory by design — durability lives in the checkpoint log.
+//!
+//! Flight Recorder: every run is journaled. The journal is attached to the
+//! executor at run start, flushed to the server store at every checkpoint
+//! boundary (in [`forward_events`]) and once more at run completion, and
+//! served read-only by `GET /runs/{id}/events`.
 
 use std::collections::{HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
@@ -25,12 +30,14 @@ use futures::FutureExt;
 use rusty_agent_runtime::checkpoint::Checkpointer;
 use rusty_agent_runtime::error::RustyError;
 use rusty_agent_runtime::executor::{ExecutionOutcome, Executor, GraphEvent, RunConfig};
+use rusty_agent_runtime::journal::{Clock, Journal};
 use rusty_agent_runtime::state::State;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
 
 use crate::error::ApiError;
+use crate::server_store::ServerStore;
 use crate::GraphRegistry;
 
 // --------------------------------------------------------------------- //
@@ -514,6 +521,8 @@ pub(crate) struct RunDeps {
     pub registry: GraphRegistry,
     pub checkpointer: Arc<dyn Checkpointer>,
     pub manager: RunManager,
+    /// Flight Recorder journal persistence (`GET /runs/{id}/events`).
+    pub server_store: Arc<dyn ServerStore>,
     pub queue_cap: usize,
     pub log_capacity: usize,
 }
@@ -626,17 +635,29 @@ async fn execute(deps: RunDeps, run_id: String) {
         .stream_mode
         .clone()
         .unwrap_or_else(|| vec!["values".to_string(), "updates".to_string()]);
+    // Flight Recorder: one journal per run, keyed by the server-minted run
+    // id. Events carry the external (wire) thread id — the internal
+    // tenant-scoped id must never appear in served evidence. The journal's
+    // clock is the default system clock, so timestamps match pre-R0.5
+    // behavior; attaching it makes the executor read time through it.
+    let journal = Journal::new(run_id.clone(), snap.wire_thread_id.clone(), Clock::System);
     let (evt_tx, evt_rx) = mpsc::channel::<GraphEvent>(256);
     let forwarder = tokio::spawn(forward_events(
         evt_rx,
         sink.clone(),
-        Arc::clone(&deps.checkpointer),
-        snap.thread_id.clone(),
-        Arc::clone(&snap.checkpoint_ids),
-        modes,
+        ForwardDeps {
+            checkpointer: Arc::clone(&deps.checkpointer),
+            server_store: Arc::clone(&deps.server_store),
+            journal: journal.clone(),
+            thread_id: snap.thread_id.clone(),
+            checkpoint_ids: Arc::clone(&snap.checkpoint_ids),
+            modes,
+        },
     ));
 
-    let mut config = RunConfig::new(snap.thread_id.clone()).with_event_tx(evt_tx);
+    let mut config = RunConfig::new(snap.thread_id.clone())
+        .with_event_tx(evt_tx)
+        .with_journal(journal.clone());
     if let Some(command) = &snap.payload.command {
         if let Some(resume) = &command.resume {
             config = config.with_resume(resume.clone());
@@ -663,6 +684,13 @@ async fn execute(deps: RunDeps, run_id: String) {
     // `config` (holding the only sender) is dropped with the run; the
     // forwarder drains what remains and exits.
     let _ = forwarder.await;
+
+    // Final journal write: the complete evidence of the run, including the
+    // events recorded after the last checkpoint boundary. Persisted before
+    // the run goes terminal so `complete: true` on the events endpoint never
+    // races ahead of the snapshot it serves. Evidence of a failed run is
+    // still evidence — this write happens on every outcome.
+    persist_journal(&deps.server_store, &journal).await;
 
     let step = sink.current_step();
     let (status, terminal) = match result {
@@ -715,15 +743,32 @@ async fn execute(deps: RunDeps, run_id: String) {
     terminate(&deps, &run_id, status, terminal).await;
 }
 
-/// Map executor events to SSE frames per the design doc's §4 table.
-async fn forward_events(
-    mut rx: mpsc::Receiver<GraphEvent>,
-    sink: FrameSink,
+/// Everything [`forward_events`] needs beyond the frame sink, bundled to
+/// keep the task's argument list readable.
+struct ForwardDeps {
     checkpointer: Arc<dyn Checkpointer>,
+    server_store: Arc<dyn ServerStore>,
+    journal: Journal,
+    /// Internal (tenant-scoped) thread id, for checkpoint read-backs.
     thread_id: String,
     checkpoint_ids: Arc<StdMutex<Vec<String>>>,
     modes: Vec<String>,
-) {
+}
+
+/// Map executor events to SSE frames per the design doc's §4 table. Also the
+/// Flight Recorder's checkpoint-boundary persistence point: every
+/// `CheckpointSaved` event flushes the journal's current snapshot to the
+/// server store, so the stored evidence trails the live journal by at most
+/// one super-step.
+async fn forward_events(mut rx: mpsc::Receiver<GraphEvent>, sink: FrameSink, deps: ForwardDeps) {
+    let ForwardDeps {
+        checkpointer,
+        server_store,
+        journal,
+        thread_id,
+        checkpoint_ids,
+        modes,
+    } = deps;
     while let Some(event) = rx.recv().await {
         match event {
             GraphEvent::StateUpdate { step, updates } => {
@@ -743,6 +788,7 @@ async fn forward_events(
             } => {
                 lock_recover(&checkpoint_ids).push(checkpoint_id.clone());
                 sink.note_checkpoint(&checkpoint_id);
+                persist_journal(&server_store, &journal).await;
                 if modes.iter().any(|m| m == "values") {
                     match read_back_state(&*checkpointer, &thread_id, &checkpoint_id).await {
                         Ok(Some(values)) => sink.push("values", step, values),
@@ -760,6 +806,16 @@ async fn forward_events(
             | GraphEvent::NodeStart { .. }
             | GraphEvent::NodeEnd { .. } => {}
         }
+    }
+}
+
+/// Flush the journal's current snapshot to the server store. A persistence
+/// failure is logged, not raised: the run's execution must not fail because
+/// its evidence could not be written, and the next checkpoint boundary (or
+/// the completion write) retries.
+async fn persist_journal(server_store: &Arc<dyn ServerStore>, journal: &Journal) {
+    if let Err(error) = server_store.put_journal(&journal.snapshot()).await {
+        tracing::warn!(run_id = %journal.run_id(), %error, "journal persistence failed");
     }
 }
 
@@ -845,5 +901,6 @@ fn error_kind(error: &RustyError) -> &'static str {
         RustyError::Tool(_) => "tool_error",
         RustyError::Serialization(_) => "serialization_error",
         RustyError::InvalidUpdate(_) => "invalid_update",
+        RustyError::Replay(_) => "replay_error",
     }
 }

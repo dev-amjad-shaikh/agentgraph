@@ -129,7 +129,7 @@ curl localhost:8080/ok
 # {"ok":true}
 
 curl localhost:8080/info
-# {"service":"rusty-server","version":"0.4.0","checkpointer":"json_file",
+# {"service":"rusty-server","version":"0.5.0","checkpointer":"json_file",
 #  "store_path":"./data/checkpoints",
 #  "graphs":[{"channels":["approval","draft"],"name":"publisher"}]}
 ```
@@ -273,6 +273,66 @@ curl -s -X POST localhost:8080/threads/branch-a/runs/wait \
 ```
 
 The safe pattern is fork first, replay on the fork: the branch gets its own thread id and its own history, while replaying on the original thread appends new checkpoints on top of the old timeline (supported, but rarely what you want). Errors: `404` for an unknown thread or checkpoint id, `400` when the source thread has no checkpoints to copy, `409` when `new_thread_id` is already taken.
+
+## 9. Inspect the run's journal (Flight Recorder, 1 min)
+
+Every run is journaled: super-step boundaries, node inputs/outputs, interrupts, routing decisions, and checkpoint writes are recorded as `RunEvent`s — causally linked (`parent`), totally ordered (`seq`), with effect classifications. Fetch any run's evidence:
+
+```bash
+RUN_ID=<a run_id from any runs/wait response above>
+
+curl -s localhost:8080/runs/$RUN_ID/events | jq '{complete, first: .events[0], count: (.events | length)}'
+# {
+#   "complete": true,
+#   "first": {
+#     "id": "7c1e…:0",
+#     "run_id": "7c1e…",
+#     "thread_id": "3f2b9c4e-…",
+#     "node_id": null,
+#     "seq": 0,
+#     "kind": "super_step_start",
+#     "effect": "pure",
+#     ...
+#   },
+#   "count": 12
+# }
+```
+
+`complete: true` means the served snapshot is the run's final journal; while a run is active, the snapshot trails the live journal by at most one checkpoint boundary (it is flushed per checkpoint and at completion). The interrupted §5 run shows a `"kind": "interrupt"` event, and its §6 resume — a separate run with its own journal — starts with a `"kind": "resume"` event. Unknown runs answer `404`, exactly like `GET /runs/{id}`.
+
+To take the evidence with you — say, to re-drive this run in CI — download it as a portable replay fixture:
+
+```bash
+curl -s localhost:8080/runs/$RUN_ID/fixture -o fixture.json
+# journal + graph topology hash + final checkpoint; load in Rust with
+# rusty_agent_runtime::replay::ReplayFixture::import(&json)
+```
+
+## 10. Replay a run server-side & diff two branches (2 min)
+
+Downloading a fixture replays in CI; `POST /runs/replay` replays **in place**: the server re-drives the journaled run against the graph code registered in the process (zero outbound calls, over a throwaway checkpointer — your real checkpoint history is untouched) and verifies the replayed evidence against the recorded journal:
+
+```bash
+curl -s -X POST localhost:8080/runs/replay \
+  -H 'Content-Type: application/json' \
+  -d '{"run_id": "'$RUN_ID'"}'
+# {"run_id": "7c1e…", "verified": true, "expected_events": 12,
+#  "actual_events": 12, "first_divergence": null}
+```
+
+`verified: true` means the same graph code, given the same input, reproduced the recorded run's decisions and state transitions — compared on kinds, nodes, sequences, effect classes, statuses, and payloads, with per-run minted checkpoint ids and wall-clock measurements excluded. When it reports `false`, `first_divergence` is the journal `seq` where the replay parted ways with the evidence (change a node body, replay an old run, and watch it point at the first diverging event). Statuses worth knowing: `404` unknown run, `409` while the run is still executing or has no journal yet, `422` when the run's graph is not registered in this server process, when the journal holds recorded model/tool calls (those replay through the CI fixture — server-side replay cannot serve effects), or when the run resumed from a checkpoint.
+
+Forks are where this gets interesting. Diff the §8 branch against the original run:
+
+```bash
+curl -s "localhost:8080/runs/diff?base=$RUN_ID&branch=$FORK_RUN_ID" | jq \
+  '{first_divergent_seq, added: (.added | length), removed: (.removed | length),
+    step_diffs, base_totals, branch_totals}'
+```
+
+The response is core's `BranchDiff` shape as-is: events compare logically (identity and timing excluded), so the shared prefix of a fork reads as equal, `first_divergent_seq` marks where the branches parted, `added`/`removed` carry the events at and after that point, and `step_diffs` shows which state channels changed at which super-step. Diff a run against itself and `first_divergent_seq` comes back `null`. The Studio's compare/replay UI consumes both endpoints with exactly these shapes, and both SDKs wrap them (`replay_run(run_id)` / `diff_runs(base, branch)` in Python, `replayRun` / `diffRuns` in TypeScript).
+
+All four Flight Recorder endpoints stay reachable by run id even after the run's in-memory record is evicted or the server restarts — reads fall back to the persisted journal, so last week's run replays and diffs exactly like one from a minute ago.
 
 ---
 

@@ -43,7 +43,7 @@
 //!   node failure (with a `retryable` classification).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -54,7 +54,11 @@ use tracing::Instrument;
 use crate::checkpoint::{Checkpoint, Checkpointer};
 use crate::error::{Result, RustyError};
 use crate::graph::{Edge, Graph, Route};
+use crate::journal::{Clock, EventDraft, Journal, RngSource};
 use crate::node::{Command, NodeConfig, NodeContext, NodeOutput};
+use crate::record::{
+    CheckpointHeader, Effect, EventStatus, PolicyVersion, RunEventKind, CURRENT_FORMAT_VERSION,
+};
 use crate::state::{State, StateSpec};
 
 /// How a run ended.
@@ -152,6 +156,40 @@ pub struct RunConfig {
     /// super-step boundaries). Consumers implement LangGraph's stream modes
     /// (`values` / `updates` / `tasks` / ...) as filters over this stream.
     pub event_tx: Option<mpsc::Sender<GraphEvent>>,
+
+    /// Flight Recorder determinism seam (R0.5): the run's time source. Every
+    /// executor timestamp — event `recorded_at`, node latencies, checkpoint
+    /// `created_at` — is read through it. `None` (the default) is the system
+    /// wall clock, byte-identical to pre-R0.5 behavior. Attach
+    /// [`Clock::Logical`] to make a recorded run re-drivable.
+    pub clock: Option<Clock>,
+
+    /// Flight Recorder determinism seam (R0.5): the run's randomness source.
+    /// Checkpoint ids (and the run id, when the executor creates the
+    /// journal) are minted through it. `None` (the default) is OS entropy,
+    /// byte-identical to pre-R0.5 behavior; [`RngSource::Seeded`] makes the
+    /// id stream reproducible.
+    pub rng: Option<RngSource>,
+
+    /// Flight Recorder (R0.5): attach a pre-built journal for this run. Node
+    /// closures capture a clone of the same [`Journal`] to record their own
+    /// model/tool/remote/WASM calls into the run's evidence (the journal
+    /// stamps sequence numbers and timestamps itself). When `None`, the
+    /// executor creates a fresh journal per run; either way the run's
+    /// journal is retrievable afterwards via [`Executor::journal`].
+    pub journal: Option<Journal>,
+
+    /// Flight Recorder (R0.5): the executor policy active for this run,
+    /// stamped into every checkpoint header. `None` records the static
+    /// default ([`PolicyVersion::STATIC_V0`]) — the correct value for any
+    /// run before the policy plane lands (R0.8+).
+    pub policy_version: Option<PolicyVersion>,
+
+    /// Flight Recorder (R0.5): the application's own graph version string,
+    /// stamped into every checkpoint header next to the topology hash.
+    /// `None` records `"unversioned"`. Bump it when node bodies change in
+    /// ways the topology hash cannot see.
+    pub graph_version: Option<String>,
 }
 
 impl Default for RunConfig {
@@ -173,6 +211,11 @@ impl RunConfig {
             resume: None,
             checkpoint_id: None,
             event_tx: None,
+            clock: None,
+            rng: None,
+            journal: None,
+            policy_version: None,
+            graph_version: None,
         }
     }
 
@@ -199,6 +242,43 @@ impl RunConfig {
     /// Builder-style: attach a streaming event sink.
     pub fn with_event_tx(mut self, tx: mpsc::Sender<GraphEvent>) -> Self {
         self.event_tx = Some(tx);
+        self
+    }
+
+    /// Builder-style: source the run's time from `clock` (Flight Recorder
+    /// determinism seam; see the [`RunConfig::clock`] field docs).
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
+    /// Builder-style: source the run's randomness from `rng` (Flight
+    /// Recorder determinism seam; see the [`RunConfig::rng`] field docs).
+    pub fn with_rng(mut self, rng: RngSource) -> Self {
+        self.rng = Some(rng);
+        self
+    }
+
+    /// Builder-style: record the run into `journal` (Flight Recorder; see
+    /// the [`RunConfig::journal`] field docs). When the config carries no
+    /// explicit [`RunConfig::clock`], the executor also reads time from the
+    /// attached journal's clock, keeping one time source per run.
+    pub fn with_journal(mut self, journal: Journal) -> Self {
+        self.journal = Some(journal);
+        self
+    }
+
+    /// Builder-style: stamp the active executor policy version into every
+    /// checkpoint header (see the [`RunConfig::policy_version`] field docs).
+    pub fn with_policy_version(mut self, version: PolicyVersion) -> Self {
+        self.policy_version = Some(version);
+        self
+    }
+
+    /// Builder-style: stamp the application's graph version into every
+    /// checkpoint header (see the [`RunConfig::graph_version`] field docs).
+    pub fn with_graph_version(mut self, version: impl Into<String>) -> Self {
+        self.graph_version = Some(version.into());
         self
     }
 
@@ -286,6 +366,9 @@ pub enum GraphEvent {
 pub struct Executor {
     checkpointer: Option<Arc<dyn Checkpointer>>,
     token_tx: Option<mpsc::Sender<GraphEvent>>,
+    // The most recent run's Flight Recorder journal. Interior mutability
+    // keeps `run` taking `&self`; overwritten at the start of every run.
+    journal: Mutex<Option<Journal>>,
 }
 
 impl Executor {
@@ -301,6 +384,7 @@ impl Executor {
         Self {
             checkpointer: Some(checkpointer),
             token_tx: None,
+            journal: Mutex::new(None),
         }
     }
 
@@ -331,6 +415,24 @@ impl Executor {
     /// `Executor` can drive many concurrent runs over the same store.
     pub fn checkpointer(&self) -> Option<&Arc<dyn Checkpointer>> {
         self.checkpointer.as_ref()
+    }
+
+    /// The Flight Recorder journal of the most recent run started through
+    /// this executor — the one attached via [`RunConfig::with_journal`], or
+    /// the fresh journal the executor created for the run. `None` before the
+    /// first run.
+    ///
+    /// The journal is set at run start, so the evidence of a failed or
+    /// suspended run is retrievable exactly like a completed run's. Note the
+    /// executor is deliberately stateless across runs: driving several runs
+    /// concurrently through one `Executor` leaves this handle pointing at
+    /// whichever run started last — attach per-run journals via the config
+    /// when runs overlap.
+    pub fn journal(&self) -> Option<Journal> {
+        self.journal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Run a compiled graph to completion (or interruption).
@@ -397,6 +499,42 @@ impl Executor {
     ) -> Result<ExecutionOutcome> {
         let started = std::time::Instant::now();
 
+        // ---- flight recorder setup ----
+        //
+        // Resolve the determinism seams and the run's journal before any
+        // checkpoint work: every timestamp and id below flows through them.
+        // An attached journal carries its own identity and clock; otherwise
+        // the executor mints a run id from the (possibly seeded) RNG and a
+        // journal over the configured clock. The run reads time from the
+        // journal's clock when no explicit clock is configured, keeping one
+        // time source per run.
+        let rng = config.rng.clone().unwrap_or_default();
+        let journal = match &config.journal {
+            Some(attached) => attached.clone(),
+            None => Journal::new(
+                rng.uuid_string(),
+                config.thread_id.clone(),
+                config.clock.clone().unwrap_or_default(),
+            ),
+        };
+        let recorder = Recorder {
+            clock: config
+                .clock
+                .clone()
+                .unwrap_or_else(|| journal.clock().clone()),
+            rng,
+            graph_version: config
+                .graph_version
+                .clone()
+                .unwrap_or_else(|| "unversioned".to_owned()),
+            graph_hash: graph.topology_hash(),
+            policy_version: config.policy_version.clone().unwrap_or_default(),
+            journal: journal.clone(),
+        };
+        // Publish before the loop: evidence of a failed or suspended run is
+        // retrievable exactly like a completed run's.
+        *self.journal.lock().unwrap_or_else(|e| e.into_inner()) = Some(journal);
+
         // ---- initialization / resume ----
         //
         // On resume the checkpointed state and next-node set take precedence
@@ -414,6 +552,9 @@ impl Executor {
         let mut active: Vec<ActiveTask>;
         let mut step: usize = 0;
         let mut pending_resume: Option<Value> = None;
+        // Causal parent for the first super-step: the resume event on a
+        // resumed run, nothing on a fresh one.
+        let mut step_parent: Option<String> = None;
 
         if config.checkpoint_id.is_some() || config.resume.is_some() {
             let checkpointer = self.checkpointer.as_ref().ok_or_else(|| {
@@ -443,6 +584,13 @@ impl Executor {
                         ))
                     })?,
             };
+            step_parent = Some(recorder.record(
+                EventDraft::new(RunEventKind::Resume, Effect::Pure).input(serde_json::json!({
+                    "checkpoint_id": checkpoint.id,
+                    "step": checkpoint.step,
+                    "resume": config.resume.clone().unwrap_or(Value::Null),
+                })),
+            ));
             state = checkpoint.state;
             step = checkpoint.step;
             active = checkpoint
@@ -488,19 +636,22 @@ impl Executor {
                     graph,
                     spec,
                     &config,
+                    &recorder,
                     &mut state,
                     &active,
                     step,
                     &mut pending_resume,
+                    step_parent.clone(),
                 )
                 .instrument(step_span)
                 .await?;
 
             match transition {
-                StepTransition::Next(next) => {
+                StepTransition::Next(next, route_event) => {
                     active = next;
                     step += 1;
                     steps_run += 1;
+                    step_parent = Some(route_event);
                 }
                 StepTransition::Finish(outcome) => {
                     if !outcome.is_interrupted() {
@@ -520,33 +671,57 @@ impl Executor {
     /// -> boundary checkpoint. Returns the next active set, or
     /// [`StepTransition::Finish`] with the terminal outcome when the run ends
     /// (`Done`) or suspends (`Interrupted`).
+    ///
+    /// Flight Recorder: every phase transition is journaled through
+    /// `recorder` — super-step start/end, one node input/output pair per
+    /// invocation (in deterministic active-set order, not finish order), the
+    /// routing decision, and the checkpoint write. Node events carry the
+    /// node's declared [`Effect`] classification.
     #[allow(clippy::too_many_arguments)]
     async fn execute_super_step(
         &self,
         graph: &Graph,
         spec: &StateSpec,
         config: &RunConfig,
+        recorder: &Recorder,
         state: &mut State,
         active: &[ActiveTask],
         step: usize,
         pending_resume: &mut Option<Value>,
+        step_parent: Option<String>,
     ) -> Result<StepTransition> {
         // -- plan.
+        let active_names: Vec<String> = active.iter().map(|t| t.name.clone()).collect();
         Self::emit(
             config,
             GraphEvent::SuperStep {
                 step,
-                active_nodes: active.iter().map(|t| t.name.clone()).collect(),
+                active_nodes: active_names.clone(),
             },
         );
+        let mut plan_draft =
+            EventDraft::new(RunEventKind::SuperStepStart, Effect::Pure).input(serde_json::json!({
+                "step": step,
+                "active_nodes": active_names,
+            }));
+        if let Some(parent) = step_parent {
+            plan_draft = plan_draft.parent(parent);
+        }
+        let step_start_event = recorder.record(plan_draft);
 
         // -- compute. Scoped (Send) state is overlaid onto each invocation's
         //    private copy of the start-of-step snapshot, so fan-out items
         //    never collide in the shared state.
         let snapshot = state.clone();
-        let mut join_set: JoinSet<(String, Result<NodeOutput>)> = JoinSet::new();
+        let mut join_set: JoinSet<(usize, String, Result<NodeOutput>, u64)> = JoinSet::new();
+        // Per-invocation journal metadata, aligned with `active`: the input
+        // event id (causal parent of the matching output) and the node's
+        // declared effect class. Fan-out invocations of the same node each
+        // get their own entry — index, not name, is the identity.
+        let mut input_events: Vec<String> = Vec::with_capacity(active.len());
+        let mut invocation_effects: Vec<Effect> = Vec::with_capacity(active.len());
 
-        for task in active {
+        for (index, task) in active.iter().enumerate() {
             let node = graph.node(&task.name).ok_or_else(|| {
                 RustyError::Graph(format!("routing activated unknown node `{}`", task.name))
             })?;
@@ -569,15 +744,30 @@ impl Executor {
                 }
             }
 
+            let input_event = recorder.record(
+                EventDraft::new(RunEventKind::NodeInput, node.effect())
+                    .node(task.name.clone())
+                    .input(node_state.to_value())
+                    .parent(step_start_event.clone()),
+            );
+            invocation_effects.push(node.effect());
+
             let ctx = NodeContext::new(
                 node_state,
                 NodeConfig {
                     thread_id: config.thread_id.clone(),
                     step,
                     resume: pending_resume.clone(),
-                    extra: HashMap::new(),
+                    // Hand the invocation its own journal event id so node
+                    // code can parent the effects it records (model/tool
+                    // calls) to this invocation.
+                    extra: HashMap::from([(
+                        crate::journal::PARENT_EVENT_KEY.to_owned(),
+                        Value::String(input_event.clone()),
+                    )]),
                 },
             );
+            input_events.push(input_event);
             let name = task.name.clone();
             Self::emit(
                 config,
@@ -590,7 +780,19 @@ impl Executor {
             // context, so the per-node span is attached to each spawned
             // future explicitly via `.instrument()`.
             let node_span = tracing::info_span!("rusty.node", node = %name, step = step);
-            join_set.spawn(async move { (name, node.run(ctx).await) }.instrument(node_span));
+            // Latency is read through the run's clock seam — under a logical
+            // clock the value is reproducible; under the system clock it is
+            // the real elapsed time.
+            let clock = recorder.clock.clone();
+            join_set.spawn(
+                async move {
+                    let node_started = clock.now();
+                    let result = node.run(ctx).await;
+                    let latency_ms = (clock.now() - node_started).num_milliseconds().max(0) as u64;
+                    (index, name, result, latency_ms)
+                }
+                .instrument(node_span),
+            );
         }
         // The resume value is consumed by the first super-step after a resume.
         *pending_resume = None;
@@ -601,10 +803,13 @@ impl Executor {
         let mut writes: Vec<(String, HashMap<String, Value>)> = Vec::new();
         let mut commands: Vec<Command> = Vec::new();
         let mut ran_nodes: Vec<String> = Vec::new();
-        let mut interrupted: Option<(String, Value)> = None;
+        let mut interrupted: Option<(usize, String, Value)> = None;
+        // Journal payloads of finished invocations, in finish order here;
+        // journaled in active-set order after the barrier.
+        let mut completed: Vec<(usize, String, u64, Value)> = Vec::new();
 
         while let Some(joined) = join_set.join_next().await {
-            let (name, result) = joined.map_err(|e| {
+            let (index, name, result, latency_ms) = joined.map_err(|e| {
                 RustyError::Node(format!(
                     "node task failed to join (panic or cancellation): {e}"
                 ))
@@ -618,6 +823,15 @@ impl Executor {
                             step,
                         },
                     );
+                    completed.push((
+                        index,
+                        name.clone(),
+                        latency_ms,
+                        serde_json::json!({
+                            "updates": &output.updates,
+                            "command": &output.command,
+                        }),
+                    ));
                     if let Some(command) = output.command {
                         if !command.goto.is_empty() {
                             commands.push(command);
@@ -629,10 +843,20 @@ impl Executor {
                 Err(RustyError::Interrupt { value }) => {
                     // Record the suspension and stop the barrier loop; the
                     // JoinSet is dropped below to abort stragglers.
-                    interrupted = Some((name, value));
+                    interrupted = Some((index, name, value));
                     break;
                 }
                 Err(e) => {
+                    // A failed node is still evidence: journal the failure
+                    // before the error unwinds the run.
+                    recorder.record(
+                        EventDraft::new(RunEventKind::NodeOutput, invocation_effects[index])
+                            .node(name.clone())
+                            .status(EventStatus::Error)
+                            .output(serde_json::json!({ "error": e.to_string() }))
+                            .latency_ms(latency_ms)
+                            .parent(input_events[index].clone()),
+                    );
                     // LLM and tool failures are the transient, retryable
                     // error classes; everything else is a hard failure.
                     let retryable = matches!(e, RustyError::Llm(_) | RustyError::Tool(_));
@@ -650,7 +874,7 @@ impl Executor {
             }
         }
 
-        if let Some((name, value)) = interrupted {
+        if let Some((index, name, value)) = interrupted {
             // Suspend the run. The step is transactional, so no write of
             // this step survived — not even from siblings that completed
             // before the interrupt reached the barrier. The suspension
@@ -660,6 +884,13 @@ impl Executor {
             // siblings would never re-run. Dropping the JoinSet first aborts
             // stragglers, preserving the transactional suspension point.
             drop(join_set);
+            let interrupt_event = recorder.record(
+                EventDraft::new(RunEventKind::Interrupt, invocation_effects[index])
+                    .node(name.clone())
+                    .input(value.clone())
+                    .status(EventStatus::Interrupted)
+                    .parent(input_events[index].clone()),
+            );
             tracing::info!(
                 node = %name,
                 step = step,
@@ -667,10 +898,19 @@ impl Executor {
             );
             let pending: Vec<String> = active.iter().map(|t| t.name.clone()).collect();
             let checkpoint =
-                Checkpoint::new(config.thread_id.clone(), step, state.clone(), pending);
+                recorder.mint_checkpoint(config.thread_id.clone(), step, state.clone(), pending);
             let checkpoint_id = checkpoint.id.clone();
             if let Some(checkpointer) = &self.checkpointer {
                 checkpointer.put(checkpoint).await?;
+                recorder.record(
+                    EventDraft::new(RunEventKind::CheckpointWritten, Effect::Idempotent)
+                        .output(serde_json::json!({
+                            "checkpoint_id": checkpoint_id,
+                            "step": step,
+                            "suspension": true,
+                        }))
+                        .parent(interrupt_event),
+                );
                 Self::emit(
                     config,
                     GraphEvent::CheckpointSaved {
@@ -684,6 +924,23 @@ impl Executor {
                 state: state.clone(),
                 checkpoint_id,
             }));
+        }
+
+        // Journal node outputs in active-set order, not JoinSet finish
+        // order: the finish order is scheduling-dependent, and the journal's
+        // sequence is evidence — replay compares it.
+        completed.sort_by_key(|(index, ..)| *index);
+        let mut last_output_event: Option<String> = None;
+        for (index, name, latency_ms, output_json) in completed {
+            last_output_event = Some(
+                recorder.record(
+                    EventDraft::new(RunEventKind::NodeOutput, invocation_effects[index])
+                        .node(name)
+                        .output(output_json)
+                        .latency_ms(latency_ms)
+                        .parent(input_events[index].clone()),
+                ),
+            );
         }
 
         // -- merge: reducers + LastValue single-write validation. On
@@ -709,6 +966,13 @@ impl Executor {
             step = step,
             channels = ?channels_written,
             "merged node updates at super-step barrier"
+        );
+        // The super-step's reducer result is journaled even when empty —
+        // "no channel changed" is evidence too.
+        let step_end_event = recorder.record(
+            EventDraft::new(RunEventKind::SuperStepEnd, Effect::Pure)
+                .output(Value::Object(merged_updates.clone()))
+                .parent(last_output_event.unwrap_or_else(|| step_start_event.clone())),
         );
         if !merged_updates.is_empty() {
             Self::emit(
@@ -802,13 +1066,40 @@ impl Executor {
             }
         }
 
+        let route_event = recorder.record(
+            EventDraft::new(RunEventKind::RoutingDecision, Effect::Pure)
+                .output(serde_json::json!({
+                    "next": next
+                        .iter()
+                        .map(|t| serde_json::json!({
+                            "node": &t.name,
+                            "scoped": &t.scoped,
+                        }))
+                        .collect::<Vec<_>>(),
+                    "goto": commands
+                        .iter()
+                        .flat_map(|command| command.goto.iter().cloned())
+                        .collect::<Vec<String>>(),
+                }))
+                .parent(step_end_event.clone()),
+        );
+
         // -- checkpoint at the super-step boundary.
         if let Some(checkpointer) = &self.checkpointer {
             let next_names: Vec<String> = next.iter().map(|t| t.name.clone()).collect();
             let checkpoint =
-                Checkpoint::new(config.thread_id.clone(), step, state.clone(), next_names);
+                recorder.mint_checkpoint(config.thread_id.clone(), step, state.clone(), next_names);
             let checkpoint_id = checkpoint.id.clone();
             checkpointer.put(checkpoint).await?;
+            recorder.record(
+                EventDraft::new(RunEventKind::CheckpointWritten, Effect::Idempotent)
+                    .output(serde_json::json!({
+                        "checkpoint_id": checkpoint_id,
+                        "step": step,
+                        "suspension": false,
+                    }))
+                    .parent(route_event.clone()),
+            );
             Self::emit(
                 config,
                 GraphEvent::CheckpointSaved {
@@ -824,13 +1115,63 @@ impl Executor {
                 state.clone(),
             )));
         }
-        Ok(StepTransition::Next(next))
+        Ok(StepTransition::Next(next, route_event))
     }
 
     /// Best-effort event emission: a full or closed channel never aborts a run.
     fn emit(config: &RunConfig, event: GraphEvent) {
         if let Some(tx) = &config.event_tx {
             let _ = tx.try_send(event);
+        }
+    }
+}
+
+/// Per-run Flight Recorder state handed to every super-step: the journal,
+/// the determinism seams, and the frozen provenance stamped into every
+/// checkpoint of the run.
+struct Recorder {
+    journal: Journal,
+    clock: Clock,
+    rng: RngSource,
+    graph_version: String,
+    graph_hash: String,
+    policy_version: PolicyVersion,
+}
+
+impl Recorder {
+    /// Append one event to the run's journal; returns the event id (the
+    /// causal-parent handle for whatever the event causes).
+    fn record(&self, draft: EventDraft) -> String {
+        self.journal.record(draft)
+    }
+
+    /// Mint a boundary checkpoint through the determinism seams: id from the
+    /// run's RNG, timestamp from the run's clock, the frozen provenance
+    /// header, and a journal reference pinning the evidence head as it stood
+    /// *before* this checkpoint's own `checkpoint_written` event is
+    /// recorded.
+    fn mint_checkpoint(
+        &self,
+        thread_id: String,
+        step: usize,
+        state: State,
+        next_nodes: Vec<String>,
+    ) -> Checkpoint {
+        Checkpoint {
+            id: self.rng.uuid_string(),
+            thread_id,
+            step,
+            state,
+            next_nodes,
+            created_at: self.clock.now(),
+            header: CheckpointHeader {
+                format_version: CURRENT_FORMAT_VERSION,
+                graph_version: self.graph_version.clone(),
+                graph_hash: self.graph_hash.clone(),
+                policy_version: self.policy_version.clone(),
+                logical_clock: self.clock.now_ms(),
+            },
+            journal_ref: Some(self.journal.head_ref()),
         }
     }
 }
@@ -846,7 +1187,9 @@ struct ActiveTask {
 /// The control-flow result of a single super-step: either the next active
 /// set (the loop continues) or the terminal run outcome (the loop breaks).
 enum StepTransition {
-    Next(Vec<ActiveTask>),
+    /// The next active set plus the routing-decision journal event that
+    /// produced it (the causal parent of the next super-step's start event).
+    Next(Vec<ActiveTask>, String),
     Finish(ExecutionOutcome),
 }
 

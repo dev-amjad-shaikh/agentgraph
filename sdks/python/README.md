@@ -110,6 +110,10 @@ With auth configured on the server (`ServerConfig::with_api_key`), pass `RustyCl
 | `run_wait(thread_id, …same opts…, timeout=None)` | `POST /threads/{id}/runs/wait` | terminal dict `{status, output‖interrupt, …}` |
 | `run_stream(thread_id, …same opts…, stream_mode=None, last_event_id=None, timeout=None)` | `POST /threads/{id}/runs/stream` | **generator** of `SSEEvent(event, data, id)` |
 | `run_status(run_id)` | `GET /runs/{id}` | `{run_id, status, …}` (+ `output`/`error` when terminal) |
+| `run_events(run_id)` | `GET /runs/{id}/events` | `{run_id, events, complete}` (Flight Recorder journal) |
+| `get_fixture(run_id)` | `GET /runs/{id}/fixture` | portable `ReplayFixture` bundle for CI replay |
+| `replay_run(run_id)` | `POST /runs/replay` | `{run_id, verified, expected_events, actual_events, first_divergence}` |
+| `diff_runs(base, branch)` | `GET /runs/diff?base=…&branch=…` | `BranchDiff` (`first_divergent_seq`, `added`, `removed`, `step_diffs`, totals) |
 | `delete_run(thread_id, run_id)` | `DELETE /threads/{id}/runs/{run_id}` | rollback a finished run |
 | `create_assistant(name, graph, config=None, metadata=None, assistant_id=None)` | `POST /assistants` | assistant record |
 | `list_assistants()` / `get_assistant(assistant_id)` | `GET /assistants[/{id}]` | assistant(s) |

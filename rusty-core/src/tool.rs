@@ -33,6 +33,19 @@ pub trait Tool: Send + Sync {
     /// JSON Schema for the tool's arguments.
     fn parameters_schema(&self) -> Value;
 
+    /// The declared effect classification of calling this tool (Flight
+    /// Recorder, R0.5): recorded on tool-call journal events and used by
+    /// retry/replay policy.
+    ///
+    /// The default is [`crate::record::Effect::NonIdempotent`] — the runtime
+    /// cannot prove a tool call is safely repeatable, so it assumes the
+    /// restrictive class. Override to `ReadOnly` for pure lookups or
+    /// `Idempotent` for keyed writes; never declare a weaker class than the
+    /// tool's real behavior.
+    fn effect(&self) -> crate::record::Effect {
+        crate::record::Effect::NonIdempotent
+    }
+
     /// Execute the tool with model-supplied arguments.
     async fn call(&self, args: Value) -> Result<Value>;
 }

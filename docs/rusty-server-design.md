@@ -375,7 +375,11 @@ checkpointer behind the `postgres` feature, token streaming via `ChatModel::chat
 | `POST /threads/{id}/runs/wait` | ✅ implemented (terminal JSON: success / interrupted / error) |
 | `POST /threads/{id}/runs/stream` | ✅ implemented (SSE: `metadata`/`updates`/`values`/`messages`/`error`/`end`; frame ids `{checkpoint_id}:{step}:{seq}`; `Last-Event-ID` dedup over a per-run in-memory event log) |
 | `DELETE /threads/{id}/runs/{run_id}` | ✅ implemented (rollback: delete a finished run's checkpoints; `409` while active) |
-| `GET /runs/{run_id}` (run polling) | ❌ not in Phase A — Phase C roadmap |
+| `GET /runs/{run_id}` (run polling) | ✅ implemented (v0.2; terminal runs carry `output` / `error` / `interrupt`) |
+| `GET /runs/{run_id}/events` | ✅ implemented (R0.5 Flight Recorder: the run's journaled `RunEvent`s as `{run_id, events, complete}`; snapshot persisted per checkpoint boundary and at run completion under `{store_path}/journals/` or the `server_journals` table; head hash re-verified on read; 404 + tenant isolation identical to `GET /runs/{id}`; store-level fallback keeps journals fetchable by run id after run eviction / process restart) |
+| `GET /runs/{run_id}/fixture` | ✅ implemented (R0.5: portable `ReplayFixture` bundle — integrity-verified journal + graph topology hash + final checkpoint; `409` before the first persisted snapshot) |
+| `POST /runs/replay` | ✅ implemented (R0.5: server-side exact replay of a journaled run against its registered graph, zero outbound, over a throwaway in-memory checkpointer → `{run_id, verified, expected_events, actual_events, first_divergence}`; `404` unknown/cross-tenant, `409` no persisted journal or still executing, `422` graph not registered in this process / journal carries recorded effect calls / resumed-run journal) |
+| `GET /runs/diff?base=&branch=` | ✅ implemented (R0.5: structural diff of two runs' journals, core's `BranchDiff` serde shape as-is — `first_divergent_seq`, `added`/`removed`, per-step channel diffs, token/cost totals; `404` unknown/cross-tenant either side, `409` no persisted journal) |
 | `GET`/`DELETE /threads…` (list/delete threads), `GET /graphs`, `GET /metrics` | ❌ not in Phase A — roadmap |
 
 Deviations from the design draft as implemented: config is code-only
@@ -390,3 +394,36 @@ builder. `multitask_strategy` is implemented as `enqueue` (default) / `reject`; 
 in-memory in v0.1 (checkpoints are durable on disk). SSE resume replays the per-run
 in-memory event log; durable cross-restart stream reconstruction from the checkpoint
 log remains roadmap.
+
+**R0.5 addendum (2026-08-07).** rusty-server v0.5.0 adds the Flight Recorder
+surface: every run is journaled by the executor (core R0.5 kernel), the server
+persists the journal's `JournalSnapshot` at every checkpoint boundary and at run
+completion (one JSON file per run under `{store_path}/journals/`, or the
+auto-migrated `server_journals` table with the `postgres` feature), and
+`GET /runs/{run_id}/events` serves the events in the golden-pinned `RunEvent`
+wire shape with a `complete` flag marking the final snapshot.
+`GET /runs/{run_id}/fixture` downloads the run as a portable `ReplayFixture`
+(journal + graph topology hash + final checkpoint) for CI replay via
+`ReplayFixture::import`.
+
+Two more endpoints complete the server-side replay story. `POST /runs/replay`
+(body `{"run_id": "…"}`) re-drives the journaled run against the graph code
+registered in this process — zero outbound by construction (journals carrying
+recorded model/tool/remote/WASM calls are refused with `422`; that is the
+CI-fixture path), over a throwaway in-memory checkpointer so the shared
+checkpoint log is never touched — and answers exactly `{run_id, verified,
+expected_events, actual_events, first_divergence}`. `verified` compares the
+replayed journal against the recorded one on the evidence axes (kinds, nodes,
+sequences, effect classes, statuses, resolved payloads), excluding per-run
+minted checkpoint ids and wall-clock measurements — server runs record under
+the system clock and OS entropy, so byte-identity remains the CI-fixture
+story. `GET /runs/diff?base=<run_id>&branch=<run_id>` returns core's
+`BranchDiff` serde shape as-is. Both endpoints answer `404` for unknown or
+cross-tenant runs and `409` when no journal is persisted yet; replay adds
+`422` for an unregistered graph or unreplayable (resumed-run) evidence. The
+Studio's compare/replay UI consumes both endpoints with exactly these
+response shapes. All four Flight Recorder endpoints resolve runs through the
+live run manager first and fall back to the persisted journal, so evidence
+stays reachable by run id after the run's in-memory record is evicted or the
+process restarts (tenant isolation in the fallback goes through the journal's
+thread id resolved under the caller's tenant scope).

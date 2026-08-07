@@ -407,6 +407,155 @@ class TestPlatformSurface(LiveServerTestCase):
         self.assertEqual(keyed.info()["service"], "rusty-server")
 
 
+class TestFlightRecorder(LiveServerTestCase):
+    """Flight Recorder: `RustyClient.run_events` against journaled demo runs."""
+
+    def test_50_run_events_pipeline(self) -> None:
+        tid = self.new_thread()
+        terminal = self.client.run_wait(tid)
+        self.assertEqual(terminal["status"], "success")
+        run_id = terminal["run_id"]
+
+        body = self.client.run_events(run_id)
+        self.assertEqual(body["run_id"], run_id)
+        self.assertIs(body["complete"], True)
+        events = body["events"]
+        self.assertTrue(events, "a journaled run must have events")
+
+        # Total order + deterministic ids: seq is 0..n, id is {run_id}:{seq}.
+        for seq, event in enumerate(events):
+            for field in (
+                "id", "run_id", "thread_id", "node_id", "seq", "kind",
+                "effect", "input", "output", "latency_ms", "tokens",
+                "cost_usd", "status", "parent", "recorded_at",
+            ):
+                self.assertIn(field, event)
+            self.assertEqual(event["seq"], seq)
+            self.assertEqual(event["id"], f"{run_id}:{seq}")
+            self.assertEqual(event["run_id"], run_id)
+            self.assertEqual(event["thread_id"], tid)
+
+        # The executor journaled the full lifecycle.
+        kinds = [e["kind"] for e in events]
+        for expected in (
+            "super_step_start", "super_step_end", "node_input",
+            "node_output", "routing_decision", "checkpoint_written",
+        ):
+            self.assertIn(expected, kinds)
+        self.assertEqual(kinds[0], "super_step_start")
+
+        # Payload refs are adjacently tagged; demo pipeline nodes are pure.
+        node_input = next(e for e in events if e["kind"] == "node_input")
+        self.assertEqual(node_input["input"]["kind"], "inline")
+        self.assertEqual(node_input["effect"], "pure")
+
+    def test_51_run_events_react_agent(self) -> None:
+        tid = self.new_thread("react_agent")
+        terminal = self.client.run_wait(
+            tid, input={"messages": [{"role": "user", "content": "say pong"}]}
+        )
+        self.assertEqual(terminal["status"], "success")
+        body = self.client.run_events(terminal["run_id"])
+        self.assertIs(body["complete"], True)
+        kinds = [e["kind"] for e in body["events"]]
+        self.assertIn("checkpoint_written", kinds)
+
+    def test_52_run_events_unknown_run_404(self) -> None:
+        with self.assertRaises(RustyError) as ctx:
+            self.client.run_events(str(uuid.uuid4()))
+        self.assertEqual(ctx.exception.status, 404)
+
+
+class TestReplayAndDiff(LiveServerTestCase):
+    """Server-side replay + branch diff: `replay_run`, `diff_runs`,
+    `get_fixture` against journaled demo runs."""
+
+    def test_60_replay_pipeline_run_verifies(self) -> None:
+        tid = self.new_thread()
+        terminal = self.client.run_wait(tid)
+        self.assertEqual(terminal["status"], "success")
+        run_id = terminal["run_id"]
+        event_count = len(self.client.run_events(run_id)["events"])
+
+        report = self.client.replay_run(run_id)
+        self.assertEqual(
+            sorted(report.keys()),
+            [
+                "actual_events",
+                "expected_events",
+                "first_divergence",
+                "run_id",
+                "verified",
+            ],
+        )
+        self.assertEqual(report["run_id"], run_id)
+        self.assertIs(report["verified"], True)
+        self.assertEqual(report["expected_events"], event_count)
+        self.assertEqual(report["actual_events"], event_count)
+        self.assertIsNone(report["first_divergence"])
+
+    def test_61_replay_unknown_run_404(self) -> None:
+        with self.assertRaises(RustyError) as ctx:
+            self.client.replay_run(str(uuid.uuid4()))
+        self.assertEqual(ctx.exception.status, 404)
+
+    def test_62_diff_of_a_run_and_its_fork_diverges(self) -> None:
+        tid = self.new_thread()
+        base_run = self.client.run_wait(tid, input={"seed": 1})["run_id"]
+
+        fork = self.client.fork(tid)
+        branch_run = self.client.run_wait(
+            fork["thread_id"], input={"seed": 2}
+        )["run_id"]
+
+        diff = self.client.diff_runs(base_run, branch_run)
+        for field in (
+            "first_divergent_seq", "added", "removed",
+            "step_diffs", "base_totals", "branch_totals",
+        ):
+            self.assertIn(field, diff)
+        self.assertIsNotNone(
+            diff["first_divergent_seq"],
+            f"forks with different inputs must diverge: {diff}",
+        )
+        self.assertTrue(diff["added"])
+        self.assertTrue(diff["removed"])
+        self.assertEqual(
+            diff["base_totals"]["events"], diff["branch_totals"]["events"]
+        )
+
+        # A run diffed against itself is logically identical.
+        same = self.client.diff_runs(base_run, base_run)
+        self.assertIsNone(same["first_divergent_seq"])
+        self.assertEqual(same["added"], [])
+        self.assertEqual(same["removed"], [])
+
+    def test_63_diff_unknown_run_404(self) -> None:
+        tid = self.new_thread()
+        run_id = self.client.run_wait(tid)["run_id"]
+        with self.assertRaises(RustyError) as ctx:
+            self.client.diff_runs(run_id, str(uuid.uuid4()))
+        self.assertEqual(ctx.exception.status, 404)
+
+    def test_64_get_fixture_downloads_a_replay_bundle(self) -> None:
+        tid = self.new_thread()
+        terminal = self.client.run_wait(tid)
+        run_id = terminal["run_id"]
+
+        fixture = self.client.get_fixture(run_id)
+        self.assertEqual(fixture["format_version"], 1)
+        self.assertTrue(fixture["graph_hash"])
+        self.assertEqual(fixture["journal"]["run_id"], run_id)
+        self.assertEqual(fixture["journal"]["thread_id"], tid)
+        self.assertTrue(fixture["journal"]["events"])
+        # The demo run wrote checkpoints, so the bundle carries the final one.
+        self.assertEqual(fixture["final_checkpoint"]["thread_id"], tid)
+
+        with self.assertRaises(RustyError) as ctx:
+            self.client.get_fixture(str(uuid.uuid4()))
+        self.assertEqual(ctx.exception.status, 404)
+
+
 class TestInterruptResume(unittest.TestCase):
     @unittest.skip(
         "server_demo registers no interrupting graph (pipeline and "

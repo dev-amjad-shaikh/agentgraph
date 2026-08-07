@@ -22,7 +22,7 @@
 //! # }
 //! ```
 //!
-//! ## Endpoint inventory (v0.3)
+//! ## Endpoint inventory (v0.5)
 //!
 //! | Endpoint | Purpose |
 //! |---|---|
@@ -37,6 +37,10 @@
 //! | `POST /threads/{id}/runs/wait` | blocking run: terminal result as JSON |
 //! | `POST /threads/{id}/runs/stream` | run with SSE streaming (`updates`/`values`/`messages`/`metadata`/`error`/`end`); a fresh run starts a new frame sequence, so `Last-Event-ID` is ignored here |
 //! | `GET /runs/{id}/stream` | attach to an existing run's SSE stream: replay honoring `Last-Event-ID`, then live frames |
+//! | `GET /runs/{id}/events` | Flight Recorder: the run's journaled `RunEvent`s as `{run_id, events, complete}` (snapshot flushed per checkpoint boundary and at run completion; persisted under `{store_path}/journals/` or the `server_journals` table; fetchable by run id even after the live run record is evicted or the process restarts) |
+//! | `GET /runs/{id}/fixture` | Flight Recorder: download the run as a portable `ReplayFixture` bundle (journal + graph topology hash + final checkpoint) for CI replay |
+//! | `POST /runs/replay` | Flight Recorder: re-drive a journaled run against its registered graph and verify the replayed evidence → `{run_id, verified, expected_events, actual_events, first_divergence}` (`422` when the graph is not registered in this process or the journal carries recorded effect calls) |
+//! | `GET /runs/diff?base=&branch=` | Flight Recorder: structural diff of two runs' journals (core's `BranchDiff` shape: `first_divergent_seq`, `added`/`removed` events, per-step channel diffs, token/cost totals) |
 //! | `DELETE /threads/{id}/runs/{run_id}` | rollback: delete a finished run's checkpoints (JSON-file checkpointer only; `409` on Postgres) |
 //! | `GET /runs/{run_id}` | run status polling (plus `output`/`error`/`interrupt` once terminal) |
 //! | `POST /assistants` | create a named graph alias with config metadata |
@@ -57,6 +61,8 @@ mod assistants;
 mod auth;
 mod crons;
 mod error;
+mod journals;
+mod replay;
 mod routes;
 mod runs;
 mod server_store;
@@ -76,12 +82,19 @@ pub use error::ApiError;
 pub use runs::RunStatus;
 
 /// Names the JSON-file layout already owns at the store root
-/// (`assistants/`, `crons/`, `threads/`, `store/`, plus the `latest`
-/// pointer file inside each thread's checkpoint dir). Client-chosen ids and
-/// tenant ids claiming one of these would write checkpoints into platform
-/// directories (or platform records into checkpoint dirs), so both
+/// (`assistants/`, `crons/`, `journals/`, `threads/`, `store/`, plus the
+/// `latest` pointer file inside each thread's checkpoint dir). Client-chosen
+/// ids and tenant ids claiming one of these would write checkpoints into
+/// platform directories (or platform records into checkpoint dirs), so both
 /// `validate_client_id` and [`ServerConfig::with_tenant_key`] reject them.
-pub(crate) const RESERVED_NAMES: &[&str] = &["assistants", "crons", "store", "threads", "latest"];
+pub(crate) const RESERVED_NAMES: &[&str] = &[
+    "assistants",
+    "crons",
+    "journals",
+    "store",
+    "threads",
+    "latest",
+];
 
 /// One registered graph: the compiled topology plus the state schema the
 /// executor needs to drive it.
@@ -178,9 +191,9 @@ pub struct ServerConfig {
     /// Postgres connection URL. When set (requires the `postgres` feature —
     /// see `ServerConfig::with_postgres`), checkpoints live in core's
     /// `rusty_checkpoints` table and the platform surface in the
-    /// `server_assistants` / `server_crons` / `server_threads` / `server_kv`
-    /// tables, all auto-migrated on connect. Connections are established
-    /// lazily on first use.
+    /// `server_assistants` / `server_crons` / `server_threads` /
+    /// `server_kv` / `server_journals` tables, all auto-migrated on
+    /// connect. Connections are established lazily on first use.
     pub database_url: Option<String>,
 
     /// Per-thread in-flight run cap used as the **enqueue queue depth**
@@ -290,7 +303,7 @@ impl ServerConfig {
     /// Builder-style: persist everything in Postgres at `url` (e.g.
     /// `postgres://user:pass@localhost/rusty`). Switches the run
     /// checkpointer to [`rusty_agent_runtime::checkpoint_postgres::PostgresCheckpointer`]
-    /// **and** the assistants/crons/threads/KV server store to the
+    /// **and** the assistants/crons/threads/KV/journals server store to the
     /// `server_*` tables. Schemas auto-migrate on (lazy) connect.
     #[cfg(feature = "postgres")]
     pub fn with_postgres(mut self, url: impl Into<String>) -> Self {

@@ -461,6 +461,81 @@ class RustyClient:
         """
         return self._request("GET", f"/runs/{_q(run_id)}")
 
+    def run_events(self, run_id: str) -> Dict[str, Any]:
+        """Fetch a run's Flight Recorder journal
+        (``GET /runs/{run_id}/events``).
+
+        Returns ``{"run_id", "events", "complete"}`` where ``events`` is the
+        journaled ``RunEvent`` list in ``seq`` order (super-step boundaries,
+        node inputs/outputs, model/tool calls, interrupts, routing
+        decisions, checkpoint writes) and ``complete`` is ``True`` once the
+        run is terminal — i.e. the served snapshot is the final journal.
+        While a run is active the snapshot trails the live journal by at
+        most one checkpoint boundary. Unknown runs raise
+        :class:`RustyError` with ``status == 404``.
+        """
+        return self._request("GET", f"/runs/{_q(run_id)}/events")
+
+    def get_fixture(self, run_id: str) -> Dict[str, Any]:
+        """Download a run as a portable replay fixture
+        (``GET /runs/{run_id}/fixture``).
+
+        Returns core's ``ReplayFixture`` envelope:
+        ``{"format_version", "graph_hash", "graph_version", "journal",
+        "final_checkpoint", "metadata"}`` — feed it to
+        ``ReplayFixture::import`` to re-drive the run in CI. Raises
+        :class:`RustyError` with ``status == 404`` for unknown runs and
+        ``status == 409`` when the run has no persisted journal yet
+        (queued, or before its first checkpoint boundary).
+        """
+        return self._request("GET", f"/runs/{_q(run_id)}/fixture")
+
+    def replay_run(self, run_id: str) -> Dict[str, Any]:
+        """Re-drive a journaled run server-side and verify the replayed
+        evidence (``POST /runs/replay``).
+
+        The server re-executes the run's registered graph against the
+        persisted journal (zero outbound calls) and compares the replayed
+        evidence against the recorded journal. Returns exactly::
+
+            {"run_id": ..., "verified": bool, "expected_events": int,
+             "actual_events": int, "first_divergence": int | None}
+
+        ``verified`` compares kinds, nodes, sequences, effect classes,
+        statuses, and payloads (per-run minted checkpoint ids and wall-clock
+        measurements excluded); ``first_divergence`` is the ``seq`` of the
+        first disagreeing event. Raises :class:`RustyError` with
+        ``status == 404`` for unknown runs, ``status == 409`` when no
+        journal is persisted or the run is still executing, and
+        ``status == 422`` when the run's graph is not registered in the
+        server process or the journal carries recorded model/tool calls
+        (those replay through the CI fixture instead).
+        """
+        return self._request("POST", "/runs/replay", {"run_id": run_id})
+
+    def diff_runs(self, base: str, branch: str) -> Dict[str, Any]:
+        """Structural diff of two runs' journals
+        (``GET /runs/diff?base=…&branch=…``).
+
+        Returns core's ``BranchDiff`` shape::
+
+            {"first_divergent_seq": int | None,
+             "added": [...],   # branch events at/after the divergence
+             "removed": [...], # base events at/after the divergence
+             "step_diffs": [{"step", "channels": [{"channel", "base", "branch"}]}],
+             "base_totals": {"events", "tokens", "cost_usd"},
+             "branch_totals": {"events", "tokens", "cost_usd"}}
+
+        Events compare logically (identity/timing excluded), so two runs
+        that forked from one point show their shared prefix as equal; a run
+        diffed against itself has ``first_divergent_seq`` ``None``. Raises
+        :class:`RustyError` with ``status == 404`` for unknown runs (either
+        side) and ``status == 409`` when either run has no persisted
+        journal yet.
+        """
+        query = urllib.parse.urlencode({"base": base, "branch": branch})
+        return self._request("GET", f"/runs/diff?{query}")
+
     def delete_run(self, thread_id: str, run_id: str) -> Any:
         """Rollback: delete a **finished** run's checkpoints, re-anchoring
         the thread to the pre-run checkpoint

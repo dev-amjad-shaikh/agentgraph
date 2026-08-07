@@ -35,6 +35,10 @@
 //! - **Remote nodes** ([`remote`]): a [`remote::RemoteNode`] executes node
 //!   work on a remote worker over HTTP behind the same [`node::Node`] trait;
 //!   HITL interrupts cross the wire.
+//! - **Replay** ([`replay`]): exact replay of journaled runs — model, tool,
+//!   remote, and WASM calls are served from the journal instead of executed —
+//!   plus branch diffs between journal snapshots and portable
+//!   [`replay::ReplayFixture`] bundles for CI.
 //! - **WASM nodes** (`wasm_node`, feature `wasm`): sandboxed WebAssembly
 //!   modules run as graph nodes via Wasmtime.
 //!
@@ -68,11 +72,14 @@ pub mod checkpoint_postgres;
 pub mod error;
 pub mod executor;
 pub mod graph;
+pub mod journal;
 pub mod llm;
 pub mod mcp;
 pub mod node;
 pub mod react;
+pub mod record;
 pub mod remote;
+pub mod replay;
 pub mod state;
 pub mod tool;
 #[cfg(feature = "wasm")]
@@ -88,11 +95,28 @@ pub mod prelude {
     pub use crate::error::{Result, RustyError};
     pub use crate::executor::{ExecutionOutcome, Executor, GraphEvent, RunConfig};
     pub use crate::graph::{ConditionalRouter, Edge, Graph, GraphBuilder, Route, Send};
+    pub use crate::journal::{
+        Clock, EventDraft, Journal, JournalSnapshot, RngSource, PARENT_EVENT_KEY,
+    };
     pub use crate::llm::{
         ChatMessage, ChatModel, ChatResponse, OpenAiCompatibleClient, Role, ToolCall, Usage,
     };
     pub use crate::node::{Command, Node, NodeConfig, NodeContext, NodeOutput};
-    pub use crate::react::{create_react_agent, create_react_agent_streaming};
+    pub use crate::react::{
+        create_react_agent, create_react_agent_replaying, create_react_agent_streaming,
+        create_react_agent_with_recording,
+    };
+    pub use crate::record::{
+        ArtifactRef, CheckpointHeader, DecisionAction, DecisionEvent, DecisionFamily,
+        DecisionOutcome, Effect, EventStatus, JournalRef, PayloadRef, PolicyVersion, RunEvent,
+        RunEventKind, CURRENT_FORMAT_VERSION,
+    };
+    pub use crate::replay::{
+        BranchDiff, BranchTotals, ChannelDiff, ExactReplay, FixtureMetadata, LogicalClockParams,
+        RecordingChatModel, RecordingTool, ReplayFixture, ReplayOutcome, ReplayParams,
+        ReplaySource, ReplayingChatModel, ReplayingTool, ServedEffect, StepDiff,
+        FIXTURE_FORMAT_VERSION,
+    };
     pub use crate::state::{Reducer, State, StateSpec};
     pub use crate::tool::{Tool, ToolExecutor, ToolRegistry};
 }

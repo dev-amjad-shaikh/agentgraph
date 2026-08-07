@@ -4,7 +4,7 @@
 
 Rusty Core models agent workflows as **cyclic graphs over shared state**. Every state key is a versioned *channel* with per-key reducer semantics; nodes are async functions returning partial updates; execution follows a Pregel/BSP super-step model with first-class checkpoints, interrupts, streaming events, and dynamic fan-out. Dual-licensed under MIT OR Apache-2.0.
 
-> **Status: v0.4.0.** The public API surface — modules, types, and trait signatures in `src/` — is stable to build against. The state/reducer engine, the graph builder (validated when you call `GraphBuilder::compile()`), Pregel/BSP executor super-step loop, in-memory, JSON-file, and Postgres checkpointers, checkpoint time travel (`get_by_id` / `fork_thread` / `RunConfig::with_checkpoint_id`), sandboxed `WasmNode` execution (`wasm` feature), `ChatModel` abstraction with token streaming, OpenAI-compatible client, parallel `ToolExecutor`, the prebuilt ReAct agent (`react::create_react_agent`), the MCP client, remote nodes (`RemoteNode`), and executor `tracing` instrumentation are implemented and tested, with four runnable examples under [`examples/`](examples/). An axum HTTP/SSE server lives in the sibling [`rusty-server`](../rusty-server) crate, and OpenTelemetry export in [`rusty-otel`](../rusty-otel). See the [roadmap](#roadmap) for what's next.
+> **Status: v0.5.0.** The public API surface — modules, types, and trait signatures in `src/` — is stable to build against. The state/reducer engine, the graph builder (validated when you call `GraphBuilder::compile()`), Pregel/BSP executor super-step loop, in-memory, JSON-file, and Postgres checkpointers, checkpoint time travel (`get_by_id` / `fork_thread` / `RunConfig::with_checkpoint_id`), sandboxed `WasmNode` execution (`wasm` feature), `ChatModel` abstraction with token streaming, OpenAI-compatible client, parallel `ToolExecutor`, the prebuilt ReAct agent (`react::create_react_agent`), the MCP client, remote nodes (`RemoteNode`), executor `tracing` instrumentation, and the Flight Recorder (canonical evidence contracts, per-run effect journal with determinism seams, exact replay, branch diff, portable replay fixtures) are implemented and tested, with five runnable examples under [`examples/`](examples/). An axum HTTP/SSE server lives in the sibling [`rusty-server`](../rusty-server) crate, and OpenTelemetry export in [`rusty-otel`](../rusty-otel). See the [roadmap](#roadmap) for what's next.
 
 ## Why Rust?
 
@@ -32,6 +32,7 @@ The trade-off is deliberate: you give up Python's runtime monkey-patching and ge
 - **Remote nodes** *(v0.3)* — the `remote` module's `RemoteNode` POSTs node execution to worker services over HTTP; the companion `rusty-worker` crate is the SDK that serves your handlers. HITL interrupts cross the wire: a remote node can suspend the run and resume with a human payload just like a local node.
 - **Time travel** *(v0.4)* — every checkpoint is a handle: `Checkpointer::get_by_id` fetches any checkpoint of a thread, `Checkpointer::fork_thread` copies a thread's history (full, or up to a checkpoint) into a new thread, and `RunConfig::with_checkpoint_id` replays a run from that checkpoint's state and next-node set instead of the latest. Fork first, replay on the fork.
 - **WASM nodes** *(v0.4, feature `wasm`)* — `WasmNode` runs sandboxed WebAssembly modules as graph nodes via Wasmtime: untrusted or community code executes with capability isolation behind the same `Node` trait as local and remote nodes, with no separate worker fleet and no process boundary to manage.
+- **Flight Recorder** *(v0.5)* — every run is journaled as replayable evidence: canonical serde-versioned contracts (`RunEvent`, `DecisionEvent`, the `Effect` taxonomy, `CheckpointHeader`, golden-file pinned), an append-only per-run journal with causal parentage, content-addressed payloads, and a tamper-evident SHA-256 head hash stamped into checkpoints. Injectable `Clock` / `RngSource` determinism seams make a recorded run re-drivable, and `ExactReplay` plus the `Recording*` / `Replaying*` wrappers re-run it with **zero outbound calls** — every model/tool/remote/WASM effect is served from the journal, verified event-for-event. `BranchDiff` compares forked branches; `ReplayFixture` exports a run as one portable JSON document for CI replay.
 
 ## Quickstart
 
@@ -39,7 +40,7 @@ Rusty Core is published on crates.io as [`rusty-agent-runtime`](https://crates.i
 
 ```toml
 [dependencies]
-rusty-agent-runtime = "0.4"
+rusty-agent-runtime = "0.5"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 ```
@@ -174,6 +175,38 @@ let _ = replayed;
 
 `Checkpointer::get_by_id` fetches any single checkpoint by id; `fork_thread` preserves checkpoint ids, steps, states, and next-node sets; only the `thread_id` changes. The server crate exposes the same two operations over HTTP (`POST /threads/{id}/fork` and `"checkpoint": {"checkpoint_id": …}` on the run endpoints).
 
+### Flight Recorder: record → exact replay
+
+Every run is journaled: the executor creates a `Journal` per run even when you attach nothing (retrieve it via `Executor::journal`). Attach your own journal with determinism seams — a logical clock and a seeded RNG — and the run's evidence becomes reproducible: same event ids, timestamps, and checkpoint ids on every drive. Inside nodes, wrap your model and tools with `RecordingChatModel` / `RecordingTool` so their calls journal in the canonical replay-compatible shapes:
+
+```rust
+use rusty_agent_runtime::prelude::*;
+
+// 1. Record: determinism seams make the evidence reproducible.
+let journal = Journal::new("run-1", "thread-1", Clock::logical(1_000_000, 5));
+let outcome = Executor::new()
+    .run(&graph, &spec, input,
+         RunConfig::new("thread-1")
+             .with_journal(journal.clone())
+             .with_rng(RngSource::seeded(42)))
+    .await?;
+let snapshot = journal.snapshot(); // serde-complete export; head-hash verified on load
+
+// 2. Replay exactly: build the same graph topology with ReplayingChatModel /
+//    ReplayingTool wrappers over `replay.source()` — they answer from the
+//    journal and never invoke the wrapped implementations (zero outbound).
+let replay = ExactReplay::new(snapshot)?;
+let params = ReplayParams::new(
+    replay.fresh_journal(Clock::logical(1_000_000, 5)),
+    RngSource::seeded(42),
+);
+let replayed = replay
+    .run_and_verify(&replay_graph, &spec, input, params)
+    .await?; // RustyError::Replay on the first divergence, order violation, or shortfall
+```
+
+`run_and_verify` checks the replayed journal reproduces the recorded one event-for-event — payloads, artifacts, and the chained head hash included. Byte-identical replay requires the recorded run's clock/seed parameters and runs whose super-steps execute one node at a time (parallel steps interleave logical-clock reads by schedule). `BranchDiff::between(&base, &branch)` diffs two journals logically (first divergence, added/removed events, per-step channel diffs, token/cost totals), and `ReplayFixture::{capture, export, import, replay_in_ci}` packages a run — topology hash, journal, final checkpoint, determinism metadata — as one portable JSON document (`FIXTURE_FORMAT_VERSION` 1) for CI replay. The prebuilt ReAct agent has the wiring built in: `create_react_agent_with_recording` journals every model/tool call of the loop (canonical shapes, per-iteration causal parentage) and `create_react_agent_replaying` re-drives the recorded run under `ExactReplay` — see [`examples/react_record_replay.rs`](examples/react_record_replay.rs). The server persists journals per run and serves them over HTTP (`GET /runs/{id}/events`, `GET /runs/{id}/fixture`).
+
 ## Architecture
 
 ```text
@@ -266,11 +299,12 @@ Runnable examples live under [`examples/`](examples/):
 | Example | What it shows |
 |---|---|
 | [`react_agent.rs`](examples/react_agent.rs) | The prebuilt ReAct loop via `react::create_react_agent`: `agent` node calling a `ChatModel`, `tools` node running `ToolExecutor::execute_batch`, conditional routing on pending tool calls — run with `cargo run --example react_agent` |
+| [`react_record_replay.rs`](examples/react_record_replay.rs) | Flight Recorder on the prebuilt ReAct agent: record with `create_react_agent_with_recording`, then exact-replay with `create_react_agent_replaying` over panic-on-call sentinels — zero outbound calls, byte-identical journal — run with `cargo run --example react_record_replay` |
 | [`parallel_fanout.rs`](examples/parallel_fanout.rs) | Dynamic map-reduce: `Route::Send` fan-out over generated topics, parallel `process_item` workers, fan-in via `Reducer::Append` — run with `cargo run --example parallel_fanout` |
 | [`human_in_loop.rs`](examples/human_in_loop.rs) | Interrupt → durable `JsonFileCheckpointer` checkpoint → resume with a human approval payload — run with `cargo run --example human_in_loop` |
 | [`live_agent.rs`](examples/live_agent.rs) | A **live** ReAct agent against a real OpenAI-compatible endpoint (Ollama, OpenAI, vLLM, LM Studio) with token streaming — run with `cargo run --example live_agent`; exits gracefully with setup instructions when no endpoint is reachable |
 
-See [`examples/README.md`](examples/README.md) for a guided tour of all four.
+See [`examples/README.md`](examples/README.md) for a guided tour of all five.
 
 ## Roadmap
 
@@ -286,6 +320,12 @@ See [`examples/README.md`](examples/README.md) for a guided tour of all four.
 - [x] **Time travel** — `Checkpointer::get_by_id` / `fork_thread` + `RunConfig::with_checkpoint_id`; exposed over HTTP by `rusty-server` v0.3 (`POST /threads/{id}/fork`, checkpoint replay on run endpoints) ✅ implemented in v0.4.0
 - [x] **WASM nodes** — sandboxed `WasmNode` execution via Wasmtime behind the `wasm` cargo feature ✅ implemented in v0.4.0
 - [x] **OpenTelemetry** — OTLP export per super-step/node/LLM call via the [`rusty-otel`](../rusty-otel) crate ✅ implemented in v0.4.0 (`rusty-otel` v0.1.0)
+- [x] **Flight Recorder contracts** — canonical `RunEvent` / `DecisionEvent` / `Effect` taxonomy / `CheckpointHeader` (with `format_version`), golden-file pinned under `tests/golden/` ✅ implemented in v0.5.0
+- [x] **Effect journal + determinism seams** — per-run append-only journal with causal parentage, content-addressed payloads, and a tamper-evident head hash; injectable `Clock` / `RngSource` with pre-R0.5 defaults ✅ implemented in v0.5.0
+- [x] **Exact replay** — `ExactReplay::{run, verify, run_and_verify}` with `RecordingChatModel` / `RecordingTool` and `ReplayingChatModel` / `ReplayingTool`; zero outbound calls by construction ✅ implemented in v0.5.0
+- [x] **Branch diff + portable fixtures** — `BranchDiff::between` fork comparison; `ReplayFixture` (`FIXTURE_FORMAT_VERSION` 1) with `replay_in_ci` ✅ implemented in v0.5.0
+- [x] **ReAct Flight Recorder wiring** — `create_react_agent_with_recording` / `create_react_agent_replaying` journal and exact-replay the prebuilt agent's model/tool calls ✅ implemented in v0.5.0
+- [x] **Postgres checkpoint provenance** — `rusty_checkpoints` persists `Checkpoint.header` / `journal_ref` via nullable `jsonb` columns (additive, idempotent auto-migration; pre-R0.5 rows decode to serde defaults) ✅ implemented in v0.5.0
 - [ ] **WASM target** — run graphs in the browser or edge runtimes (sans native checkpointers)
 - [ ] **Provider adapters** — thin `ChatModel` impls over Rig, `async-openai`, `genai`
 - [x] ~~**PyO3 / napi-rs bindings**~~ — **rejected**: the HTTP/SSE server is the polyglot interop layer; see [docs/roadmap.md](../docs/roadmap.md)

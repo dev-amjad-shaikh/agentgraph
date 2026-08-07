@@ -203,6 +203,29 @@ impl Graph {
     pub fn node_count(&self) -> usize {
         self.inner.nodes.len()
     }
+
+    /// SHA-256 content hash of the graph's topology: the sorted node names
+    /// and the sorted edge descriptors (`from>to` for static edges,
+    /// `from>?` for conditional routers).
+    ///
+    /// Stamped into [`crate::record::CheckpointHeader::graph_hash`] so replay
+    /// can detect that a checkpoint and the graph about to resume it
+    /// disagree structurally. It is deliberately a *topology* hash: node
+    /// bodies are opaque closures/trait objects, so semantic changes inside
+    /// a node cannot be detected here — that is what the application-level
+    /// `graph_version` (set via `RunConfig::with_graph_version`) is for.
+    pub fn topology_hash(&self) -> String {
+        let mut lines: Vec<String> =
+            Vec::with_capacity(self.inner.nodes.len() + self.inner.edges.len());
+        lines.extend(self.inner.nodes.keys().map(|name| format!("node:{name}")));
+        lines.extend(self.inner.edges.iter().map(|edge| match edge {
+            Edge::Direct { from, to } => format!("edge:{from}>{to}"),
+            Edge::Conditional { from, .. } => format!("edge:{from}>?"),
+        }));
+        lines.push(format!("entry:{}", self.inner.entry_point));
+        lines.sort_unstable();
+        crate::record::sha256_hex(lines.join("\n").as_bytes())
+    }
 }
 
 /// Builder for a [`Graph`]. Register nodes and edges, set the entry point,
