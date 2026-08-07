@@ -16,3 +16,6 @@ data/
 
 # OS
 .DS_Store
+
+# Local working archive (not part of the public repo)
+_local-archive/

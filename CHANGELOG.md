@@ -39,7 +39,7 @@ All notable changes to the agentgraph platform. Format loosely follows [Keep a C
 - **TypeScript SDK** *(sdks/typescript, v0.1.0)* — a zero-dependency ESM client for Node.js ≥ 18 and modern browsers (global `fetch` / `ReadableStream` / `AbortController`), with hand-written `.d.ts` declarations: the full HTTP + SSE surface including an async-generator `runStream`. Covered by a 17-test e2e suite (16 pass + 1 skip) against the real server.
 - **Multi-tenant auth** *(agentgraph-server v0.4.0)* — API keys map to tenants via `ServerConfig::with_tenant_key(tenant, key)` (legacy `with_api_key` = the `default` tenant). Threads + checkpoints, runs, assistants, crons, and KV namespaces are fully isolated through internal `{tenant}/` id prefixing (no schema changes; the unprefixed default tenant keeps existing deployments' flat layout). Cross-tenant access answers `404`, never `403`; the cron scheduler is tenancy-aware. Open (no-key) mode is byte-identical to pre-multi-tenancy behavior — both SDK suites pass against it unchanged. 9 dedicated integration tests (`tests/multi_tenant.rs`).
 - **Live-LLM validation** — `docs/live-demo-transcript.md` captures real end-to-end ReAct runs of `examples/live_agent.rs` against Ollama (`qwen2.5:0.5b`, `llama3.2`): graph loop, tool dispatch, and event stream all verified against a live model.
-- **Blog follow-up** — `blog/we-shipped-the-whole-engine.md` (+ `.docx`): the v0.1→v0.4 platform story.
+- **Blog follow-up** — `we-shipped-the-whole-engine` (published outside this repo): the v0.1→v0.4 platform story.
 
 ### Fixed
 

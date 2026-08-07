@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: ${{ matrix.crate }} (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [agentgraph, agentgraph-server, agentgraph-worker, agentgraph-otel]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable + rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.crate }}
+
+      - name: Format
+        working-directory: ${{ matrix.crate }}
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (warnings are errors)
+        working-directory: ${{ matrix.crate }}
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        working-directory: ${{ matrix.crate }}
+        run: cargo test
+
+      - name: Check all features
+        working-directory: ${{ matrix.crate }}
+        run: cargo check --all-features
+
+  docs:
+    name: rustdoc (${{ matrix.crate }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [agentgraph, agentgraph-server, agentgraph-worker, agentgraph-otel]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.crate }}
+
+      - name: Build docs (warnings are errors)
+        working-directory: ${{ matrix.crate }}
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps
+
+  sdk-e2e:
+    name: SDK end-to-end (Python + TypeScript)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: agentgraph-server
+
+      - name: Build server demo binary
+        working-directory: agentgraph-server
+        run: cargo build --example server_demo
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python SDK e2e
+        run: python3 -m unittest discover -s sdks/python/tests -v
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: TypeScript SDK e2e
+        run: node --test sdks/typescript/test/

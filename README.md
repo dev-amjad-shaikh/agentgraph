@@ -79,9 +79,8 @@ agentgraph-otel/     OpenTelemetry export crate (library, v0.1.0)
 agentgraph-worker/   worker SDK crate (v0.1.0)
 sdks/                zero-dep client SDKs: Python (stdlib-only) + TypeScript (ESM)
 studio/              zero-build single-file debug UI for agentgraph-server
-docs/                server design doc + quickstart + platform roadmap + studio guide + live-LLM transcript
-research/            design research notes
-whitepaper/, blog/   accompanying writing
+docs/                design docs, quickstarts, platform roadmap, studio guide, live-LLM transcript
+.github/             CI: fmt, clippy, tests, and rustdoc for every crate + SDK e2e suites
 ```
 
 ## License

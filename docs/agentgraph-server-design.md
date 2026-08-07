@@ -1,8 +1,8 @@
 # agentgraph-server v0.2 — Architecture & Setup Design
 
 **Status:** design draft · **Date:** 2026-08-04 · **Audience:** agentgraph contributors
-**References:** `research/langgraph_platform_api.md` (LangGraph Platform / Agent Server API spec),
-`research/rust_server_plugin_patterns.md` (ranked user-code-in-server patterns), crate ground
+**References:** [`langgraph_platform_api.md`](langgraph_platform_api.md) (LangGraph Platform / Agent Server API spec),
+[`rust_server_plugin_patterns.md`](rust_server_plugin_patterns.md) (ranked user-code-in-server patterns), crate ground
 truth in `agentgraph/src/lib.rs`, `agentgraph/src/executor.rs`, `agentgraph/src/checkpoint.rs`,
 `agentgraph/examples/react_agent.rs`.
 
