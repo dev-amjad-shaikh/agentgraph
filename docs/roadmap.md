@@ -1,6 +1,8 @@
 # Rusty platform roadmap
 
-Where the platform has been, what's landing this cycle, and what's next. Crates are versioned independently (`rusty-agent-runtime` core, `rusty-server`, `rusty-worker`); phases below group work across the monorepo. Named releases: **R0.1 — Ignition**, **R0.2 — Persistence**, **R0.3 — Interop**, **R0.4 — Time Travel** (all implemented), and **R1.0 — Unleashed** (upcoming). History lives in [../CHANGELOG.md](../CHANGELOG.md); per-crate detail lives in each crate's README.
+Where the platform has been, what's landing this cycle, and what's next. Crates are versioned independently (`rusty-agent-runtime` core, `rusty-server`, `rusty-worker`); phases below group work across the monorepo. Named releases: **R0.1 — Ignition**, **R0.2 — Persistence**, **R0.3 — Interop**, **R0.4 — Time Travel** (all implemented), **R0.5 — Flight Recorder**, **R0.6 — Durable Work**, **R0.7 — Agent Fabric**, **R0.8 — Rusty Learn**, **R0.9 — Capsules**, **R0.10 — Adaptation** (upcoming), and **R1.0 — Unleashed** (the stability release). History lives in [../CHANGELOG.md](../CHANGELOG.md); per-crate detail lives in each crate's README.
+
+The forward plan (R0.5 onward) comes from the product/technical strategy review of 2026-08-07. Its sequencing rule: **replay before learning** — no learning mechanism ships before the run evidence it learns from can be faithfully recorded, evaluated, and rolled back.
 
 ## Status at a glance
 
@@ -11,7 +13,13 @@ Where the platform has been, what's landing this cycle, and what's next. Crates 
 | **R0.3 — Interop** | interop & distribution | MCP client, remote nodes + worker SDK, server API completion, executor tracing | `rusty-agent-runtime` v0.3.0, `rusty-server` v0.2.0, `rusty-worker` v0.1.0 | ✅ Implemented | 2026-08-05 |
 | **R0.4 — Time Travel** | production hardening | WASM nodes, time-travel core + server API, Postgres server store, OpenTelemetry export, Studio UI, permissive CORS | `rusty-agent-runtime` v0.4.0, `rusty-server` v0.3.0, `rusty-otel` v0.1.0 | ✅ Implemented | 2026-08-05 |
 | v0.5 (pre-1.0) | SDKs & tenancy | Python SDK (stdlib-only), TypeScript SDK (zero-dep ESM), multi-tenant auth with full isolation, live-LLM validation + calculator fix | `rusty-server` v0.4.0, `sdks/*` v0.1.0 | ✅ Implemented | 2026-08-05 |
-| **R1.0 — Unleashed** | platform ambitions | Hosted multi-tenant service (tenant isolation implemented in v0.5 — the first brick), WASM target, edge runtimes | TBD | 🚧 Upcoming | — |
+| **R0.5 — Flight Recorder** | evidence | Canonical contracts (RunEvent, DecisionEvent, Effect, checkpoint header with `format_version`), effect journal, determinism seams, exact/live/hybrid replay, fork + branch diff, portable replay fixtures | `rusty-agent-runtime` v0.5.0, `rusty-server` v0.5.0 | 🚧 Building | — |
+| **R0.6 — Durable Work** | effectively-once activities | Postgres task queue, leases + heartbeats, retry taxonomy with backoff + DLQ, cancellation propagation, idempotency keys, transactional outbox, worker draining | `rusty-server` v0.6.0, `rusty-worker` v0.2.0 | 📋 Planned | — |
+| **R0.7 — Agent Fabric** | durable agent teams + state scaling | Durable agent identities, typed mailboxes, supervision, budgets, task/artifact contracts; copy-on-write state, delta checkpoints, content-addressed artifacts | `rusty-agent-runtime` v0.6.0 | 📋 Planned | — |
+| **R0.8 — Rusty Learn** | governed learning | Memory record model with provenance/scopes, correction loop, candidate distillation, shadow evaluation, promotion/rollback by version pointer, executor policy plane v1 | `rusty-agent-runtime` v0.7.0 | 📋 Planned | — |
+| **R0.9 — Capsules** | secure isolation + federation | WASM capsule manifests, deny-by-default capability host, resource budgets, policy overlays; MCP server bridge, A2A server/client with durable tasks/artifacts | `rusty-agent-runtime` v0.8.0 | 📋 Planned | — |
+| **R0.10 — Adaptation** | executor policy learning | Checkpoint placement, retry, timeout, worker placement, concurrency policies; shadow evaluation, drift detection, revert-to-default | `rusty-agent-runtime` v0.9.0 | 📋 Planned (gated on headroom experiment) | — |
+| **R1.0 — Unleashed** | stable platform | Stable public APIs, event schema, checkpoint format, capsule manifest, migration policy; independent security review; documented capacity envelope; three production-shaped case studies | v1.0.0 all crates | 🚧 Upcoming | — |
 
 ## Implemented
 
@@ -46,26 +54,105 @@ Five workstreams landed concurrently this cycle:
 
 - **Python SDK** (`sdks/python/`) — zero-dependency, stdlib-only client (`urllib.request` + `json`): the full thread/run/SSE/time-travel/assistant/cron/KV surface, verified by an e2e suite that boots the real `server_demo` binary. This is the "interop over HTTP" story made concrete — the polyglot path the rejected PyO3/napi-rs bindings were traded for.
 - **TypeScript SDK** (`sdks/typescript/`) — zero-dependency ESM client for Node ≥ 18 and browsers (global `fetch`, async-generator `runStream`), with hand-written type declarations and its own live-server e2e suite.
-- **Multi-tenant auth** (`rusty-server` v0.4.0) — `ServerConfig::with_tenant_key(tenant, key)` maps API keys to tenants; threads, runs, assistants, crons, and KV namespaces are fully isolated via internal `{tenant}/` id prefixing, cross-tenant access answers 404 (never 403), and open/dev mode stays byte-identical to before. **This is the first brick of the hosted control plane** — see R1.0 — Unleashed.
+- **Multi-tenant auth** (`rusty-server` v0.4.0) — `ServerConfig::with_tenant_key(tenant, key)` maps API keys to tenants; threads, runs, assistants, crons, and KV namespaces are fully isolated via internal `{tenant}/` id prefixing, cross-tenant access answers 404 (never 403), and open/dev mode stays byte-identical to before.
 - **Live-LLM validation + calculator fix** — `examples/live_agent.rs` verified end-to-end against real Ollama models ([transcript](live-demo-transcript.md)); the run exposed (and a follow-up run confirmed the fix for) a calculator arg-parsing defect: quoted numeric args (`"128"`) failed `as_f64()` and silently computed `0 op 0`. The example now coerces numeric strings and alias keys, logs raw args on failure, and carries 5 unit tests.
+
+## Upcoming
+
+### R0.5 — Flight Recorder · evidence
+
+Rusty's first unmistakable flagship: record the effects required to explain and replay an agent run — not just observability spans.
+
+- **Contract freeze** — canonical serde-versioned schemas: `RunEvent` (run, thread, node, sequence, input/output references, latency, cost, status), `DecisionEvent` (family, features, legal actions, selected action, propensity, policy version, outcome), the `Effect` taxonomy (`Pure` / `ReadOnly` / `Idempotent` / `Compensatable` / `NonIdempotent`), and a checkpoint header carrying `format_version`, graph version, and policy version. Golden-file tests pin the wire shapes; old checkpoints keep loading.
+- **Determinism seams** — the executor sources time and randomness through injectable clock/RNG, so a recorded run can be re-driven exactly.
+- **Effect journal** — model calls, tool calls, remote/WASM node calls, and human interrupts recorded with inputs, outcomes, latency, cost, and causal parentage.
+- **Replay modes** — *exact* (zero outbound calls; every effect served from the journal), *live* (re-execute against current dependencies), *hybrid* (pin selected effects, re-run others).
+- **Fork + branch diff** — fork at any checkpoint, change one model/prompt/tool input, compare state and event streams.
+- **Portable fixtures** — export any run as a self-contained replay fixture; replay it in CI.
+- **First experiment** — measure checkpoint-placement headroom after mandatory checkpoints for non-idempotent effects. If residual freedom is small, R0.10 stops investing in that wedge. Result published in [benchmarks.md](benchmarks.md).
+
+**Release proof:** exact replay makes zero outbound calls and produces the same ordered event stream and state transitions.
+
+### R0.6 — Durable Work · effectively-once activities
+
+Workers evolve from remote-execution helpers into a durable activity system. The promise is effectively-once behavior when applications use idempotency — not universal exactly-once side effects.
+
+- Postgres-backed task queue with leases/visibility timeouts; worker heartbeats, lease renewal, failure detection, safe reassignment.
+- Retries with classified errors, exponential backoff + jitter, attempt limits, dead-letter queue.
+- End-to-end cancellation propagation; worker draining during deployment.
+- Task idempotency keys, deduplication, transactional outbox, effect receipts.
+- Named worker pools, concurrency limits, tenant quotas; version pinning for in-flight runs.
+
+**Release proof:** kill the server and a worker mid-effect; restart; the run completes without losing state or duplicating the external effect.
+
+### R0.7 — Agent Fabric · durable agent teams + state scaling
+
+- **Durable agents** — stable identity, versioned capability manifest, typed durable mailboxes (ordering, acknowledgement, idempotency, dead-letter), private state plus explicit team/user/tenant scopes, supervision with restart/escalation, deadlines, and a cancellation tree.
+- **Coordination patterns with runtime guarantees** — delegate/handoff (typed task contract, scoped context transfer), fan-out/map (bounded parallelism, causal children, deterministic merge), race (idempotent candidates only, cancel losers, record wasted cost), quorum (explicit membership, evidence record, deterministic resolver).
+- **State scaling** — replace full-state clones with copy-on-write/persistent structures, delta checkpoints, and content-addressed large artifacts; typed state path retained behind the JSON SDK boundary. Measured against the published [baseline numbers](benchmarks.md) before any claim.
+
+**Release proof:** an agent team resumes after a crash with causal history intact; state-scaling numbers published.
+
+### R0.8 — Rusty Learn · governed learning
+
+The learning rule: no learning process may silently rewrite a production prompt, graph, policy, memory, or tool permission. Learning creates an immutable candidate that must be evaluated and promoted.
+
+- **Governed memory** — records carry provenance, confidence, validity interval, expiration, supersession, and scope (run/agent/team/user/tenant); retrieval with structured filters + context budget; consolidation, conflict detection, and real forgetting (embeddings, caches, dependent summaries). Vector retrieval deferred per the de-priorities below.
+- **Correction loop** — human corrections become attributed candidate memories/examples.
+- **Learning loop** — observe completed runs → distill candidate → replay against recorded evaluations → promote only within an approved envelope (otherwise review/canary) → monitor drift → roll back by immutable version pointer.
+- **Executor policy plane v1** — policy pinning already lands in R0.5 contracts (policy version + propensity in the checkpoint header); epoch-bounded immutable policy versions; closed action sets as Rust enums; default static behavior as the floor.
+
+**Release proof:** apply a correction, evaluate the derived candidate, promote it, and explain the later improvement — attributable and reversible.
+
+### R0.9 — Capsules · secure isolation + federation
+
+- **Capsule manifest** — identity, version, build digest, declared graph/node interface, typed inputs/outputs/effects, capability grants (filesystem paths, network hosts, secrets, tools, models), and resource budgets (CPU, memory, wall time, WASM fuel, tokens, cost, output size). Signing/attestation follows the MVP.
+- **Deny by default** — no filesystem, network, secrets, or process access unless granted; network grants scoped by host/protocol/method; secrets injected as non-serializable handles; guest outputs validated before host actions; tenant overlays may only narrow capabilities.
+- **Protocol bridges** — expose any graph as an MCP tool (generated schemas, streamed progress) and as an A2A agent (generated Agent Card); consume MCP servers and A2A agents as durable nodes, preserving tasks, artifacts, streaming, and cancellation.
+
+**Release proof:** run an untrusted remote agent that attempts forbidden network/filesystem access and visibly deny it.
+
+### R0.10 — Adaptation · executor policy learning
+
+Gated on the R0.5 headroom experiment. Decision families in priority order: same-operation retry (classified failures; reformulation is never an ordinary retry), timeout/stopping (per-tool latency and hazard), equivalent-worker placement, concurrency/backpressure, side-effect-free speculation with budget, and checkpoint placement (if headroom exists). Agent/model selection is a governed semantic policy, not an automatic one. Interrupt policy is deferred (the prevented-error counterfactual is unobservable).
+
+**Release proof:** a learned policy reduces cost or latency net of telemetry overhead at non-inferior completion, with the evaluation published.
+
+### R1.0 — Unleashed · stable platform
+
+- Stable public APIs, event schema, checkpoint format, capsule manifest, and migration policy.
+- Independent security review of server multitenancy, secrets, protocol endpoints, and the WASM host.
+- Documented capacity envelope and supported deployment topologies.
+- At least three production-shaped case studies: durability, multi-agent coordination, sandboxed execution.
+- No unresolved critical CI, data-loss, replay-integrity, or tenant-isolation defect.
+- Also in scope: hosted multi-tenant control plane (tenant isolation already landed in v0.5 as the first brick; durable queues arrive in R0.6), graphs on a WASM target (browser/edge), and registry publishing across crates.io / npm / PyPI.
+
+## Design principles
+
+- **Runtime over framework** — win on execution guarantees, density, safety, and debuggability, not on the number of LLM wrappers.
+- **Replay before learning** — an improvement system without faithful evidence, evaluation, and rollback is an uncontrolled mutation system.
+- **Mechanical learning first** — learn decisions with dense objective signals and closed action spaces before learning semantic behavior.
+- **Capabilities over trust** — tools and agents receive only the files, network destinations, secrets, compute, and budget they require.
+- **Protocol-native** — interoperate across languages and vendors through MCP and A2A; Rusty is the durable runtime underneath.
+- **Self-hosted by default** — a hosted control plane may come later; core durability, security, and debugging never require it.
+- **Evidence over claims** — benchmark performance, replay fidelity, crash recovery, telemetry overhead, and learning benefit before marketing them.
+
+## Deliberately de-prioritized
+
+Until the runtime moat is proven, we do not build: a generic vector-database abstraction or RAG framework; long model-provider lists with no operational differentiation; voice/realtime media agents; a drag-and-drop no-code builder; an agent marketplace (before signed capsules exist); more ReAct variants and prompt templates; a hosted control plane (before durable workers, migrations, and self-hosting are excellent); model-weight training or open-ended self-modification.
 
 ## Explicitly rejected
 
 - **napi-rs / PyO3 bindings** — REJECTED: they'd freeze a trait surface that's still moving and split maintenance across three ecosystems; the HTTP/SSE server is the polyglot interop layer instead.
 - **`cdylib` / C ABI** — REJECTED: a C ABI over async tokio graphs leaks runtime-ownership and panic-safety problems across the boundary for near-zero demand; embed the Rust crate directly or talk HTTP.
 
-## R1.0 — Unleashed — platform ambitions
-
-Directional, not scheduled. The Phase D ambitions below are what R1.0 — Unleashed is made of:
-
-- **Hosted multi-tenant service** — the server crate operated as a managed platform: tenant isolation, durable queues, autoscaling workers. **Partially started:** v0.5 implemented the tenant-isolation brick (per-tenant API keys, namespaced storage, 404-on-cross-tenant semantics) in `rusty-server` v0.4.0; durable queues and autoscaling remain open.
-- **WASM target** — run graphs themselves in the browser or edge runtimes (sans native checkpointers).
-- **Edge deployment** — single-digit-MB agent services on edge runtimes, leaning on Rust's footprint and the static-binary story.
-
 ## Design docs & references
 
 - [rusty-server design](rusty-server-design.md) — endpoint mapping, SSE semantics, phased server roadmap (Phases A/B/C).
 - [server quickstart](server-quickstart.md) — zero to a served graph with interrupt/resume over HTTP + SSE.
+- [benchmarks](benchmarks.md) — published performance numbers and reproduction steps.
+- [stability contract](stability.md) — what is stable, what may break, deprecation policy.
+- [versioning](versioning.md) — compatibility matrix across all packages.
 - [rusty-agent-runtime README](../rusty-core/README.md#roadmap) — core crate roadmap checklist.
 - [rusty-server README](../rusty-server/README.md) — server endpoint inventory and status.
 - [CHANGELOG](../CHANGELOG.md) — version history.
