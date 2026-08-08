@@ -26,6 +26,8 @@
 //! Golden-file tests under `tests/golden/` pin these serialized shapes;
 //! any accidental contract drift fails CI.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -265,6 +267,22 @@ pub struct EffectReceipt {
     /// in-process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
+
+    /// The deterministic effect id (R0.7 effect kernel) of the effect this
+    /// receipt confirms — [`crate::effects::derive_effect_id`] over the
+    /// run scope, effect kind, input hash, and idempotency key. Recovery
+    /// re-derives the id of the effect it is about to perform and looks the
+    /// receipt up by it (see
+    /// [`crate::journal::JournalSnapshot::find_effect_receipt_by_effect_id`]),
+    /// which is how "did this exact effect already commit?" becomes
+    /// answerable without re-execution.
+    ///
+    /// Additive like `task_id`: absent (not null) on the wire when unset, so
+    /// pre-R0.7 receipts and consumers see no shape change. `None` is honest
+    /// for receipts journaled by writers that predate the typed kernel; the
+    /// [`EffectReceipt::idempotency_key`] lookup keeps serving them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_id: Option<String>,
 }
 
 /// The outcome status of a journaled event.
@@ -527,6 +545,157 @@ pub struct DecisionEvent {
     pub decided_at: DateTime<Utc>,
 }
 
+/// A capsule version pin — the R0.7 placeholder for R0.9's capsule manifest
+/// identity.
+///
+/// R0.9 gives capsules a full manifest (build digest, declared interface,
+/// capability grants); R0.7 pins only the version string so a run's manifest
+/// can already record *which* capsule build influenced it. Typing it now —
+/// rather than storing a bare string — localizes the R0.9 evolution to one
+/// type instead of every consumer of the manifest map. Transparent over
+/// `String`: the wire shape is the version string itself.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CapsuleVersion(pub String);
+
+impl CapsuleVersion {
+    /// Wrap a version string.
+    pub fn new(version: impl Into<String>) -> Self {
+        Self(version.into())
+    }
+
+    /// The version string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for CapsuleVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The versioned run manifest (R0.7): everything beyond the graph itself
+/// that can influence a run, pinned at checkpoint time.
+///
+/// The R0.5 header pins the checkpoint format, the graph version and
+/// topology, and the executor policy — but a run's behavior is also shaped
+/// by its prompts, its tools' schemas, its model and parameters, and (as
+/// they land) its memory schema and capsule builds. The manifest pins all of
+/// them by content address (lowercase hex SHA-256, the one hashing primitive
+/// shared with artifact references and journal heads), so a checkpoint
+/// answers not just "which graph produced this?" but "which *configuration
+/// of everything else* produced this?".
+///
+/// **Upgrade safety.** Pinning is what lets long-running agents survive
+/// platform upgrades: a run resumed from a checkpoint keeps executing
+/// against the versions its manifest pins, while new versions shadow for new
+/// runs. An absent field means *unpinned*, never a default — consumers must
+/// not invent one. Migration contracts between pinned versions (when a run
+/// may move from pin A to pin B, and how) are R1.0's stability work,
+/// deliberately: this wave records the evidence migrations will be judged
+/// against.
+///
+/// Every field is optional and omitted from the wire when unset
+/// (`skip_serializing_if`), so a header carrying no manifest — or a manifest
+/// carrying only some pins — produces no shape change for pre-R0.7 readers.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RunManifest {
+    /// Prompt digests: prompt name → SHA-256 of the exact prompt text
+    /// (`sha256_hex` over its UTF-8 bytes). Prompt text, not a name alone,
+    /// because an edited prompt under an unchanged name is exactly the drift
+    /// the manifest exists to catch.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub prompts: BTreeMap<String, String>,
+
+    /// Tool schema digests: tool name → SHA-256 of the canonical
+    /// `serde_json` serialization of its parameters schema (the same
+    /// canonicalization [`PayloadRef::content_hash`] relies on: object keys
+    /// sort deterministically, so equal schemas hash equal).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_schemas: BTreeMap<String, String>,
+
+    /// The model identifier the run pinned (a provider-precise string such
+    /// as `gpt-5.2-2026-06-01`, not a floating alias like `gpt-5.2-latest` —
+    /// an alias is not a pin).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    /// SHA-256 digest of the canonical JSON of the model parameters
+    /// (temperature, seed, token limits, ...) the run pinned. A digest
+    /// rather than the parameters themselves: the header stays cheap to scan
+    /// and parameter sets with secrets-adjacent values never land in
+    /// evidence verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_params: Option<String>,
+
+    /// The memory schema version the run pinned (R0.8's memory record
+    /// model). Declared in R0.7 so runs that outlive the R0.8 upgrade can
+    /// still be interpreted against the schema their memories were written
+    /// under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_schema: Option<String>,
+
+    /// Capsule version pins: capsule name → [`CapsuleVersion`] (placeholder
+    /// for R0.9's capsule manifests — see that type's docs).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub capsules: BTreeMap<String, CapsuleVersion>,
+}
+
+impl RunManifest {
+    /// An empty manifest: nothing pinned. Equivalent to [`Default`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Pin a prompt by content: records the SHA-256 of its exact UTF-8 text
+    /// under `name`.
+    pub fn pin_prompt(mut self, name: impl Into<String>, prompt: &str) -> Self {
+        self.prompts
+            .insert(name.into(), sha256_hex(prompt.as_bytes()));
+        self
+    }
+
+    /// Pin a tool's parameters schema by content: records the SHA-256 of its
+    /// canonical `serde_json` serialization under `name`.
+    pub fn pin_tool_schema(mut self, name: impl Into<String>, schema: &Value) -> Self {
+        self.tool_schemas
+            .insert(name.into(), canonical_json_digest(schema));
+        self
+    }
+
+    /// Pin the model identifier and the content digest of its parameters.
+    pub fn pin_model(mut self, model: impl Into<String>, parameters: &Value) -> Self {
+        self.model = Some(model.into());
+        self.model_params = Some(canonical_json_digest(parameters));
+        self
+    }
+
+    /// Pin the memory schema version (R0.8's record model; see the field
+    /// docs).
+    pub fn with_memory_schema(mut self, version: impl Into<String>) -> Self {
+        self.memory_schema = Some(version.into());
+        self
+    }
+
+    /// Pin a capsule version (R0.9 placeholder; see [`CapsuleVersion`]).
+    pub fn pin_capsule(mut self, name: impl Into<String>, version: CapsuleVersion) -> Self {
+        self.capsules.insert(name.into(), version);
+        self
+    }
+}
+
+/// SHA-256 of the canonical `serde_json` serialization of `value` — the
+/// digest convention shared by every manifest pin over JSON content.
+fn canonical_json_digest(value: &Value) -> String {
+    // Serializing a `Value` is infallible in practice (its maps always have
+    // string keys); `PayloadRef::content_hash` documents why the result is
+    // canonical.
+    let bytes = serde_json::to_vec(value).expect("a serde_json::Value always serializes");
+    sha256_hex(&bytes)
+}
+
 /// The provenance header stamped into every checkpoint.
 ///
 /// Answers, for any stored checkpoint: which checkpoint format wrote it
@@ -537,7 +706,10 @@ pub struct DecisionEvent {
 /// checkpoints whose format or graph no longer matches.
 ///
 /// Added to `Checkpoint` with serde defaults: checkpoints written before
-/// R0.5 (no header) deserialize into [`CheckpointHeader::default`].
+/// R0.5 (no header) deserialize into [`CheckpointHeader::default`]. R0.7
+/// extends the header additively with the [`RunManifest`] pin set — same
+/// rule: unset fields stay absent from the wire and old headers keep
+/// deserializing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CheckpointHeader {
     /// Checkpoint envelope format version; [`CURRENT_FORMAT_VERSION`] for
@@ -562,12 +734,24 @@ pub struct CheckpointHeader {
     /// clock it is the deterministic tick — either way it is the ordering
     /// and replay handle, not wall time.
     pub logical_clock: u64,
+
+    /// The versioned run manifest (R0.7): prompts, tool schemas, model and
+    /// parameters, memory schema, and capsule versions pinned for the run —
+    /// see [`RunManifest`] for the upgrade-safety contract. Stamped from
+    /// `RunConfig::with_manifest` at checkpoint time.
+    ///
+    /// Additive: `None` (the default) is absent from the wire, so headers
+    /// written before R0.7 — and headers of runs that pin nothing — keep
+    /// their exact R0.5 shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<RunManifest>,
 }
 
 impl Default for CheckpointHeader {
     /// The header for a checkpoint written without run context: current
-    /// format, unversioned/empty graph identity, static policy, clock zero.
-    /// Also the deserialization fallback for pre-R0.5 checkpoints.
+    /// format, unversioned/empty graph identity, static policy, clock zero,
+    /// no manifest. Also the deserialization fallback for pre-R0.5
+    /// checkpoints.
     fn default() -> Self {
         Self {
             format_version: CURRENT_FORMAT_VERSION,
@@ -575,6 +759,7 @@ impl Default for CheckpointHeader {
             graph_hash: String::new(),
             policy_version: PolicyVersion::default(),
             logical_clock: 0,
+            manifest: None,
         }
     }
 }
@@ -698,5 +883,127 @@ mod tests {
         assert_eq!(header.graph_version, "unversioned");
         assert_eq!(header.policy_version, PolicyVersion::default());
         assert_eq!(header.logical_clock, 0);
+        assert_eq!(header.manifest, None);
+    }
+
+    #[test]
+    fn manifest_digests_are_stable_content_addresses() {
+        // Constants computed independently (SHA-256 of the exact bytes): the
+        // pins are content addresses, so their stability across releases is
+        // the contract — a drifting digest would silently split runs from
+        // their own evidence.
+        let manifest = RunManifest::new()
+            .pin_prompt("system", "You are a careful research agent.")
+            .pin_tool_schema(
+                "search",
+                &json!({"type": "object", "properties": {"query": {"type": "string"}}}),
+            )
+            .pin_model(
+                "gpt-5.2-2026-06-01",
+                &json!({"temperature": 0, "seed": 42, "max_tokens": 512}),
+            )
+            .with_memory_schema("memory-v1")
+            .pin_capsule("researcher", CapsuleVersion::new("1.4.0"));
+
+        assert_eq!(
+            manifest.prompts["system"],
+            "edff20fbc61c032a9206bdc94aec3b70e05ab953383972b267b83957d9ba7bfe"
+        );
+        assert_eq!(
+            manifest.tool_schemas["search"],
+            "094ec29d007cce150c65abf0756d79ad5b62a1acfdb6e0841f69f1377ef41761"
+        );
+        assert_eq!(
+            manifest.model_params.as_deref(),
+            Some("fc004364a674799b07f8e4e6323ad74398745607ae3bd955e0d9c1d7529a0762")
+        );
+        assert_eq!(manifest.model.as_deref(), Some("gpt-5.2-2026-06-01"));
+        assert_eq!(manifest.memory_schema.as_deref(), Some("memory-v1"));
+        assert_eq!(manifest.capsules["researcher"].as_str(), "1.4.0");
+
+        // Key order in the source JSON must not matter: canonicalization
+        // sorts object keys, so semantically equal schemas pin equal.
+        let reordered = RunManifest::new().pin_tool_schema(
+            "search",
+            &json!({"properties": {"query": {"type": "string"}}, "type": "object"}),
+        );
+        assert_eq!(manifest.tool_schemas, reordered.tool_schemas);
+    }
+
+    #[test]
+    fn manifest_serde_roundtrip_and_sparse_wire_shape() {
+        let manifest = RunManifest::new()
+            .pin_prompt("system", "Be brief.")
+            .pin_model("model-x", &json!({"temperature": 0.5}));
+        let back: RunManifest =
+            serde_json::from_str(&serde_json::to_string(&manifest).unwrap()).unwrap();
+        assert_eq!(manifest, back);
+
+        // Sparse pins stay sparse on the wire: unset fields are absent, not
+        // null or empty — pre-R0.7 readers see no new keys at all.
+        let value = serde_json::to_value(&manifest).unwrap();
+        assert!(value.get("tool_schemas").is_none());
+        assert!(value.get("memory_schema").is_none());
+        assert!(value.get("capsules").is_none());
+        assert!(value.get("prompts").is_some());
+
+        // An empty manifest serializes to an empty object, and a header that
+        // carries no manifest omits the field entirely.
+        assert_eq!(serde_json::to_value(RunManifest::new()).unwrap(), json!({}));
+        let header = CheckpointHeader::default();
+        assert!(serde_json::to_value(&header)
+            .unwrap()
+            .get("manifest")
+            .is_none());
+    }
+
+    #[test]
+    fn r05_header_without_manifest_still_loads() {
+        // The R0.5 shape — exactly what the golden file pins — deserializes
+        // into the extended header with the manifest unset.
+        let r05_shape = json!({
+            "format_version": 1,
+            "graph_version": "react-v3",
+            "graph_hash": "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
+            "policy_version": "static-v0",
+            "logical_clock": 1750000000000u64,
+        });
+        let header: CheckpointHeader = serde_json::from_value(r05_shape).unwrap();
+        assert_eq!(header.manifest, None);
+        assert_eq!(header.format_version, CURRENT_FORMAT_VERSION);
+
+        // And a header carrying a manifest round-trips it.
+        let extended = CheckpointHeader {
+            manifest: Some(RunManifest::new().with_memory_schema("memory-v1")),
+            ..header
+        };
+        let back: CheckpointHeader =
+            serde_json::from_str(&serde_json::to_string(&extended).unwrap()).unwrap();
+        assert_eq!(extended, back);
+    }
+
+    #[test]
+    fn effect_receipt_effect_id_is_additive() {
+        let receipt = EffectReceipt {
+            provider: "stripe".into(),
+            provider_id: "ch_3PKd".into(),
+            idempotency_key: "run-1:charge:7".into(),
+            task_id: None,
+            effect_id: None,
+        };
+        // Unset: absent on the wire — pre-R0.7 receipts see no shape change.
+        let value = serde_json::to_value(&receipt).unwrap();
+        assert!(value.get("effect_id").is_none());
+
+        // Set: carried as a bare digest string, surviving the round-trip.
+        let with_id = EffectReceipt {
+            effect_id: Some(
+                "9b71d224bd62f3785d96d46ad3ea3d73319bfbc2890caadae2dff72519673ca7".into(),
+            ),
+            ..receipt
+        };
+        let back: EffectReceipt =
+            serde_json::from_str(&serde_json::to_string(&with_id).unwrap()).unwrap();
+        assert_eq!(with_id, back);
     }
 }

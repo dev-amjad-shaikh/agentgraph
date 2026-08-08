@@ -585,18 +585,45 @@ impl JournalSnapshot {
     /// than fatal — integrity failures of the snapshot itself are caught by
     /// [`Journal::from_snapshot`]'s hash check at load time.
     pub fn find_effect_receipt(&self, idempotency_key: &str) -> Option<EffectReceipt> {
+        self.receipts()
+            .find(|receipt| receipt.idempotency_key == idempotency_key)
+    }
+
+    /// The effect-kernel receipt lookup (R0.7): the journaled
+    /// [`EffectReceipt`] for a deterministic effect id, when one exists.
+    ///
+    /// Where [`JournalSnapshot::find_effect_receipt`] answers "did this key
+    /// already land?", this answers the recovery question the typed kernel
+    /// asks: "did *this exact effect* — this kind, this input, this key, in
+    /// this run scope — already commit?" (see
+    /// [`crate::effects::derive_effect_id`]). Receipts journaled before the
+    /// kernel (no `effect_id` on the wire) simply never match here and keep
+    /// being served by the key lookup — the two lookups coexist, the id
+    /// lookup strictly sharper.
+    pub fn find_effect_receipt_by_effect_id(
+        &self,
+        effect_id: &crate::effects::EffectId,
+    ) -> Option<EffectReceipt> {
+        self.receipts()
+            .find(|receipt| receipt.effect_id.as_deref() == Some(effect_id.as_str()))
+    }
+
+    /// Every well-formed receipt journaled in this snapshot, in sequence
+    /// order. Malformed receipt payloads (a hand-edited journal) are skipped
+    /// rather than fatal — integrity failures of the snapshot itself are
+    /// caught by [`Journal::from_snapshot`]'s hash check at load time.
+    fn receipts(&self) -> impl Iterator<Item = EffectReceipt> + '_ {
         self.events
             .iter()
             .filter(|event| event.kind == RunEventKind::EffectReceipt)
-            .find_map(|event| {
+            .filter_map(|event| {
                 let value = match event.output.as_ref()? {
                     PayloadRef::Inline(value) => value.clone(),
                     PayloadRef::Artifact(reference) => {
                         self.artifacts.get(&reference.sha256)?.clone()
                     }
                 };
-                let receipt: EffectReceipt = serde_json::from_value(value).ok()?;
-                (receipt.idempotency_key == idempotency_key).then_some(receipt)
+                serde_json::from_value(value).ok()
             })
     }
 }
@@ -723,6 +750,7 @@ mod tests {
             provider_id: "ch_3PKd".into(),
             idempotency_key: key.into(),
             task_id: Some("task-9".into()),
+            effect_id: None,
         }
     }
 
@@ -766,5 +794,43 @@ mod tests {
         j.record_effect_receipt(&receipt("k"), None);
         let event = j.events().pop().unwrap();
         assert_eq!(event.parent, None);
+    }
+
+    #[test]
+    fn effect_receipt_is_findable_by_effect_id() {
+        use crate::effects::derive_effect_id;
+
+        let j = journal();
+        // The recovery shape: the run re-derives the id of the effect it is
+        // about to perform; the journal answers with the committed receipt.
+        let committed = derive_effect_id(
+            "run-1",
+            "charge_card",
+            &sha256_hex(b"input"),
+            Some("run-1:charge:7"),
+        );
+        let mut with_id = receipt("run-1:charge:7");
+        with_id.effect_id = Some(committed.as_str().to_owned());
+        j.record_effect_receipt(&with_id, None);
+        // A pre-kernel receipt (no effect id) coexisting in the same journal.
+        j.record_effect_receipt(&receipt("run-1:legacy:1"), None);
+
+        let snapshot = j.snapshot();
+        assert_eq!(
+            snapshot.find_effect_receipt_by_effect_id(&committed),
+            Some(with_id)
+        );
+        // An uncommitted derivation finds nothing, and a legacy receipt
+        // without an effect id never matches the id lookup.
+        let other = derive_effect_id(
+            "run-1",
+            "charge_card",
+            &sha256_hex(b"input"),
+            Some("run-1:charge:8"),
+        );
+        assert_eq!(snapshot.find_effect_receipt_by_effect_id(&other), None);
+        assert!(snapshot
+            .find_effect_receipt_by_effect_id(&derive_effect_id("run-1", "legacy", "x", None))
+            .is_none());
     }
 }

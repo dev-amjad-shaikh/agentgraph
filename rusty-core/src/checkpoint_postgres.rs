@@ -536,6 +536,7 @@ mod tests {
             graph_hash: "5d41402abc4b2a76b9719d911017c592".into(),
             policy_version: Default::default(),
             logical_clock: 1_700_000_000_042,
+            manifest: None,
         };
         checkpoint.journal_ref = Some(JournalRef {
             events: 17,

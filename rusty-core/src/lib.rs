@@ -41,6 +41,12 @@
 //!   serde-versioned [`durable::TaskEnvelope`]. Queue, leases, and workers
 //!   live in `rusty-server` / `rusty-worker`; these are the pure contracts
 //!   both sides agree on.
+//! - **Effect kernel v2** ([`effects`], R0.7): the R0.5 [`record::Effect`]
+//!   taxonomy moved into the type system — marker traits declare an effect's
+//!   safety class at compile time, deterministic [`effects::EffectId`]s let
+//!   recovery ask whether an effect already committed, and irreversible
+//!   effects execute only behind an explicit [`effects::ApprovalToken`].
+//!   Opt-in: the untyped [`record::Effect`] path behaves exactly as before.
 //! - **Replay** ([`replay`]): exact replay of journaled runs — model, tool,
 //!   remote, and WASM calls are served from the journal instead of executed —
 //!   plus branch diffs between journal snapshots and portable
@@ -76,6 +82,7 @@ pub mod checkpoint;
 #[cfg(feature = "postgres")]
 pub mod checkpoint_postgres;
 pub mod durable;
+pub mod effects;
 pub mod error;
 pub mod executor;
 pub mod graph;
@@ -103,6 +110,12 @@ pub mod prelude {
         backoff_delay_ms, classify_retry, ArtifactContract, ErrorClass, RetryDecision, TaskBudget,
         TaskEnvelope, BASE_RETRY_DELAY_MS, MAX_RETRY_DELAY_MS, TASK_ENVELOPE_FORMAT_VERSION,
     };
+    pub use crate::effects::{
+        admit_compensatable, admit_irreversible, admit_retry, admit_speculation, derive_effect_id,
+        ApprovalToken, CompensatableEffect, CompensationHandler, CompensationRegistry, EffectId,
+        EffectViolation, IdempotentEffect, IrreversibleEffect, PureEffect, ReadOnlyEffect,
+        TypedEffect, EFFECT_ID_DOMAIN,
+    };
     pub use crate::error::{Result, RustyError};
     pub use crate::executor::{ExecutionOutcome, Executor, GraphEvent, RunConfig};
     pub use crate::graph::{ConditionalRouter, Edge, Graph, GraphBuilder, Route, Send};
@@ -118,9 +131,9 @@ pub mod prelude {
         create_react_agent_with_recording,
     };
     pub use crate::record::{
-        ArtifactRef, CheckpointHeader, DecisionAction, DecisionEvent, DecisionFamily,
-        DecisionOutcome, Effect, EffectReceipt, EventStatus, JournalRef, PayloadRef, PolicyVersion,
-        RunEvent, RunEventKind, CURRENT_FORMAT_VERSION,
+        ArtifactRef, CapsuleVersion, CheckpointHeader, DecisionAction, DecisionEvent,
+        DecisionFamily, DecisionOutcome, Effect, EffectReceipt, EventStatus, JournalRef,
+        PayloadRef, PolicyVersion, RunEvent, RunEventKind, RunManifest, CURRENT_FORMAT_VERSION,
     };
     pub use crate::replay::{
         BranchDiff, BranchTotals, ChannelDiff, ExactReplay, FixtureMetadata, LogicalClockParams,

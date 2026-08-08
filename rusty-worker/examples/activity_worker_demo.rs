@@ -161,6 +161,7 @@ impl Activity for FileProvider {
             provider_id,
             idempotency_key: key.clone(),
             task_id: Some(ctx.task_id().to_owned()),
+            effect_id: None,
         };
 
         // Dedupe: the effect already landed for this key — answer the stored

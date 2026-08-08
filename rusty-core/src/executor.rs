@@ -58,7 +58,8 @@ use crate::graph::{Edge, Graph, Route};
 use crate::journal::{Clock, EventDraft, Journal, RngSource};
 use crate::node::{Command, NodeConfig, NodeContext, NodeOutput};
 use crate::record::{
-    CheckpointHeader, Effect, EventStatus, PolicyVersion, RunEventKind, CURRENT_FORMAT_VERSION,
+    CheckpointHeader, Effect, EventStatus, PolicyVersion, RunEventKind, RunManifest,
+    CURRENT_FORMAT_VERSION,
 };
 use crate::state::{State, StateSpec};
 
@@ -208,6 +209,25 @@ pub struct RunConfig {
     /// in-flight run parks itself at a resumable checkpoint instead of being
     /// torn down mid-step.
     pub cancellation: Option<CancellationToken>,
+
+    /// Effect kernel v2 (R0.7): the versioned run manifest — prompts, tool
+    /// schemas, model and parameters, memory schema, capsule versions the run
+    /// pins. Stamped into every checkpoint header so a resumed run keeps
+    /// executing against its pinned versions (see
+    /// [`crate::record::RunManifest`] for the upgrade-safety contract).
+    /// `None` (the default) pins nothing and leaves checkpoint bytes
+    /// byte-identical to R0.5/R0.6.
+    pub manifest: Option<RunManifest>,
+
+    /// Effect kernel v2 (R0.7): the approval tokens this run carries for its
+    /// irreversible effects (see [`crate::effects::ApprovalToken`]). The
+    /// executor does not consult them yet — admission enforcement in
+    /// node/tool dispatch is a later wave; the field is the extension point
+    /// that lets the approval set travel with the run's configuration from
+    /// the start, so approvals gathered at submission time are in place when
+    /// enforcement lands. Empty by default; runs that execute no
+    /// irreversible effects need nothing here.
+    pub effect_approvals: Vec<crate::effects::ApprovalToken>,
 }
 
 impl Default for RunConfig {
@@ -235,6 +255,8 @@ impl RunConfig {
             policy_version: None,
             graph_version: None,
             cancellation: None,
+            manifest: None,
+            effect_approvals: Vec::new(),
         }
     }
 
@@ -308,6 +330,23 @@ impl RunConfig {
     /// resumable from exactly that checkpoint with [`RustyError::Cancelled`].
     pub fn with_cancellation(mut self, token: CancellationToken) -> Self {
         self.cancellation = Some(token);
+        self
+    }
+
+    /// Builder-style: pin the run's versioned manifest into every checkpoint
+    /// header (see the [`RunConfig::manifest`] field docs).
+    pub fn with_manifest(mut self, manifest: RunManifest) -> Self {
+        self.manifest = Some(manifest);
+        self
+    }
+
+    /// Builder-style: carry approval tokens for the run's irreversible
+    /// effects (see the [`RunConfig::effect_approvals`] field docs).
+    pub fn with_effect_approvals(
+        mut self,
+        approvals: impl IntoIterator<Item = crate::effects::ApprovalToken>,
+    ) -> Self {
+        self.effect_approvals = approvals.into_iter().collect();
         self
     }
 
@@ -561,6 +600,7 @@ impl Executor {
                 .unwrap_or_else(|| "unversioned".to_owned()),
             graph_hash: graph.topology_hash(),
             policy_version: config.policy_version.clone().unwrap_or_default(),
+            manifest: config.manifest.clone(),
             journal: journal.clone(),
         };
         // Publish before the loop: evidence of a failed or suspended run is
@@ -1189,6 +1229,7 @@ struct Recorder {
     graph_version: String,
     graph_hash: String,
     policy_version: PolicyVersion,
+    manifest: Option<RunManifest>,
 }
 
 impl Recorder {
@@ -1223,6 +1264,7 @@ impl Recorder {
                 graph_hash: self.graph_hash.clone(),
                 policy_version: self.policy_version.clone(),
                 logical_clock: self.clock.now_ms(),
+                manifest: self.manifest.clone(),
             },
             journal_ref: Some(self.journal.head_ref()),
         }

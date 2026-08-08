@@ -30,9 +30,9 @@ use rusty_agent_runtime::journal::{Clock, EventDraft, Journal, RngSource, PARENT
 use rusty_agent_runtime::llm::{ChatMessage, ChatModel, ChatResponse, Usage};
 use rusty_agent_runtime::node::{NodeContext, NodeOutput};
 use rusty_agent_runtime::record::{
-    ArtifactRef, CheckpointHeader, DecisionAction, DecisionEvent, DecisionFamily, DecisionOutcome,
-    Effect, EffectReceipt, EventStatus, PayloadRef, PolicyVersion, RunEvent, RunEventKind,
-    CURRENT_FORMAT_VERSION,
+    ArtifactRef, CapsuleVersion, CheckpointHeader, DecisionAction, DecisionEvent, DecisionFamily,
+    DecisionOutcome, Effect, EffectReceipt, EventStatus, PayloadRef, PolicyVersion, RunEvent,
+    RunEventKind, RunManifest, CURRENT_FORMAT_VERSION,
 };
 use rusty_agent_runtime::state::{Reducer, State, StateSpec};
 use rusty_agent_runtime::tool::Tool;
@@ -157,8 +157,61 @@ fn golden_checkpoint_header_shape() {
             graph_hash: "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae".into(),
             policy_version: PolicyVersion::new("static-v0"),
             logical_clock: 1_750_000_000_000,
+            // R0.7: no manifest pinned — the serialized shape must stay
+            // byte-identical to the R0.5 golden (additive evolution).
+            manifest: None,
         },
     );
+}
+
+/// The R0.7 versioned run manifest, fully pinned: prompts, tool schemas,
+/// model + parameters, memory schema, and capsule versions.
+fn sample_run_manifest() -> RunManifest {
+    RunManifest::new()
+        .pin_prompt("system", "You are a careful research agent.")
+        .pin_tool_schema(
+            "search",
+            &json!({"type": "object", "properties": {"query": {"type": "string"}}}),
+        )
+        .pin_model(
+            "gpt-5.2-2026-06-01",
+            &json!({"temperature": 0, "seed": 42, "max_tokens": 512}),
+        )
+        .with_memory_schema("memory-v1")
+        .pin_capsule("researcher", CapsuleVersion::new("1.4.0"))
+}
+
+#[test]
+fn golden_run_manifest_shape() {
+    assert_golden("run_manifest.json", &sample_run_manifest());
+}
+
+#[test]
+fn golden_checkpoint_header_with_manifest_shape() {
+    // The extended header: the R0.5 fields unchanged, plus the pinned
+    // manifest. This is the wire shape R0.7 checkpoints carry.
+    assert_golden(
+        "checkpoint_header_manifest.json",
+        &CheckpointHeader {
+            format_version: CURRENT_FORMAT_VERSION,
+            graph_version: "react-v3".into(),
+            graph_hash: "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae".into(),
+            policy_version: PolicyVersion::new("static-v0"),
+            logical_clock: 1_750_000_000_000,
+            manifest: Some(sample_run_manifest()),
+        },
+    );
+}
+
+/// Old headers deserialize into the extended header: the R0.5 golden file
+/// doubles as the pre-R0.7 fixture.
+#[test]
+fn r05_golden_header_deserializes_with_no_manifest() {
+    let bytes = std::fs::read_to_string(golden_path("checkpoint_header.json")).unwrap();
+    let header: CheckpointHeader = serde_json::from_str(&bytes)
+        .expect("the R0.5 golden header must deserialize into the extended header");
+    assert_eq!(header.manifest, None);
+    assert_eq!(header.format_version, CURRENT_FORMAT_VERSION);
 }
 
 /// The receipt an `Idempotent` effect's recipient journals (R0.6 wave 2b):
@@ -169,6 +222,9 @@ fn sample_effect_receipt() -> EffectReceipt {
         provider_id: "ch_3PKdY2eZvKYlo2C0".into(),
         idempotency_key: "019157c4-6f1f-7a3b-8c2d-9e4f5a6b7c8d:charge:7".into(),
         task_id: Some("task-019157c5".into()),
+        // R0.7 effect id unset: the receipt golden must stay byte-identical
+        // to the R0.6 shape (additive evolution).
+        effect_id: None,
     }
 }
 
@@ -456,6 +512,57 @@ async fn journal_records_ordered_causally_linked_classified_events() {
         history[1].journal_ref.as_ref().unwrap().events
             > history[0].journal_ref.as_ref().unwrap().events
     );
+}
+
+#[tokio::test]
+async fn run_manifest_is_stamped_into_every_checkpoint_header() {
+    let checkpointer = Arc::new(InMemoryCheckpointer::new());
+    let executor = Executor::with_checkpointer(checkpointer.clone());
+
+    let journal = Journal::new("run-manifest", "t-manifest", Clock::System);
+    let (graph, spec) = model_tool_graph(&journal);
+    let manifest = sample_run_manifest();
+
+    let outcome = executor
+        .run(
+            &graph,
+            &spec,
+            State::new(),
+            RunConfig::new("t-manifest")
+                .with_journal(journal)
+                .with_manifest(manifest.clone()),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, ExecutionOutcome::Done(_)));
+
+    // Every boundary checkpoint of the run carries the pinned manifest,
+    // alongside the R0.5 provenance it extends.
+    let history = checkpointer.list("t-manifest").await.unwrap();
+    assert!(!history.is_empty());
+    for checkpoint in &history {
+        assert_eq!(checkpoint.header.manifest.as_ref(), Some(&manifest));
+        assert_eq!(checkpoint.header.format_version, CURRENT_FORMAT_VERSION);
+        assert_eq!(checkpoint.header.graph_hash, graph.topology_hash());
+    }
+
+    // A run that pins nothing stamps no manifest — and its serialized
+    // checkpoints carry no `manifest` key at all (no churn for old shapes).
+    let plain_journal = Journal::new("run-plain", "t-plain", Clock::System);
+    let (plain_graph, plain_spec) = model_tool_graph(&plain_journal);
+    executor
+        .run(
+            &plain_graph,
+            &plain_spec,
+            State::new(),
+            RunConfig::new("t-plain").with_journal(plain_journal),
+        )
+        .await
+        .unwrap();
+    let plain = checkpointer.get_latest("t-plain").await.unwrap().unwrap();
+    assert_eq!(plain.header.manifest, None);
+    let wire = serde_json::to_value(&plain.header).unwrap();
+    assert!(wire.get("manifest").is_none());
 }
 
 #[tokio::test]

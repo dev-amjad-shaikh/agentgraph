@@ -1146,6 +1146,10 @@ mod tests {
                         provider_id: "ch_3PKd".into(),
                         idempotency_key: ctx.idempotency_key().unwrap_or_default().to_owned(),
                         task_id: Some(ctx.task_id().to_owned()),
+                        // R0.7: the typed-kernel effect id is unset on this
+                        // pre-kernel receipt path; the idempotency-key lookup
+                        // keeps serving it.
+                        effect_id: None,
                     }),
                 })
             }
@@ -1185,6 +1189,10 @@ mod tests {
                         provider_id: "ch_arc".into(),
                         idempotency_key: ctx.idempotency_key().unwrap_or_default().to_owned(),
                         task_id: Some(ctx.task_id().to_owned()),
+                        // R0.7: the typed-kernel effect id is unset on this
+                        // pre-kernel receipt path; the idempotency-key lookup
+                        // keeps serving it.
+                        effect_id: None,
                     }),
                 })
             }
@@ -1383,6 +1391,7 @@ mod tests {
             provider_id: "ch_3PKd".into(),
             idempotency_key: "run-9:charge:7".into(),
             task_id: Some("t-1".into()),
+            effect_id: None,
         };
         let complete = CompleteRequest {
             worker_id: "w-1",
