@@ -6,7 +6,7 @@
 //! - `POST /tasks/claim` `{worker_id, pools?, lease_ms}` →
 //!   `200 {"task": {task record}}` | `204`
 //! - `POST /tasks/{id}/heartbeat` `{worker_id, lease_ms}` →
-//!   `200 {lease_expires_at}` | `409`
+//!   `200 {lease_expires_at, cancel_requested}` | `409`
 //! - `POST /tasks/{id}/complete` `{worker_id, result}` → `200 {task}` | `409`
 //! - `POST /tasks/{id}/fail` `{worker_id, error_class, message, retryable}`
 //!   → `200 {requeued, next_attempt_at, dead}` | `409`
@@ -54,6 +54,9 @@ struct MockState {
     heartbeat_counts: HashMap<String, usize>,
     /// If set, heartbeats beyond this count answer `409` (lease lost).
     heartbeat_conflict_after: Option<usize>,
+    /// If set, heartbeats beyond this count answer `200` carrying
+    /// `cancel_requested: true` (control-plane cancellation).
+    heartbeat_cancel_requested_after: Option<usize>,
 }
 
 /// A snapshot of the calls recorded so far (cloned, so no lock is held
@@ -84,6 +87,8 @@ fn task_record(id: &str, kind: &str, payload: Value, owner: &str) -> Value {
         "result": null,
         "run_id": "run-1",
         "thread_id": "thread-1",
+        "cancel_requested": false,
+        "deadline": null,
         "lease": {"owner": owner, "expires_at": "2026-08-07T12:00:30Z"},
         "next_attempt_at": null,
         "created_at": "2026-08-07T12:00:00Z",
@@ -127,12 +132,18 @@ async fn heartbeat_handler(
     let conflict = state
         .heartbeat_conflict_after
         .is_some_and(|after| count > after);
+    let cancel_requested = state
+        .heartbeat_cancel_requested_after
+        .is_some_and(|after| count > after);
     if conflict {
         StatusCode::CONFLICT.into_response()
     } else {
         (
             StatusCode::OK,
-            Json(json!({"lease_expires_at": "2026-08-07T12:00:30Z"})),
+            Json(json!({
+                "lease_expires_at": "2026-08-07T12:00:30Z",
+                "cancel_requested": cancel_requested,
+            })),
         )
             .into_response()
     }
@@ -677,6 +688,162 @@ async fn undecodable_claim_body_is_not_settled_and_polling_continues() {
 
     let calls = recorded(&state);
     assert!(calls.iter().all(|c| c.path == "/tasks/claim"));
+
+    stop_worker(shutdown, handle).await;
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation propagation (R0.6 wave 2a)
+
+#[tokio::test]
+async fn cancel_requested_on_heartbeat_aborts_and_reports_cancelled() {
+    let state = Arc::new(Mutex::new(MockState {
+        // First heartbeat renews; subsequent ones carry the cancel hint.
+        heartbeat_cancel_requested_after: Some(1),
+        ..MockState::default()
+    }));
+    state
+        .lock()
+        .unwrap()
+        .tasks
+        .push_back(task_record("task-8", "stuck", json!({}), ""));
+    let base_url = start_mock(state.clone()).await;
+
+    let aborted = Arc::new(AtomicBool::new(false));
+    let probe = aborted.clone();
+    let worker = test_worker(&base_url).register("stuck", move |_ctx: ActivityContext| {
+        let probe = probe.clone();
+        async move {
+            let _guard = AbortProbe(probe);
+            let () = std::future::pending().await;
+            #[allow(unreachable_code)]
+            Ok(Value::Null)
+        }
+    });
+
+    let shutdown = CancellationToken::new();
+    let handle = spawn_worker(worker, shutdown.clone());
+
+    // The handler future is really dropped (not detached)...
+    wait_for("handler abort", Duration::from_secs(5), || {
+        aborted.load(Ordering::SeqCst)
+    })
+    .await;
+    // ...and promptly: the abort follows the second heartbeat (~66 ms of
+    // a 100 ms lease), not the lease's expiry.
+    wait_for("cancelled fail call", Duration::from_secs(5), || {
+        !calls_to(&recorded(&state), "/tasks/task-8/fail").is_empty()
+    })
+    .await;
+
+    let calls = recorded(&state);
+    // Unlike lease loss, a cancelled attempt is settled through the fail
+    // path while the worker still holds the lease: error_class cancelled,
+    // never retryable (the server maps it to terminal-cancelled, not DLQ).
+    let fail = calls_to(&calls, "/tasks/task-8/fail")[0];
+    assert_eq!(fail.body["worker_id"], json!("w-test"));
+    assert_eq!(fail.body["error_class"], json!("cancelled"));
+    assert_eq!(fail.body["retryable"], json!(false));
+    assert!(calls_to(&calls, "/tasks/task-8/complete").is_empty());
+
+    stop_worker(shutdown, handle).await;
+}
+
+#[tokio::test]
+async fn deadline_already_passed_reports_cancelled_without_running() {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let mut task = task_record("task-10", "late", json!({}), "");
+    task["deadline"] = json!("2020-01-01T00:00:00Z");
+    state.lock().unwrap().tasks.push_back(task);
+    let base_url = start_mock(state.clone()).await;
+
+    let started = Arc::new(AtomicBool::new(false));
+    let flag = started.clone();
+    let worker = test_worker(&base_url).register("late", move |_ctx: ActivityContext| {
+        let flag = flag.clone();
+        async move {
+            flag.store(true, Ordering::SeqCst);
+            Ok(Value::Null)
+        }
+    });
+
+    let shutdown = CancellationToken::new();
+    let handle = spawn_worker(worker, shutdown.clone());
+
+    wait_for("cancelled fail call", Duration::from_secs(5), || {
+        !calls_to(&recorded(&state), "/tasks/task-10/fail").is_empty()
+    })
+    .await;
+
+    let calls = recorded(&state);
+    let fail = calls_to(&calls, "/tasks/task-10/fail")[0];
+    assert_eq!(fail.body["error_class"], json!("cancelled"));
+    assert_eq!(fail.body["retryable"], json!(false));
+    assert!(
+        fail.body["message"]
+            .as_str()
+            .unwrap()
+            .contains("deadline already passed"),
+        "unexpected message: {}",
+        fail.body["message"]
+    );
+    // The handler never ran, and no heartbeats were needed.
+    assert!(!started.load(Ordering::SeqCst));
+    assert!(calls_to(&calls, "/tasks/task-10/heartbeat").is_empty());
+    assert!(calls_to(&calls, "/tasks/task-10/complete").is_empty());
+
+    stop_worker(shutdown, handle).await;
+}
+
+#[tokio::test]
+async fn deadline_expiring_mid_attempt_aborts_and_reports_cancelled() {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let mut task = task_record("task-11", "slow", json!({}), "");
+    // 300 ms of headroom: long enough to start, far short of the handler.
+    let deadline = chrono::Utc::now() + chrono::Duration::milliseconds(300);
+    task["deadline"] = json!(deadline.to_rfc3339());
+    state.lock().unwrap().tasks.push_back(task);
+    let base_url = start_mock(state.clone()).await;
+
+    let aborted = Arc::new(AtomicBool::new(false));
+    let probe = aborted.clone();
+    let worker = test_worker(&base_url).register("slow", move |_ctx: ActivityContext| {
+        let probe = probe.clone();
+        async move {
+            let _guard = AbortProbe(probe);
+            let () = std::future::pending().await;
+            #[allow(unreachable_code)]
+            Ok(Value::Null)
+        }
+    });
+
+    let shutdown = CancellationToken::new();
+    let handle = spawn_worker(worker, shutdown.clone());
+
+    wait_for(
+        "handler abort at the deadline",
+        Duration::from_secs(5),
+        || aborted.load(Ordering::SeqCst),
+    )
+    .await;
+    wait_for("cancelled fail call", Duration::from_secs(5), || {
+        !calls_to(&recorded(&state), "/tasks/task-11/fail").is_empty()
+    })
+    .await;
+
+    let calls = recorded(&state);
+    let fail = calls_to(&calls, "/tasks/task-11/fail")[0];
+    assert_eq!(fail.body["error_class"], json!("cancelled"));
+    assert_eq!(fail.body["retryable"], json!(false));
+    assert!(
+        fail.body["message"]
+            .as_str()
+            .unwrap()
+            .contains("deadline expired mid-attempt"),
+        "unexpected message: {}",
+        fail.body["message"]
+    );
+    assert!(calls_to(&calls, "/tasks/task-11/complete").is_empty());
 
     stop_worker(shutdown, handle).await;
 }

@@ -31,7 +31,7 @@ use crate::assistants::{self, AssistantRecord};
 use crate::crons::{self, CronRecord};
 use crate::journals;
 use crate::store::{self, StoreItem};
-use crate::tasks::{self, MutationOutcome, TaskRecord, TaskStatus};
+use crate::tasks::{self, CancelOutcome, MutationOutcome, RunCancellation, TaskRecord, TaskStatus};
 use crate::threads::{self, ThreadRecord};
 
 /// Store operation result. The `String` payload is a 500-class internal
@@ -156,6 +156,28 @@ pub(crate) trait ServerStore: Send + Sync {
         tenant: &str,
         status: Option<TaskStatus>,
     ) -> StoreResult<Vec<TaskRecord>>;
+    /// Cancel a non-terminal task (control-plane operation, not
+    /// lease-guarded): queued and retry-scheduled tasks move to the
+    /// terminal `cancelled` state immediately; a leased task keeps its
+    /// lease with `cancel_requested` set, so the holder learns on its next
+    /// heartbeat. Terminal tasks answer [`CancelOutcome::Terminal`].
+    async fn cancel_task(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<CancelOutcome>;
+    /// Cancel every non-terminal task of one run (tenant-scoped), the
+    /// run-level propagation of `POST /runs/{run_id}/cancel`. Applies the
+    /// same two transitions as [`ServerStore::cancel_task`] and returns
+    /// both sets so the route can report what was finalized versus
+    /// signalled.
+    async fn cancel_run_tasks(
+        &self,
+        tenant: &str,
+        run_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<RunCancellation>;
 }
 
 // --------------------------------------------------------------------- //
@@ -359,6 +381,25 @@ impl ServerStore for JsonFileStore {
         now: chrono::DateTime<chrono::Utc>,
     ) -> StoreResult<Option<TaskRecord>> {
         let mut map = self.tasks.lock().await;
+        // Finalize before handing out work: a cancel request the lease
+        // holder never acknowledged, or a whole-task deadline that has
+        // passed, turns the task terminal-cancelled — never re-leased.
+        let due: Vec<String> = map
+            .values()
+            .filter(|t| t.tenant == tenant && t.cancellation_due(now))
+            .map(|t| t.task_id.clone())
+            .collect();
+        for task_id in due {
+            let mut task = map
+                .get(&task_id)
+                .cloned()
+                .expect("finalization candidate came from the task index");
+            task.apply_cancellation(now);
+            tasks::persist(&self.root, &task)
+                .await
+                .map_err(io_err("persist task"))?;
+            map.insert(task_id, task);
+        }
         // The whole claim (pick + mutate + persist) runs under the one
         // index lock, so two concurrent claims can never take the same
         // task — the file backend's SKIP LOCKED equivalent.
@@ -460,6 +501,64 @@ impl ServerStore for JsonFileStore {
         });
         Ok(tasks)
     }
+
+    async fn cancel_task(
+        &self,
+        tenant: &str,
+        task_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<CancelOutcome> {
+        let mut map = self.tasks.lock().await;
+        let Some(current) = map.get(task_id) else {
+            return Ok(CancelOutcome::Unknown);
+        };
+        // Cross-tenant ids are indistinguishable from unknown ones (404).
+        if current.tenant != tenant {
+            return Ok(CancelOutcome::Unknown);
+        }
+        let mut task = current.clone();
+        let Some(_transition) = task.cancel(now) else {
+            return Ok(CancelOutcome::Terminal(task.status));
+        };
+        tasks::persist(&self.root, &task)
+            .await
+            .map_err(io_err("persist task"))?;
+        map.insert(task_id.to_string(), task.clone());
+        Ok(CancelOutcome::Applied(Box::new(task)))
+    }
+
+    async fn cancel_run_tasks(
+        &self,
+        tenant: &str,
+        run_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<RunCancellation> {
+        let mut map = self.tasks.lock().await;
+        let targets: Vec<String> = map
+            .values()
+            .filter(|t| t.tenant == tenant && t.run_id.as_deref() == Some(run_id))
+            .map(|t| t.task_id.clone())
+            .collect();
+        let mut outcome = RunCancellation::default();
+        for task_id in targets {
+            let mut task = map
+                .get(&task_id)
+                .cloned()
+                .expect("cancel target came from the task index");
+            let Some(transition) = task.cancel(now) else {
+                continue; // already terminal: nothing to propagate
+            };
+            tasks::persist(&self.root, &task)
+                .await
+                .map_err(io_err("persist task"))?;
+            map.insert(task_id, task.clone());
+            match transition {
+                tasks::CancelTransition::Cancelled => outcome.cancelled.push(task),
+                tasks::CancelTransition::Signalled => outcome.signalled.push(task),
+            }
+        }
+        Ok(outcome)
+    }
 }
 
 impl JsonFileStore {
@@ -511,7 +610,9 @@ mod postgres {
     use crate::assistants::AssistantRecord;
     use crate::crons::CronRecord;
     use crate::store::StoreItem;
-    use crate::tasks::{self, MutationOutcome, TaskLease, TaskRecord, TaskStatus};
+    use crate::tasks::{
+        self, CancelOutcome, MutationOutcome, RunCancellation, TaskLease, TaskRecord, TaskStatus,
+    };
     use crate::threads::ThreadRecord;
 
     // -- Schema (auto-migrated on connect) ------------------------------ //
@@ -586,6 +687,8 @@ mod postgres {
             result           JSONB,
             run_id           TEXT,
             thread_id        TEXT,
+            cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
+            deadline         TIMESTAMPTZ,
             next_attempt_at  TIMESTAMPTZ,
             created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -603,6 +706,19 @@ mod postgres {
         CREATE INDEX IF NOT EXISTS server_tasks_claimable
             ON server_tasks (tenant, pool, status)";
 
+    /// Wave-2 additive columns for databases whose `server_tasks` predates
+    /// cancellation propagation (fresh databases get them from
+    /// [`CREATE_TASKS_SQL`]; `ADD COLUMN IF NOT EXISTS` makes both paths
+    /// converge without a versioned migration table).
+    pub(crate) const ALTER_TASKS_ADD_CANCEL_REQUESTED_SQL: &str = "
+        ALTER TABLE server_tasks
+            ADD COLUMN IF NOT EXISTS cancel_requested BOOLEAN NOT NULL DEFAULT FALSE";
+
+    /// See [`ALTER_TASKS_ADD_CANCEL_REQUESTED_SQL`].
+    pub(crate) const ALTER_TASKS_ADD_DEADLINE_SQL: &str = "
+        ALTER TABLE server_tasks
+            ADD COLUMN IF NOT EXISTS deadline TIMESTAMPTZ";
+
     /// All idempotent migration statements, executed in order on connect.
     pub(crate) const MIGRATION_SQL: &[&str] = &[
         CREATE_ASSISTANTS_SQL,
@@ -613,6 +729,8 @@ mod postgres {
         CREATE_TASKS_SQL,
         CREATE_TASKS_IDEMPOTENCY_INDEX_SQL,
         CREATE_TASKS_CLAIMABLE_INDEX_SQL,
+        ALTER_TASKS_ADD_CANCEL_REQUESTED_SQL,
+        ALTER_TASKS_ADD_DEADLINE_SQL,
     ];
 
     /// Transaction-scoped advisory lock key serializing concurrent
@@ -708,9 +826,9 @@ mod postgres {
         INSERT INTO server_tasks (
             task_id, tenant, kind, payload, pool, status,
             attempt, max_attempts, error_class, effect, idempotency_key,
-            run_id, thread_id, next_attempt_at, created_at, updated_at
+            run_id, thread_id, deadline, next_attempt_at, created_at, updated_at
         ) VALUES (
-            $1, $2, $3, $4, $5, 'queued', 0, $6, NULL, $7, $8, $9, $10, NULL, $11, $11
+            $1, $2, $3, $4, $5, 'queued', 0, $6, NULL, $7, $8, $9, $10, $11, NULL, $12, $12
         )
         ON CONFLICT DO NOTHING
         RETURNING task_id";
@@ -719,9 +837,27 @@ mod postgres {
     pub(crate) const SELECT_TASK_BY_IDEMPOTENCY_SQL: &str = "
         SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, next_attempt_at, created_at, updated_at
+            run_id, thread_id, cancel_requested, deadline, next_attempt_at, created_at, updated_at
         FROM server_tasks
         WHERE tenant = $1 AND idempotency_key = $2";
+
+    /// Claim finalization, run before [`CLAIM_SELECT_SQL`] in the same
+    /// transaction: a cancel request the lease holder never acknowledged
+    /// (its lease lapsed) or a whole-task deadline that has passed makes
+    /// the task terminal-cancelled instead of re-leasable. Leased tasks
+    /// with a live lease are the worker's concern (it reports the
+    /// expired deadline as cancelled through the fail path).
+    pub(crate) const CLAIM_FINALIZE_SQL: &str = "
+        UPDATE server_tasks
+        SET status = 'cancelled', error_class = 'cancelled', lease_owner = NULL,
+            lease_expires_at = NULL, next_attempt_at = NULL, updated_at = $2
+        WHERE tenant = $1
+          AND (cancel_requested OR (deadline IS NOT NULL AND deadline <= $2))
+          AND (
+              status = 'queued'
+              OR (status = 'failed' AND next_attempt_at IS NOT NULL AND next_attempt_at <= $2)
+              OR (status = 'leased' AND lease_expires_at <= $2)
+          )";
 
     /// Claim candidate selection, run inside a transaction: `FOR UPDATE
     /// SKIP LOCKED` makes concurrent workers take distinct tasks without
@@ -749,18 +885,19 @@ mod postgres {
         WHERE task_id = $1
         RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, next_attempt_at, created_at, updated_at";
+            run_id, thread_id, cancel_requested, deadline, next_attempt_at, created_at, updated_at";
 
     /// Heartbeat: extends the lease only while the caller holds it. No row
     /// means unknown/cross-tenant (404) or lease lost (409), distinguished
-    /// by [`TASK_EXISTS_SQL`].
+    /// by [`TASK_EXISTS_SQL`]. The returned row carries `cancel_requested`
+    /// so the route can surface a pending cancellation to the holder.
     pub(crate) const HEARTBEAT_TASK_SQL: &str = "
         UPDATE server_tasks
         SET lease_expires_at = $4, updated_at = $5
         WHERE task_id = $1 AND tenant = $2 AND lease_owner = $3 AND status = 'leased'
         RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, next_attempt_at, created_at, updated_at";
+            run_id, thread_id, cancel_requested, deadline, next_attempt_at, created_at, updated_at";
 
     /// Complete: settle only the caller's own lease.
     pub(crate) const COMPLETE_TASK_SQL: &str = "
@@ -770,14 +907,14 @@ mod postgres {
         WHERE task_id = $1 AND tenant = $2 AND lease_owner = $3 AND status = 'leased'
         RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, next_attempt_at, created_at, updated_at";
+            run_id, thread_id, cancel_requested, deadline, next_attempt_at, created_at, updated_at";
 
     /// Fail, step 1: lock the row (the requeue-vs-dead decision needs the
     /// current attempt count, and concurrent settlement must serialize).
     pub(crate) const FAIL_SELECT_SQL: &str = "
         SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, next_attempt_at, created_at, updated_at
+            run_id, thread_id, cancel_requested, deadline, next_attempt_at, created_at, updated_at
         FROM server_tasks
         WHERE task_id = $1 AND tenant = $2
         FOR UPDATE";
@@ -792,7 +929,54 @@ mod postgres {
         WHERE task_id = $1
         RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, next_attempt_at, created_at, updated_at";
+            run_id, thread_id, cancel_requested, deadline, next_attempt_at, created_at, updated_at";
+
+    /// Cancel, step 1: lock the row (the terminal check and the transition
+    /// must serialize against claims and settlements).
+    pub(crate) const CANCEL_SELECT_SQL: &str = "
+        SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
+            attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
+            run_id, thread_id, cancel_requested, deadline, next_attempt_at, created_at, updated_at
+        FROM server_tasks
+        WHERE task_id = $1 AND tenant = $2
+        FOR UPDATE";
+
+    /// Cancel, step 2: apply the transition computed in Rust
+    /// ([`crate::tasks::TaskRecord::cancel`]) to the locked row. The lease
+    /// columns are bound from the mutated record — cleared for the
+    /// immediate transition, kept for the signal-a-leased-holder one.
+    pub(crate) const CANCEL_UPDATE_SQL: &str = "
+        UPDATE server_tasks
+        SET status = $2, error_class = $3, cancel_requested = $4,
+            lease_owner = $5, lease_expires_at = $6,
+            next_attempt_at = $7, updated_at = $8
+        WHERE task_id = $1
+        RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
+            attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
+            run_id, thread_id, cancel_requested, deadline, next_attempt_at, created_at, updated_at";
+
+    /// Run cancel, part 1: the run's non-leased, non-terminal tasks move to
+    /// the terminal `cancelled` state immediately.
+    pub(crate) const CANCEL_RUN_FINALIZE_SQL: &str = "
+        UPDATE server_tasks
+        SET status = 'cancelled', error_class = 'cancelled', lease_owner = NULL,
+            lease_expires_at = NULL, next_attempt_at = NULL, updated_at = $3
+        WHERE tenant = $1 AND run_id = $2
+          AND (status = 'queued' OR (status = 'failed' AND next_attempt_at IS NOT NULL))
+        RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
+            attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
+            run_id, thread_id, cancel_requested, deadline, next_attempt_at, created_at, updated_at";
+
+    /// Run cancel, part 2: the run's leased tasks keep their leases and
+    /// get `cancel_requested` set — their holders learn on the next
+    /// heartbeat and report the attempt as cancelled.
+    pub(crate) const CANCEL_RUN_SIGNAL_SQL: &str = "
+        UPDATE server_tasks
+        SET cancel_requested = TRUE, updated_at = $3
+        WHERE tenant = $1 AND run_id = $2 AND status = 'leased'
+        RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
+            attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
+            run_id, thread_id, cancel_requested, deadline, next_attempt_at, created_at, updated_at";
 
     /// Tenant-scoped existence probe distinguishing 404 from 409 after a
     /// lease-guarded update matched no row.
@@ -802,20 +986,20 @@ mod postgres {
     pub(crate) const SELECT_TASK_SQL: &str =
         "SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, next_attempt_at, created_at, updated_at
+            run_id, thread_id, cancel_requested, deadline, next_attempt_at, created_at, updated_at
         FROM server_tasks WHERE task_id = $1 AND tenant = $2";
 
     pub(crate) const LIST_TASKS_SQL: &str = "
         SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, next_attempt_at, created_at, updated_at
+            run_id, thread_id, cancel_requested, deadline, next_attempt_at, created_at, updated_at
         FROM server_tasks
         WHERE tenant = $1 ORDER BY created_at, task_id";
 
     pub(crate) const LIST_TASKS_BY_STATUS_SQL: &str = "
         SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, next_attempt_at, created_at, updated_at
+            run_id, thread_id, cancel_requested, deadline, next_attempt_at, created_at, updated_at
         FROM server_tasks
         WHERE tenant = $1 AND status = $2 ORDER BY created_at, task_id";
 
@@ -900,6 +1084,8 @@ mod postgres {
             result: row.get("result"),
             run_id: row.get("run_id"),
             thread_id: row.get("thread_id"),
+            cancel_requested: row.get("cancel_requested"),
+            deadline: row.get("deadline"),
             next_attempt_at: row.get("next_attempt_at"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
@@ -1180,6 +1366,7 @@ mod postgres {
                 .bind(&record.idempotency_key)
                 .bind(&record.run_id)
                 .bind(&record.thread_id)
+                .bind(record.deadline)
                 .bind(record.created_at)
                 .fetch_optional(self.pool().await?)
                 .await
@@ -1222,6 +1409,16 @@ mod postgres {
             // concurrent workers claim distinct tasks; the row lock holds
             // until the claim commits, so no two workers ever take one task.
             let mut tx = pool.begin().await.map_err(db_err("claim task"))?;
+            // Finalize cancel requests the holder never acknowledged and
+            // elapsed whole-task deadlines before handing out work — such
+            // tasks are cancelled, never re-leased (mirrors the file
+            // backend's sweep, same record rule).
+            sqlx::query(CLAIM_FINALIZE_SQL)
+                .bind(tenant)
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err("claim task finalization"))?;
             let candidate = sqlx::query(CLAIM_SELECT_SQL)
                 .bind(tenant)
                 .bind(pools.to_vec())
@@ -1330,7 +1527,7 @@ mod postgres {
                 .await
                 .map_err(db_err("fail task"))?;
             tx.commit().await.map_err(db_err("fail task"))?;
-            Ok(MutationOutcome::Applied(task))
+            Ok(MutationOutcome::Applied(Box::new(task)))
         }
 
         async fn get_task(&self, tenant: &str, task_id: &str) -> StoreResult<Option<TaskRecord>> {
@@ -1363,6 +1560,89 @@ mod postgres {
             };
             rows.iter().map(task_from_row).collect()
         }
+
+        async fn cancel_task(
+            &self,
+            tenant: &str,
+            task_id: &str,
+            now: DateTime<Utc>,
+        ) -> StoreResult<CancelOutcome> {
+            let pool = self.pool().await?;
+            let mut tx = pool.begin().await.map_err(db_err("cancel task"))?;
+            let locked = sqlx::query(CANCEL_SELECT_SQL)
+                .bind(task_id)
+                .bind(tenant)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err("cancel task"))?;
+            let Some(locked) = locked else {
+                tx.rollback().await.map_err(db_err("cancel task"))?;
+                return Ok(CancelOutcome::Unknown);
+            };
+            let mut task = task_from_row(&locked)?;
+            // Immediate-terminal vs signal-the-holder, computed by the same
+            // record logic the file backend runs (one rule, one test surface).
+            if task.cancel(now).is_none() {
+                let status = task.status;
+                tx.rollback().await.map_err(db_err("cancel task"))?;
+                return Ok(CancelOutcome::Terminal(status));
+            }
+            let (lease_owner, lease_expires_at) = match &task.lease {
+                Some(lease) => (Some(lease.owner.clone()), Some(lease.expires_at)),
+                None => (None, None),
+            };
+            let updated = sqlx::query(CANCEL_UPDATE_SQL)
+                .bind(&task.task_id)
+                .bind(task.status.as_str())
+                .bind(task.error_class.map(tasks::error_class_name))
+                .bind(task.cancel_requested)
+                .bind(lease_owner)
+                .bind(lease_expires_at)
+                .bind(task.next_attempt_at)
+                .bind(now)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db_err("cancel task"))?;
+            tx.commit().await.map_err(db_err("cancel task"))?;
+            Ok(CancelOutcome::Applied(Box::new(task_from_row(&updated)?)))
+        }
+
+        async fn cancel_run_tasks(
+            &self,
+            tenant: &str,
+            run_id: &str,
+            now: DateTime<Utc>,
+        ) -> StoreResult<RunCancellation> {
+            let pool = self.pool().await?;
+            // One transaction: the run's outstanding tasks cancel as a unit,
+            // never half-propagated.
+            let mut tx = pool.begin().await.map_err(db_err("cancel run tasks"))?;
+            let finalized = sqlx::query(CANCEL_RUN_FINALIZE_SQL)
+                .bind(tenant)
+                .bind(run_id)
+                .bind(now)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db_err("cancel run tasks"))?;
+            let signalled = sqlx::query(CANCEL_RUN_SIGNAL_SQL)
+                .bind(tenant)
+                .bind(run_id)
+                .bind(now)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db_err("cancel run tasks"))?;
+            tx.commit().await.map_err(db_err("cancel run tasks"))?;
+            Ok(RunCancellation {
+                cancelled: finalized
+                    .iter()
+                    .map(task_from_row)
+                    .collect::<StoreResult<Vec<_>>>()?,
+                signalled: signalled
+                    .iter()
+                    .map(task_from_row)
+                    .collect::<StoreResult<Vec<_>>>()?,
+            })
+        }
     }
 
     impl PostgresStore {
@@ -1377,7 +1657,7 @@ mod postgres {
             updated: Option<sqlx::postgres::PgRow>,
         ) -> StoreResult<MutationOutcome> {
             if let Some(row) = updated {
-                return Ok(MutationOutcome::Applied(task_from_row(&row)?));
+                return Ok(MutationOutcome::Applied(Box::new(task_from_row(&row)?)));
             }
             let exists = sqlx::query(TASK_EXISTS_SQL)
                 .bind(task_id)
@@ -1480,7 +1760,7 @@ mod postgres {
 
         #[test]
         fn migration_sql_creates_all_tables_idempotently() {
-            assert_eq!(MIGRATION_SQL.len(), 8);
+            assert_eq!(MIGRATION_SQL.len(), 10);
             for stmt in MIGRATION_SQL {
                 assert!(
                     stmt.contains("IF NOT EXISTS"),
@@ -1503,6 +1783,9 @@ mod postgres {
             assert!(CREATE_TASKS_SQL.contains("TEXT PRIMARY KEY"));
             assert!(CREATE_TASKS_IDEMPOTENCY_INDEX_SQL.contains("CREATE UNIQUE INDEX"));
             assert!(CREATE_TASKS_CLAIMABLE_INDEX_SQL.contains("CREATE INDEX"));
+            // Additive columns for pre-wave-2 databases arrive as ALTERs.
+            assert!(ALTER_TASKS_ADD_CANCEL_REQUESTED_SQL.contains("ALTER TABLE server_tasks"));
+            assert!(ALTER_TASKS_ADD_DEADLINE_SQL.contains("ALTER TABLE server_tasks"));
         }
 
         #[test]
@@ -1518,6 +1801,8 @@ mod postgres {
                 "attempt",
                 "max_attempts",
                 "effect",
+                "cancel_requested",
+                "deadline",
             ] {
                 assert!(CREATE_TASKS_SQL.contains(col), "missing column {col}");
             }
@@ -1537,6 +1822,24 @@ mod postgres {
             assert!(CLAIM_SELECT_SQL.contains("lease_expires_at <= $3"));
             assert!(CLAIM_UPDATE_SQL.contains("status = 'leased'"));
             assert!(CLAIM_UPDATE_SQL.contains("next_attempt_at = NULL"));
+            // Finalization turns unanswered cancels and elapsed deadlines
+            // terminal-cancelled before any candidate is selected.
+            assert!(CLAIM_FINALIZE_SQL.contains("status = 'cancelled'"));
+            assert!(CLAIM_FINALIZE_SQL.contains("cancel_requested"));
+            assert!(CLAIM_FINALIZE_SQL.contains("deadline <= $2"));
+            assert!(CLAIM_FINALIZE_SQL.contains("lease_expires_at <= $2"));
+        }
+
+        #[test]
+        fn cancel_sql_locks_then_applies_the_record_transition() {
+            // Same discipline as fail: lock the row, decide in Rust, write.
+            assert!(CANCEL_SELECT_SQL.contains("FOR UPDATE"));
+            assert!(CANCEL_UPDATE_SQL.contains("cancel_requested = $4"));
+            // Run cancel splits immediate finalization from holder signalling.
+            assert!(CANCEL_RUN_FINALIZE_SQL.contains("status = 'cancelled'"));
+            assert!(CANCEL_RUN_FINALIZE_SQL.contains("run_id = $2"));
+            assert!(CANCEL_RUN_SIGNAL_SQL.contains("cancel_requested = TRUE"));
+            assert!(CANCEL_RUN_SIGNAL_SQL.contains("status = 'leased'"));
         }
 
         #[test]

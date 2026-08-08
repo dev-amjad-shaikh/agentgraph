@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use axum::body::{to_bytes, Body, Bytes};
 use axum::http::{Request, StatusCode};
 use axum::Router;
+use rusty_agent_runtime::prelude::*;
 use rusty_server::{router, GraphRegistry, ServerConfig};
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -779,5 +780,323 @@ async fn tasks_survive_a_router_rebuild() {
     assert_eq!(task["attempt"], json!(2));
     let task = claim_one(&app2, "worker-new", 30_000).await;
     assert_eq!(task["task_id"], json!(queued));
+    let _ = std::fs::remove_dir_all(store);
+}
+
+// --------------------------------------------------------------------- //
+// Cancellation propagation (R0.6 wave 2a)
+// --------------------------------------------------------------------- //
+
+#[tokio::test]
+async fn cancel_queued_task_is_terminal_and_never_leased() {
+    let (app, store) = app();
+    let task_id = enqueue(&app, json!({})).await;
+
+    let (status, v) = call(&app, "POST", &format!("/tasks/{task_id}/cancel"), None).await;
+    assert_eq!(status, StatusCode::OK, "cancel failed: {v}");
+    assert_eq!(v["status"], json!("cancelled"));
+    assert_eq!(v["error_class"], json!("cancelled"));
+    assert_eq!(v["cancel_requested"], json!(false), "no holder to signal");
+
+    // Terminal: never leased, not in the DLQ, listed under `cancelled`.
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/tasks/claim",
+        Some(json!({"worker_id": "w", "lease_ms": 30_000})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, v) = call(&app, "GET", "/tasks?status=dead", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v.as_array().unwrap().len(), 0);
+    let (status, v) = call(&app, "GET", "/tasks?status=cancelled", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = v.as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["task_id"], json!(task_id));
+    let _ = std::fs::remove_dir_all(store);
+}
+
+#[tokio::test]
+async fn cancel_leased_task_signals_via_heartbeat_then_settles_cancelled() {
+    let (app, store) = app();
+    let task_id = enqueue(&app, json!({})).await;
+    claim_one(&app, "worker-1", 60_000).await;
+
+    // The cancel keeps the lease and flags the record: the holder learns
+    // on its next heartbeat, not through a 409.
+    let (status, v) = call(&app, "POST", &format!("/tasks/{task_id}/cancel"), None).await;
+    assert_eq!(status, StatusCode::OK, "cancel failed: {v}");
+    assert_eq!(v["status"], json!("leased"));
+    assert_eq!(v["cancel_requested"], json!(true));
+    assert_eq!(v["lease"]["owner"], json!("worker-1"));
+
+    let (status, v) = call(
+        &app,
+        "POST",
+        &format!("/tasks/{task_id}/heartbeat"),
+        Some(json!({"worker_id": "worker-1", "lease_ms": 60_000})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "heartbeat failed: {v}");
+    assert_eq!(
+        v["cancel_requested"],
+        json!(true),
+        "the hint reaches the holder"
+    );
+
+    // The holder aborts and reports the attempt as cancelled through the
+    // fail path: the record ends terminal-cancelled, never the DLQ.
+    let (status, v) = call(
+        &app,
+        "POST",
+        &format!("/tasks/{task_id}/fail"),
+        Some(json!({"worker_id": "worker-1", "error_class": "cancelled",
+                    "message": "cancelled by the control plane", "retryable": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "fail failed: {v}");
+    assert_eq!(v["requeued"], json!(false));
+    assert_eq!(v["dead"], json!(false));
+    let (status, v) = call(&app, "GET", &format!("/tasks/{task_id}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["status"], json!("cancelled"));
+    assert_eq!(v["error_class"], json!("cancelled"));
+    let (status, v) = call(&app, "GET", "/tasks?status=dead", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v.as_array().unwrap().len(), 0);
+    let _ = std::fs::remove_dir_all(store);
+}
+
+#[tokio::test]
+async fn unanswered_cancel_is_finalized_by_the_claim_path() {
+    let (app, store) = app();
+    let task_id = enqueue(&app, json!({})).await;
+    // A worker takes a short lease and never asks (partition, slow handler).
+    claim_one(&app, "worker-gone", 100).await;
+    let (status, v) = call(&app, "POST", &format!("/tasks/{task_id}/cancel"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["cancel_requested"], json!(true));
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // The next claim finalizes the task instead of re-leasing it:
+    // cancellation outlives the lease.
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/tasks/claim",
+        Some(json!({"worker_id": "worker-new", "lease_ms": 30_000})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, v) = call(&app, "GET", &format!("/tasks/{task_id}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["status"], json!("cancelled"));
+    assert_eq!(v["error_class"], json!("cancelled"));
+    let _ = std::fs::remove_dir_all(store);
+}
+
+#[tokio::test]
+async fn cancel_terminal_task_is_409_and_unknown_is_404() {
+    let (app, store) = app();
+    let done = enqueue(&app, json!({})).await;
+    claim_one(&app, "w", 30_000).await;
+    let (status, _) = call(
+        &app,
+        "POST",
+        &format!("/tasks/{done}/complete"),
+        Some(json!({"worker_id": "w", "result": null})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, v) = call(&app, "POST", &format!("/tasks/{done}/cancel"), None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "terminal cancel: {v}");
+    let (status, v) = call(&app, "POST", "/tasks/nope/cancel", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unknown cancel: {v}");
+    let _ = std::fs::remove_dir_all(store);
+}
+
+#[tokio::test]
+async fn cancel_is_tenant_scoped() {
+    let (app, store) = multi_tenant_app();
+    let (status, v) = call_as(
+        &app,
+        Some(ACME),
+        "POST",
+        "/tasks",
+        Some(json!({"kind": "k", "payload": {}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "acme enqueue failed: {v}");
+    let task_id = v["task_id"].as_str().unwrap().to_string();
+
+    // Globex cannot cancel acme's task — 404, never 403.
+    let (status, _) = call_as(
+        &app,
+        Some(GLOBEX),
+        "POST",
+        &format!("/tasks/{task_id}/cancel"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Acme's own cancel lands.
+    let (status, v) = call_as(
+        &app,
+        Some(ACME),
+        "POST",
+        &format!("/tasks/{task_id}/cancel"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["status"], json!("cancelled"));
+    let _ = std::fs::remove_dir_all(store);
+}
+
+#[tokio::test]
+async fn deadline_expired_task_is_cancelled_instead_of_leased() {
+    let (app, store) = app();
+
+    // A task enqueued already past its whole-task deadline is finalized as
+    // cancelled by the claim path — never leased.
+    let past = enqueue(&app, json!({"deadline": "2020-01-01T00:00:00Z"})).await;
+    // A second task with a future deadline is claimable, proving the first
+    // was skipped rather than the queue being empty.
+    let future = enqueue(&app, json!({"deadline": "2999-01-01T00:00:00Z"})).await;
+
+    let task = claim_one(&app, "w", 30_000).await;
+    assert_eq!(task["task_id"], json!(future));
+    assert!(task["deadline"].is_string());
+
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/tasks/claim",
+        Some(json!({"worker_id": "w", "lease_ms": 30_000})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, v) = call(&app, "GET", &format!("/tasks/{past}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["status"], json!("cancelled"));
+    assert_eq!(v["error_class"], json!("cancelled"));
+    let _ = std::fs::remove_dir_all(store);
+}
+
+// --------------------------------------------------------------------- //
+// Run-level propagation
+// --------------------------------------------------------------------- //
+
+/// `first -> second`, appending to a `log` channel — the smallest graph a
+/// run can execute, for the run-cancel tests.
+fn pipeline_graph() -> (Graph, StateSpec) {
+    let spec = StateSpec::new().channel("log", Reducer::Append);
+    let mut builder = GraphBuilder::new();
+    builder.add_node("first", |_ctx: NodeContext| async {
+        Ok(NodeOutput::update("log", json!("first")))
+    });
+    builder.add_node("second", |_ctx: NodeContext| async {
+        Ok(NodeOutput::update("log", json!("second")))
+    });
+    builder.set_entry_point("first");
+    builder.add_edge("first", "second");
+    (builder.compile().unwrap(), spec)
+}
+
+/// Open-mode app with the `pipeline` graph registered.
+fn app_with_graph() -> (Router, PathBuf) {
+    let store = temp_store();
+    let (pipeline, pipeline_spec) = pipeline_graph();
+    let mut registry = GraphRegistry::new();
+    registry.register("pipeline", pipeline, pipeline_spec);
+    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap(), store.clone());
+    (router(registry, config), store)
+}
+
+/// Create a thread and start a run on it; returns the run id. The run
+/// stays known to the manager (terminal runs are retained), so the
+/// run-cancel route can resolve it.
+async fn start_run(app: &Router) -> String {
+    let (status, v) = call(app, "POST", "/threads", Some(json!({"graph": "pipeline"}))).await;
+    assert_eq!(status, StatusCode::CREATED, "create thread failed: {v}");
+    let thread_id = v["thread_id"].as_str().unwrap().to_string();
+    let (status, v) = call(
+        app,
+        "POST",
+        &format!("/threads/{thread_id}/runs"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "create run failed: {v}");
+    v["run_id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn run_cancel_cancels_the_runs_outstanding_tasks() {
+    let (app, store) = app_with_graph();
+    let run_id = start_run(&app).await;
+
+    // The run's tasks in three states: completed (terminal — propagation
+    // must not touch it), leased (signalled), queued (finalized). Claims
+    // are oldest-first, so the enqueue order arranges the states.
+    let done = enqueue(&app, json!({"run_id": run_id})).await;
+    let leased = enqueue(&app, json!({"run_id": run_id})).await;
+    let queued = enqueue(&app, json!({"run_id": run_id})).await;
+    // Another run's task must be unaffected.
+    let other = enqueue(&app, json!({"run_id": "run-other"})).await;
+
+    let task = claim_one(&app, "worker-1", 60_000).await;
+    assert_eq!(task["task_id"], json!(done));
+    let (status, _) = call(
+        &app,
+        "POST",
+        &format!("/tasks/{done}/complete"),
+        Some(json!({"worker_id": "worker-1", "result": {"ok": true}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let task = claim_one(&app, "worker-1", 60_000).await;
+    assert_eq!(task["task_id"], json!(leased));
+
+    let (status, v) = call(&app, "POST", &format!("/runs/{run_id}/cancel"), None).await;
+    assert_eq!(status, StatusCode::OK, "run cancel failed: {v}");
+    assert_eq!(v["cancelled"], json!([queued]));
+    assert_eq!(v["signalled"], json!([leased]));
+
+    // The queued task is terminal-cancelled; the leased one is signalled
+    // for its holder; the completed one kept its outcome.
+    let (status, v) = call(&app, "GET", &format!("/tasks/{queued}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["status"], json!("cancelled"));
+    let (status, v) = call(
+        &app,
+        "POST",
+        &format!("/tasks/{leased}/heartbeat"),
+        Some(json!({"worker_id": "worker-1", "lease_ms": 60_000})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["cancel_requested"], json!(true));
+    let (status, v) = call(&app, "GET", &format!("/tasks/{done}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["status"], json!("completed"));
+
+    // Only the other run's task remains claimable.
+    let task = claim_one(&app, "worker-2", 30_000).await;
+    assert_eq!(task["task_id"], json!(other));
+    let _ = std::fs::remove_dir_all(store);
+}
+
+#[tokio::test]
+async fn run_cancel_of_an_unknown_run_is_404() {
+    let (app, store) = app_with_graph();
+    let (status, v) = call(&app, "POST", "/runs/run-nope/cancel", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unknown run cancel: {v}");
     let _ = std::fs::remove_dir_all(store);
 }

@@ -186,14 +186,28 @@ a crash boundary.
 
 ## Cancellation propagation + drain (wave 2)
 
-- **Propagation.** Cancellation is a tree: cancelling a run cancels its
-  outstanding tasks; cancelling a task signals the leased worker, which
-  aborts the attempt and reports `cancelled` — never retried, never
-  dead-lettered. Deadline expiry is cancellation by clock: the scheduler
-  stops re-queuing, the worker treats an expired deadline as `cancelled`.
-  A worker that misses the signal (partition, slow handler) is cleaned up
-  by ordinary lease expiry; cancellation is a hint for promptness, not the
-  correctness mechanism.
+**Cancellation propagation is implemented (wave 2a); drain remains.**
+
+- **Propagation.** Cancellation is a tree: cancelling a run
+  (`POST /runs/{run_id}/cancel`) cancels its outstanding tasks — every
+  non-terminal task enqueued with that `run_id` (the linkage rule: a task
+  is a run's outstanding work iff its `run_id` matches, tenant-scoped);
+  cancelling a task (`POST /tasks/{task_id}/cancel`) moves a queued or
+  retry-scheduled task to the terminal `cancelled` state immediately, and
+  signals a leased task's holder, which aborts the attempt and reports
+  `cancelled` — never retried, never dead-lettered. The signal is
+  `cancel_requested`: set on the record, carried on heartbeat responses
+  (the lease itself is untouched, so the holder's fail report still
+  passes the owner check). Deadline expiry is cancellation by clock: the
+  claim path finalizes a task whose whole-task `deadline` has passed as
+  cancelled instead of leasing it, and the worker treats an expired
+  deadline mid-attempt as `cancelled`.
+- **Cancellation is a hint, not the correctness mechanism.** A worker
+  that misses the signal (partition, slow handler) is cleaned up by
+  ordinary lease expiry — with one refinement: the claim path finalizes a
+  cancel-requested task whose lease lapsed unanswered as cancelled rather
+  than re-leasing it, so "never re-queued" holds whether or not the
+  holder ever asks.
 - **Drain.** A worker asked to drain (deployment, scale-down) stops taking
   new leases, finishes or fast-fails in-flight attempts within a grace
   period, and releases the rest — which return to visibility for other

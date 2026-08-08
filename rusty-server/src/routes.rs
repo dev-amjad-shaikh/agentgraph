@@ -33,7 +33,7 @@ use crate::runs::{
 };
 use crate::server_store::{JsonFileStore, ServerStore};
 use crate::sse;
-use crate::tasks::{self, MutationOutcome, TaskRecord, TaskStatus};
+use crate::tasks::{self, CancelOutcome, MutationOutcome, TaskRecord, TaskStatus};
 use crate::threads::ThreadRecord;
 use crate::{store, GraphRegistry, ServerConfig, RESERVED_NAMES};
 
@@ -117,6 +117,7 @@ pub(crate) fn router(registry: GraphRegistry, config: ServerConfig) -> Router {
             delete(delete_run_checkpoints),
         )
         .route("/runs/{run_id}", get(get_run))
+        .route("/runs/{run_id}/cancel", post(cancel_run))
         .route("/runs/{run_id}/stream", get(get_run_stream))
         .route("/runs/{run_id}/events", get(get_run_events))
         .route("/runs/{run_id}/fixture", get(get_run_fixture))
@@ -139,6 +140,7 @@ pub(crate) fn router(registry: GraphRegistry, config: ServerConfig) -> Router {
         .route("/tasks/{task_id}/heartbeat", post(heartbeat_task))
         .route("/tasks/{task_id}/complete", post(complete_task))
         .route("/tasks/{task_id}/fail", post(fail_task))
+        .route("/tasks/{task_id}/cancel", post(cancel_task))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             crate::auth::require_api_key,
@@ -901,6 +903,45 @@ async fn get_run(
     Ok(Json(body))
 }
 
+/// `POST /runs/{run_id}/cancel` — propagate cancellation into the run's
+/// outstanding durable tasks: every non-terminal task enqueued with this
+/// `run_id` in the caller's tenant. Queued and retry-scheduled tasks move
+/// to the terminal `cancelled` state (reported under `cancelled`); leased
+/// tasks keep their leases with `cancel_requested` set so their holders
+/// abort and report (`signalled`). Run resolution and tenant scoping
+/// follow `GET /runs/{id}` — unknown or cross-tenant runs answer 404.
+///
+/// Scope note: this wave wires run cancellation to the *queue*. Stopping
+/// the run's in-process executor is the drain half of wave 2; a task
+/// enqueued after this call is not retroactively cancelled.
+async fn cancel_run(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let info = state
+        .run_deps
+        .manager
+        .info(&run_id)
+        .await
+        .ok_or_else(|| ApiError::not_found(format!("run `{run_id}` not found")))?;
+    if !tenant.owns(&info.thread_id) {
+        return Err(ApiError::not_found(format!("run `{run_id}` not found")));
+    }
+    let outcome = state
+        .server_store
+        .cancel_run_tasks(tenant.tenant(), &run_id, Utc::now())
+        .await
+        .map_err(internal_err)?;
+    let ids =
+        |tasks: Vec<TaskRecord>| -> Vec<String> { tasks.into_iter().map(|t| t.task_id).collect() };
+    Ok(Json(json!({
+        "run_id": run_id,
+        "cancelled": ids(outcome.cancelled),
+        "signalled": ids(outcome.signalled),
+    })))
+}
+
 // --------------------------------------------------------------------- //
 // Flight Recorder
 // --------------------------------------------------------------------- //
@@ -1630,6 +1671,21 @@ struct EnqueueTaskPayload {
     /// absent, the worker's per-attempt `retryable` flag decides.
     #[serde(default)]
     effect: Option<String>,
+    /// Run linkage: the run this task belongs to.
+    /// `POST /runs/{run_id}/cancel` cancels every non-terminal task
+    /// carrying its run id — the run-level half of cancellation
+    /// propagation. Optional; the outbox wave sets this from the run
+    /// itself.
+    #[serde(default)]
+    run_id: Option<String>,
+    /// Thread linkage (companion to `run_id`).
+    #[serde(default)]
+    thread_id: Option<String>,
+    /// Whole-task deadline (RFC 3339), across attempts. Past it the claim
+    /// path finalizes the task as cancelled instead of leasing it, and a
+    /// worker that sees it pass mid-attempt reports the attempt cancelled.
+    #[serde(default)]
+    deadline: Option<String>,
 }
 
 /// `POST /tasks` — enqueue a durable task. `201 {task_id, deduplicated:
@@ -1661,6 +1717,25 @@ async fn enqueue_task(
         .map(tasks::parse_effect)
         .transpose()
         .map_err(ApiError::bad_request)?;
+    if let Some(run_id) = &payload.run_id {
+        tasks::validate_label("run_id", run_id, 256).map_err(ApiError::bad_request)?;
+    }
+    if let Some(thread_id) = &payload.thread_id {
+        tasks::validate_label("thread_id", thread_id, 256).map_err(ApiError::bad_request)?;
+    }
+    let deadline = payload
+        .deadline
+        .as_deref()
+        .map(|raw| {
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|_| {
+                    ApiError::bad_request(format!(
+                        "`deadline` must be an RFC 3339 timestamp (got `{raw}`)"
+                    ))
+                })
+        })
+        .transpose()?;
 
     let record = TaskRecord::new(
         tasks::NewTask {
@@ -1672,6 +1747,9 @@ async fn enqueue_task(
             max_attempts,
             idempotency_key: payload.idempotency_key,
             effect,
+            run_id: payload.run_id,
+            thread_id: payload.thread_id,
+            deadline,
         },
         Utc::now(),
     );
@@ -1794,7 +1872,11 @@ fn lease_outcome(
 }
 
 /// `POST /tasks/{id}/heartbeat` — extend the held lease → `200
-/// {"lease_expires_at": "…"}`; `409` when the lease is lost.
+/// {"lease_expires_at": "…", "cancel_requested": bool}`; `409` when the
+/// lease is lost. `cancel_requested` is the cancellation hint: the holder
+/// should abort the attempt and report it as `cancelled` through the fail
+/// path (a holder that never asks is finalized by the claim path once its
+/// lease lapses).
 async fn heartbeat_task(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(tenant): Extension<TenantContext>,
@@ -1815,8 +1897,11 @@ async fn heartbeat_task(
         .await
         .map_err(internal_err)?;
     let task = lease_outcome(outcome, &task_id, &payload.worker_id)?;
-    let expires_at = task.lease.map(|lease| lease.expires_at);
-    Ok(Json(json!({ "lease_expires_at": expires_at })))
+    let expires_at = task.lease.as_ref().map(|lease| lease.expires_at);
+    Ok(Json(json!({
+        "lease_expires_at": expires_at,
+        "cancel_requested": task.cancel_requested,
+    })))
 }
 
 /// `POST /tasks/{id}/complete` — settle the held lease successfully, storing
@@ -1889,6 +1974,36 @@ async fn fail_task(
     })))
 }
 
+/// `POST /tasks/{id}/cancel` — cancel a non-terminal task → `200` with the
+/// updated record. Queued and retry-scheduled tasks move to the terminal
+/// `cancelled` state immediately (never retried, never dead-lettered,
+/// never re-queued); a leased task keeps its lease with
+/// `cancel_requested` set, so the holder learns on its next heartbeat and
+/// reports the attempt as `cancelled` through the fail path. Cancellation
+/// is a hint for promptness — lease expiry stays the correctness
+/// mechanism: a holder that never asks is finalized as cancelled by the
+/// claim path once its lease lapses. `409` when the task is already
+/// terminal, `404` for unknown or cross-tenant ids.
+async fn cancel_task(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
+    Path(task_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let outcome = state
+        .server_store
+        .cancel_task(tenant.tenant(), &task_id, Utc::now())
+        .await
+        .map_err(internal_err)?;
+    match outcome {
+        CancelOutcome::Applied(task) => Ok(Json(task.wire())),
+        CancelOutcome::Terminal(status) => Err(ApiError::conflict(format!(
+            "task `{task_id}` is already terminal ({}) and cannot be cancelled",
+            status.as_str()
+        ))),
+        CancelOutcome::Unknown => Err(ApiError::not_found(format!("task `{task_id}` not found"))),
+    }
+}
+
 /// `GET /tasks/{id}` — the task record (tenant-scoped; unknown or
 /// cross-tenant ids answer 404).
 async fn get_task(
@@ -1926,7 +2041,7 @@ async fn list_tasks(
         .map(|s| {
             TaskStatus::parse(s).ok_or_else(|| {
                 ApiError::bad_request(format!(
-                    "unknown task status `{s}` (expected queued|leased|failed|completed|dead)"
+                    "unknown task status `{s}` (expected queued|leased|failed|completed|dead|cancelled)"
                 ))
             })
         })

@@ -3,8 +3,13 @@
 //! A *task* is a unit of work enqueued by a control-plane caller (today: any
 //! API client; later waves add the run-side transactional outbox) and
 //! executed by an out-of-process worker. The server owns the substrate:
-//! durable records, leases with visibility timeouts, heartbeats, retries, and
-//! a dead-letter queue. The retry policy is not local: failed attempts are
+//! durable records, leases with visibility timeouts, heartbeats, retries, a
+//! dead-letter queue, and cancellation propagation (wave 2a): the cancel
+//! endpoints move non-terminal tasks to the terminal `cancelled` state —
+//! immediately for queued work, via a `cancel_requested` heartbeat hint for
+//! leased work — and the claim path finalizes unanswered cancels and
+//! elapsed whole-task deadlines instead of re-leasing. The retry policy is
+//! not local: failed attempts are
 //! classified into core's shared [`ErrorClass`] taxonomy and decided by
 //! core's [`classify_retry`] — the same function the worker SDK runs — so
 //! server and workers can never disagree about a retry (see
@@ -60,6 +65,12 @@ pub(crate) const MAX_LEASE_MS: u64 = 3_600_000;
 ///                     ├──fail──> RetryDecision::Fail  ──> failed (next_attempt_at null;
 ///                     │                                     terminal, *not* the DLQ)
 ///                     └──lease expires──> claimable again (new attempt)
+///
+/// cancelled (terminal) is reached three ways, all spelled `cancelled`:
+///   - the cancel endpoint on a queued or retry-scheduled task (immediate),
+///   - a worker reporting ErrorClass::Cancelled through the fail path,
+///   - the claim path finalizing a cancel-requested or deadline-expired
+///     task instead of re-leasing it.
 /// ```
 ///
 /// `Failed` covers both failure resting states, distinguished by
@@ -69,7 +80,8 @@ pub(crate) const MAX_LEASE_MS: u64 = 3_600_000;
 /// work the worker declared unsafe to re-drive. Terminal failure that a
 /// human can act on is `Dead` (the DLQ, `RetryDecision::Dead`); the DLQ
 /// never holds outright fails, per the design's "DLQ is for actionable
-/// work, not a graveyard" rule.
+/// work, not a graveyard" rule. `Cancelled` is terminal too — control
+/// flow, not failure: never retried, never dead-lettered, never re-queued.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum TaskStatus {
@@ -78,6 +90,7 @@ pub(crate) enum TaskStatus {
     Failed,
     Completed,
     Dead,
+    Cancelled,
 }
 
 impl TaskStatus {
@@ -89,6 +102,7 @@ impl TaskStatus {
             Self::Failed => "failed",
             Self::Completed => "completed",
             Self::Dead => "dead",
+            Self::Cancelled => "cancelled",
         }
     }
 
@@ -101,6 +115,7 @@ impl TaskStatus {
             "failed" => Some(Self::Failed),
             "completed" => Some(Self::Completed),
             "dead" => Some(Self::Dead),
+            "cancelled" => Some(Self::Cancelled),
             _ => None,
         }
     }
@@ -157,13 +172,29 @@ pub(crate) struct TaskRecord {
     /// The completed task's result (any JSON value), set by `complete`.
     #[serde(default)]
     pub result: Option<Value>,
-    /// Run/thread linkage, reserved for the outbox wave (R0.6 remainder);
-    /// always `null` through the public enqueue endpoint today.
+    /// Run/thread linkage: the run this task belongs to. Set at enqueue
+    /// time; `POST /runs/{run_id}/cancel` cancels every non-terminal task
+    /// carrying its run id (the outbox wave will set these from the run
+    /// itself). See [`TaskRecord::thread_id`].
     #[serde(default)]
     pub run_id: Option<String>,
     /// See [`TaskRecord::run_id`].
     #[serde(default)]
     pub thread_id: Option<String>,
+    /// Cancellation signalled to the lease holder: set by the cancel
+    /// endpoint on a leased task, surfaced on heartbeat responses, and
+    /// honored by the worker aborting the attempt and reporting
+    /// [`ErrorClass::Cancelled`]. Cancellation is a hint for promptness —
+    /// if the holder never asks, the claim path finalizes the task as
+    /// cancelled once the lease lapses instead of re-leasing it.
+    #[serde(default)]
+    pub cancel_requested: bool,
+    /// Whole-task deadline, across attempts. The claim path never leases a
+    /// task whose deadline has passed (it finalizes it as cancelled); the
+    /// worker treats an expired deadline mid-attempt as
+    /// [`ErrorClass::Cancelled`] — deadline expiry is cancellation by clock.
+    #[serde(default)]
+    pub deadline: Option<DateTime<Utc>>,
     /// When a `failed` task becomes claimable again (`None` while queued,
     /// leased, or terminal).
     #[serde(default)]
@@ -184,6 +215,10 @@ pub(crate) struct NewTask {
     pub max_attempts: u32,
     pub idempotency_key: Option<String>,
     pub effect: Option<Effect>,
+    /// Run/thread linkage and whole-task deadline (see [`TaskRecord`]).
+    pub run_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub deadline: Option<DateTime<Utc>>,
 }
 
 /// A worker's report of a failed attempt: the shared [`ErrorClass`]
@@ -208,6 +243,9 @@ impl TaskRecord {
             max_attempts,
             idempotency_key,
             effect,
+            run_id,
+            thread_id,
+            deadline,
         } = new;
         Self {
             task_id,
@@ -224,8 +262,10 @@ impl TaskRecord {
             last_error: None,
             idempotency_key,
             result: None,
-            run_id: None,
-            thread_id: None,
+            run_id,
+            thread_id,
+            cancel_requested: false,
+            deadline,
             next_attempt_at: None,
             created_at: now,
             updated_at: now,
@@ -240,7 +280,19 @@ impl TaskRecord {
             TaskStatus::Queued => true,
             TaskStatus::Failed => self.next_attempt_at.is_some_and(|at| at <= now),
             TaskStatus::Leased => self.lease.as_ref().is_some_and(|l| l.expires_at <= now),
-            TaskStatus::Completed | TaskStatus::Dead => false,
+            TaskStatus::Completed | TaskStatus::Dead | TaskStatus::Cancelled => false,
+        }
+    }
+
+    /// `true` for a record cancellation can no longer change: `completed`,
+    /// `dead`, `cancelled`, or `failed` outright with no retry scheduled.
+    /// A `failed` task *with* a retry outstanding is non-terminal — it
+    /// would otherwise re-queue, which cancellation exists to prevent.
+    pub(crate) fn is_terminal(&self) -> bool {
+        match self.status {
+            TaskStatus::Completed | TaskStatus::Dead | TaskStatus::Cancelled => true,
+            TaskStatus::Failed => self.next_attempt_at.is_none(),
+            TaskStatus::Queued | TaskStatus::Leased => false,
         }
     }
 
@@ -282,6 +334,47 @@ impl TaskRecord {
         self.lease = None;
         self.next_attempt_at = None;
         self.updated_at = now;
+    }
+
+    /// Cancel a non-terminal task; `None` (no change) when the task is
+    /// already terminal. See [`CancelTransition`] for the two paths — the
+    /// leased path is what makes cancellation a *hint*: the holder keeps
+    /// its lease and learns of the request on its next heartbeat, and the
+    /// terminal transition lands when it reports
+    /// [`ErrorClass::Cancelled`] (or, if it never asks, when the claim path
+    /// finalizes the task after the lease lapses).
+    pub(crate) fn cancel(&mut self, now: DateTime<Utc>) -> Option<CancelTransition> {
+        if self.is_terminal() {
+            return None;
+        }
+        if self.status == TaskStatus::Leased {
+            self.cancel_requested = true;
+            self.updated_at = now;
+            Some(CancelTransition::Signalled)
+        } else {
+            self.apply_cancellation(now);
+            Some(CancelTransition::Cancelled)
+        }
+    }
+
+    /// The terminal transition shared by [`Self::cancel`] and the claim
+    /// path's finalization sweep. The lease and any retry schedule are
+    /// cleared so nothing re-queues; `error_class` records *why* the task
+    /// ended (control flow, not failure — never the DLQ).
+    pub(crate) fn apply_cancellation(&mut self, now: DateTime<Utc>) {
+        self.status = TaskStatus::Cancelled;
+        self.error_class = Some(ErrorClass::Cancelled);
+        self.lease = None;
+        self.next_attempt_at = None;
+        self.updated_at = now;
+    }
+
+    /// `true` when this claimable-at-`now` task must be finalized as
+    /// cancelled instead of (re-)leased: a cancellation the lease holder
+    /// never acknowledged before its lease lapsed, or a whole-task
+    /// deadline that has passed.
+    pub(crate) fn cancellation_due(&self, now: DateTime<Utc>) -> bool {
+        self.claimable_at(now) && (self.cancel_requested || self.deadline.is_some_and(|d| d <= now))
     }
 
     /// Record a failed attempt, deciding through core's shared
@@ -328,7 +421,15 @@ impl TaskRecord {
                 self.next_attempt_at = None;
             }
             RetryDecision::Fail => {
-                self.status = TaskStatus::Failed;
+                // A cancelled attempt lands in the dedicated terminal state
+                // rather than the outright-failure one — same finality, but
+                // spelled as control flow so `?status=failed` stays a list
+                // of failures and `?status=cancelled` a list of cancels.
+                self.status = if error_class == ErrorClass::Cancelled {
+                    TaskStatus::Cancelled
+                } else {
+                    TaskStatus::Failed
+                };
                 self.next_attempt_at = None;
             }
         }
@@ -355,6 +456,8 @@ impl TaskRecord {
             "result": self.result,
             "run_id": self.run_id,
             "thread_id": self.thread_id,
+            "cancel_requested": self.cancel_requested,
+            "deadline": self.deadline,
             "lease": self.lease.as_ref().map(|lease| json!({
                 "owner": lease.owner,
                 "expires_at": lease.expires_at,
@@ -383,6 +486,47 @@ pub(crate) enum MutationOutcome {
     /// No such task in this tenant (unknown or cross-tenant id — the two
     /// are deliberately indistinguishable). Routes answer 404.
     Unknown,
+}
+
+/// What [`TaskRecord::cancel`] did to a non-terminal task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CancelTransition {
+    /// The task moved to the terminal `cancelled` state immediately: it
+    /// was queued, or failed with a retry scheduled.
+    Cancelled,
+    /// The task is leased, so the cancellation is recorded as
+    /// `cancel_requested` for the holder to learn on its next heartbeat;
+    /// the terminal transition lands through the fail path (prompt case)
+    /// or the claim path's finalization (holder never asked).
+    Signalled,
+}
+
+/// Result of the cancel endpoint (`POST /tasks/{id}/cancel`). Not
+/// lease-guarded — the canceller is the tenant's control plane, not the
+/// lease holder — so [`MutationOutcome`] does not fit; this mirrors its
+/// shape.
+#[derive(Debug, Clone)]
+pub(crate) enum CancelOutcome {
+    /// The cancellation landed (either [`CancelTransition`]; the record's
+    /// status says which).
+    Applied(Box<TaskRecord>),
+    /// The task exists but is already terminal; carries its status for the
+    /// 409 message.
+    Terminal(TaskStatus),
+    /// No such task in this tenant (unknown or cross-tenant id). Routes
+    /// answer 404.
+    Unknown,
+}
+
+/// What a run-level cancel (`POST /runs/{run_id}/cancel`) did to the run's
+/// outstanding tasks, split by how each task's cancellation lands.
+#[derive(Debug, Default)]
+pub(crate) struct RunCancellation {
+    /// Tasks moved to the terminal `cancelled` state immediately (queued,
+    /// or failed with a retry scheduled).
+    pub cancelled: Vec<TaskRecord>,
+    /// Leased tasks whose holders were signalled via `cancel_requested`.
+    pub signalled: Vec<TaskRecord>,
 }
 
 /// A `[0, 1)` jitter sample for [`classify_retry`], from OS entropy via the
@@ -562,6 +706,9 @@ mod tests {
                 max_attempts: DEFAULT_MAX_ATTEMPTS,
                 idempotency_key: None,
                 effect: None,
+                run_id: None,
+                thread_id: None,
+                deadline: None,
             },
             Utc::now(),
         )
@@ -575,6 +722,7 @@ mod tests {
             (TaskStatus::Failed, "failed"),
             (TaskStatus::Completed, "completed"),
             (TaskStatus::Dead, "dead"),
+            (TaskStatus::Cancelled, "cancelled"),
         ] {
             assert_eq!(status.as_str(), s);
             assert_eq!(TaskStatus::parse(s), Some(status));
@@ -798,6 +946,152 @@ mod tests {
     }
 
     #[test]
+    fn cancel_queued_task_is_terminal_immediately() {
+        let mut task = record();
+        let t0 = Utc::now();
+        assert_eq!(task.cancel(t0), Some(CancelTransition::Cancelled));
+        assert_eq!(task.status, TaskStatus::Cancelled);
+        assert_eq!(task.error_class, Some(ErrorClass::Cancelled));
+        assert!(task.next_attempt_at.is_none());
+        assert!(task.lease.is_none());
+        assert!(!task.cancel_requested, "no holder to signal");
+        assert!(task.is_terminal());
+        assert!(!task.claimable_at(t0 + Duration::days(365)));
+        // A second cancel changes nothing — terminal is terminal.
+        assert_eq!(task.cancel(t0), None);
+    }
+
+    #[test]
+    fn cancel_retry_scheduled_task_is_terminal_immediately() {
+        let mut task = record();
+        let t0 = Utc::now();
+        task.claim("w-1", 60_000, t0);
+        task.fail(ErrorClass::Transient, "hiccup", true, t0);
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert!(task.next_attempt_at.is_some(), "a retry is outstanding");
+        // Non-terminal while a retry is scheduled: cancellation must
+        // prevent the re-queue.
+        assert!(!task.is_terminal());
+        assert_eq!(task.cancel(t0), Some(CancelTransition::Cancelled));
+        assert_eq!(task.status, TaskStatus::Cancelled);
+        assert!(task.next_attempt_at.is_none());
+    }
+
+    #[test]
+    fn cancel_leased_task_signals_the_holder_and_keeps_its_lease() {
+        let mut task = record();
+        let t0 = Utc::now();
+        task.claim("w-1", 60_000, t0);
+        assert_eq!(task.cancel(t0), Some(CancelTransition::Signalled));
+        // The lease is untouched: the holder's heartbeat renews (carrying
+        // the hint) and its fail report still passes the owner check.
+        assert_eq!(task.status, TaskStatus::Leased);
+        assert!(task.cancel_requested);
+        assert!(task.leased_to("w-1"));
+        // Re-cancelling while still leased is an idempotent re-signal.
+        assert_eq!(task.cancel(t0), Some(CancelTransition::Signalled));
+
+        // The prompt path: the holder reports the aborted attempt as
+        // cancelled and the record ends terminal-cancelled — never the
+        // DLQ, never re-queued.
+        task.fail(
+            ErrorClass::Cancelled,
+            "cancelled by control plane",
+            false,
+            t0,
+        );
+        assert_eq!(task.status, TaskStatus::Cancelled);
+        assert_eq!(task.error_class, Some(ErrorClass::Cancelled));
+        assert!(!task.claimable_at(t0 + Duration::days(365)));
+    }
+
+    #[test]
+    fn cancel_terminal_task_is_refused() {
+        // Completed, dead, cancelled, and failed-outright (no retry
+        // scheduled) are all terminal: cancel changes nothing.
+        let t0 = Utc::now();
+        let mut completed = record();
+        completed.claim("w-1", 60_000, t0);
+        completed.complete(json!({"ok": true}), t0);
+
+        let mut dead = record();
+        dead.claim("w-1", 60_000, t0);
+        dead.attempt = dead.max_attempts;
+        dead.fail(ErrorClass::Unknown, "third strike", true, t0);
+
+        let mut failed_outright = record();
+        failed_outright.claim("w-1", 60_000, t0);
+        failed_outright.fail(ErrorClass::InvalidInput, "bad schema", true, t0);
+
+        let mut cancelled = record();
+        cancelled.cancel(t0);
+
+        for task in [
+            &mut completed,
+            &mut dead,
+            &mut failed_outright,
+            &mut cancelled,
+        ] {
+            let before = task.status;
+            assert!(task.is_terminal(), "{before:?} is terminal");
+            assert_eq!(task.cancel(t0), None, "{before:?} accepted a cancel");
+            assert_eq!(task.status, before, "cancel changed a terminal task");
+        }
+    }
+
+    #[test]
+    fn fail_with_cancelled_class_lands_cancelled_not_failed_or_dead() {
+        let mut task = record();
+        let t0 = Utc::now();
+        task.claim("w-1", 60_000, t0);
+        // Even with the worker answering retryable, the class gate fails
+        // outright — and the cancelled class spells the terminal state
+        // `cancelled` rather than the failure one.
+        task.fail(ErrorClass::Cancelled, "interrupted", true, t0);
+        assert_eq!(task.status, TaskStatus::Cancelled);
+        assert!(task.next_attempt_at.is_none());
+        assert!(!task.claimable_at(t0 + Duration::days(365)));
+    }
+
+    #[test]
+    fn cancellation_due_covers_the_unanswered_and_the_expired() {
+        let t0 = Utc::now();
+
+        // Cancel-requested with a live lease: the holder may still answer —
+        // not yet due.
+        let mut task = record();
+        task.claim("w-1", 60_000, t0);
+        task.cancel(t0);
+        assert!(!task.cancellation_due(t0));
+        // Lease lapsed unanswered: due.
+        assert!(task.cancellation_due(t0 + Duration::seconds(61)));
+
+        // Deadline passed on a queued task: due.
+        let mut task = record();
+        task.deadline = Some(t0 - Duration::seconds(1));
+        assert!(task.cancellation_due(t0));
+        // Deadline in the future: not due (and claimable normally).
+        let mut task = record();
+        task.deadline = Some(t0 + Duration::seconds(60));
+        assert!(!task.cancellation_due(t0));
+        // No flags: not due.
+        assert!(!record().cancellation_due(t0));
+    }
+
+    #[test]
+    fn apply_cancellation_clears_everything_that_could_requeue() {
+        let mut task = record();
+        let t0 = Utc::now();
+        task.claim("w-1", 1_000, t0);
+        task.cancel(t0);
+        task.apply_cancellation(t0 + Duration::seconds(2));
+        assert_eq!(task.status, TaskStatus::Cancelled);
+        assert!(task.lease.is_none(), "no lease holder survives");
+        assert!(task.next_attempt_at.is_none());
+        assert!(!task.leased_to("w-1"));
+    }
+
+    #[test]
     fn wire_omits_tenant_and_nests_the_lease() {
         let mut task = record();
         task.claim("w-1", 60_000, Utc::now());
@@ -811,6 +1105,8 @@ mod tests {
         assert_eq!(wire["idempotency_key"], Value::Null);
         assert_eq!(wire["effect"], Value::Null);
         assert_eq!(wire["run_id"], Value::Null);
+        assert_eq!(wire["cancel_requested"], json!(false));
+        assert_eq!(wire["deadline"], Value::Null);
         assert_eq!(wire["next_attempt_at"], Value::Null);
     }
 
@@ -818,6 +1114,8 @@ mod tests {
     fn record_serde_round_trip() {
         let mut task = record();
         task.idempotency_key = Some("key-1".to_string());
+        task.run_id = Some("run-9".to_string());
+        task.deadline = DateTime::<Utc>::from_timestamp_millis(1_800_000_000_000);
         task.claim("w-1", 60_000, Utc::now());
         task.fail(ErrorClass::Unknown, "it broke", true, Utc::now());
         let raw = serde_json::to_string(&task).unwrap();
@@ -831,7 +1129,11 @@ mod tests {
         // The error class persists in the shared snake_case spelling.
         assert!(raw.contains("\"error_class\":\"unknown\""));
         assert_eq!(back.next_attempt_at, task.next_attempt_at);
-        // Records written before R0.6 linkage fields existed still load.
+        assert_eq!(back.run_id.as_deref(), Some("run-9"));
+        assert_eq!(back.deadline, task.deadline);
+        assert!(!back.cancel_requested);
+        // Records written before the wave-2 cancellation fields existed
+        // still load: every additive field carries a serde default.
         let legacy = json!({
             "task_id": "t", "tenant": "default", "kind": "k", "payload": null,
             "pool": "default", "status": "queued", "attempt": 0,
@@ -841,6 +1143,7 @@ mod tests {
         assert_eq!(back.status, TaskStatus::Queued);
         assert!(back.lease.is_none() && back.result.is_none() && back.run_id.is_none());
         assert!(back.effect.is_none() && back.error_class.is_none());
+        assert!(!back.cancel_requested && back.deadline.is_none());
     }
 
     #[test]

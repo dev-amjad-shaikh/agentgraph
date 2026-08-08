@@ -25,7 +25,8 @@
 //!   work is available in the claimed pools.
 //! - `POST {base}/tasks/{task_id}/heartbeat` — body `{worker_id, lease_ms}`,
 //!   sent from a background task every `lease / 3`; a `200` renews the lease
-//!   (`{lease_expires_at}`), a `409` means the lease is lost.
+//!   (`{lease_expires_at, cancel_requested}`), a `409` means the lease is
+//!   lost.
 //! - `POST {base}/tasks/{task_id}/complete` — body `{worker_id, result}`,
 //!   where `result` is the handler's JSON return value.
 //! - `POST {base}/tasks/{task_id}/fail` — body
@@ -49,6 +50,15 @@
 //!   effectively-once contract, and it is why activity side effects should
 //!   be keyed by [`ActivityContext::task_id`] /
 //!   [`ActivityContext::idempotency_key`].
+//! - **Cancellation aborts promptly, and reports.** When a heartbeat
+//!   carries `cancel_requested: true` — or the task's whole-task
+//!   `deadline` passes mid-attempt — the handler is aborted the same way,
+//!   but the worker *does* settle: it reports the attempt as
+//!   [`ErrorClass::Cancelled`] through `/fail`, which the server's shared
+//!   retry policy fails outright, so the record ends terminal-cancelled —
+//!   never retried, never dead-lettered. A task claimed with the deadline
+//!   already passed (or the cancel flag already set) is reported cancelled
+//!   without running the handler at all.
 //! - **Graceful drain.** Cancelling the shutdown [`CancellationToken`] stops
 //!   claiming; an in-flight activity runs to its outcome and is settled
 //!   before [`ActivityWorker::run`] returns.
@@ -88,6 +98,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
 use rusty_agent_runtime::durable::ErrorClass;
 use rusty_agent_runtime::error::{Result, RustyError};
@@ -237,6 +248,21 @@ pub struct ClaimedTask {
     /// See [`ClaimedTask::run_id`].
     #[serde(default)]
     pub thread_id: Option<String>,
+
+    /// Cancellation signalled before the claim was handed out. A
+    /// well-behaved server never leases such a task (its claim path
+    /// finalizes them as cancelled), but the worker defends anyway: a
+    /// claimed task with this flag is reported cancelled without running
+    /// the handler.
+    #[serde(default)]
+    pub cancel_requested: bool,
+
+    /// Whole-task deadline, across attempts. The worker refuses to start
+    /// an attempt past it and aborts a running attempt at it, reporting
+    /// [`ErrorClass::Cancelled`] — deadline expiry is cancellation by
+    /// clock, per the Durable Work design.
+    #[serde(default)]
+    pub deadline: Option<DateTime<Utc>>,
 }
 
 /// `POST /tasks/claim` request body.
@@ -264,9 +290,14 @@ struct HeartbeatRequest<'a> {
 /// `POST /tasks/{id}/heartbeat` success body. `lease_expires_at` is an
 /// RFC 3339 timestamp; the worker treats it as informational (the server's
 /// `409` is the authoritative lease-loss signal) and logs it.
+/// `cancel_requested` is the cancellation hint: on `true` the worker
+/// aborts the in-flight attempt and reports it [`ErrorClass::Cancelled`].
+/// Absent on pre-wave-2 servers, hence the default.
 #[derive(Debug, Deserialize)]
 struct HeartbeatResponse {
     lease_expires_at: Option<String>,
+    #[serde(default)]
+    cancel_requested: bool,
 }
 
 /// `POST /tasks/{id}/complete` request body.
@@ -331,6 +362,32 @@ enum ClaimOutcome {
     /// The poll failed (transport error, unexpected status, undecodable
     /// body); the caller backs off and polls again.
     Unavailable,
+}
+
+/// Why the attempt runner stopped waiting on the handler future: finished
+/// normally, the lease is gone (abandon — the server reassigns), or the
+/// task was cancelled (abort, then report [`ErrorClass::Cancelled`]
+/// through the fail path while we still hold the lease).
+enum AttemptOutcome {
+    /// The handler future completed (possibly with an error or panic).
+    Finished(std::result::Result<Result<Value>, tokio::task::JoinError>),
+    /// A heartbeat answered `409`: the server considers the task lost or
+    /// settled. The worker makes no further calls for it.
+    LeaseLost,
+    /// Cancellation reached the worker — a heartbeat carried
+    /// `cancel_requested: true`, or the whole-task deadline expired. The
+    /// payload is the reason recorded on the fail report.
+    Cancelled(&'static str),
+}
+
+/// The deadline arm of the attempt runner's `select!`: fires when the
+/// whole-task deadline passes, or pends forever when the task has none —
+/// one arm shape either way.
+async fn sleep_until_deadline(until: Option<Duration>) {
+    match until {
+        Some(delay) => tokio::time::sleep(delay).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// A durable worker that claims leased tasks from the rusty-server task
@@ -563,6 +620,45 @@ impl ActivityWorker {
                 return;
             };
 
+            // Work that is already cancelled must not start: report the
+            // attempt cancelled without running the handler. (A
+            // well-behaved server never leases such a task; this is the
+            // worker-side defense of the same rule.)
+            if task.cancel_requested {
+                tracing::warn!("claimed task was already cancel-requested; reporting cancelled");
+                self.fail(
+                    &task.task_id,
+                    ErrorClass::Cancelled,
+                    format!("activity `{}` cancelled before dispatch", task.kind),
+                    false,
+                )
+                .await;
+                return;
+            }
+            // Wall-clock remaining until the whole-task deadline; a
+            // deadline already passed is reported cancelled without
+            // running the handler.
+            let until_deadline = match task.deadline {
+                Some(deadline) => match (deadline - Utc::now()).to_std() {
+                    Ok(remaining) => Some(remaining),
+                    Err(_) => {
+                        tracing::warn!(%deadline, "claimed task's deadline already passed; reporting cancelled");
+                        self.fail(
+                            &task.task_id,
+                            ErrorClass::Cancelled,
+                            format!(
+                                "activity `{}` cancelled: whole-task deadline already passed",
+                                task.kind
+                            ),
+                            false,
+                        )
+                        .await;
+                        return;
+                    }
+                },
+                None => None,
+            };
+
             let ctx = ActivityContext {
                 task_id: task.task_id.clone(),
                 kind: task.kind.clone(),
@@ -573,26 +669,50 @@ impl ActivityWorker {
             let task_id = task.task_id.clone();
 
             let lease_lost = CancellationToken::new();
-            let heartbeat = self.spawn_heartbeat(&task_id, lease_lost.clone());
+            let cancel_requested = CancellationToken::new();
+            let heartbeat =
+                self.spawn_heartbeat(&task_id, lease_lost.clone(), cancel_requested.clone());
 
             // The handler runs on its own task for the same reason as in
             // `/execute`: a panic must surface as an outcome, not a
             // torn-down worker.
             let mut handle = tokio::spawn(async move { handler.run(ctx).await });
-            let joined = tokio::select! {
-                joined = &mut handle => Some(joined),
-                _ = lease_lost.cancelled() => None,
+            let outcome = tokio::select! {
+                joined = &mut handle => AttemptOutcome::Finished(joined),
+                _ = lease_lost.cancelled() => AttemptOutcome::LeaseLost,
+                _ = cancel_requested.cancelled() => AttemptOutcome::Cancelled("cancelled by the control plane"),
+                _ = sleep_until_deadline(until_deadline) => AttemptOutcome::Cancelled("whole-task deadline expired mid-attempt"),
             };
             heartbeat.abort();
 
-            let Some(joined) = joined else {
-                // Dropping the JoinHandle alone would detach the handler and
-                // let it keep running; abort it and await the abort so the
-                // handler future is really dropped before the next claim.
-                handle.abort();
-                let _ = handle.await;
-                tracing::warn!("lease lost; activity aborted and left for the server to reassign");
-                return;
+            let joined = match outcome {
+                AttemptOutcome::Finished(joined) => joined,
+                AttemptOutcome::LeaseLost => {
+                    // Dropping the JoinHandle alone would detach the handler and
+                    // let it keep running; abort it and await the abort so the
+                    // handler future is really dropped before the next claim.
+                    handle.abort();
+                    let _ = handle.await;
+                    tracing::warn!("lease lost; activity aborted and left for the server to reassign");
+                    return;
+                }
+                AttemptOutcome::Cancelled(reason) => {
+                    // Same abort discipline as lease loss, but here we still
+                    // hold the lease: settle the attempt as cancelled so the
+                    // record ends terminal-cancelled rather than waiting out
+                    // the lease.
+                    handle.abort();
+                    let _ = handle.await;
+                    tracing::warn!(reason, "activity aborted");
+                    self.fail(
+                        &task_id,
+                        ErrorClass::Cancelled,
+                        format!("activity `{}` {reason}", task.kind),
+                        false,
+                    )
+                    .await;
+                    return;
+                }
             };
 
             match joined {
@@ -639,12 +759,17 @@ impl ActivityWorker {
     }
 
     /// Spawn the background heartbeat loop for one claimed task: renew the
-    /// lease every `lease / 3`; on a `409`, cancel `lease_lost` (which aborts
-    /// the handler) and exit.
+    /// lease every `lease / 3`. The loop ends the worker's wait on the
+    /// handler in two cases: a `409` cancels `lease_lost` (the server
+    /// reassigns; the worker abandons), and a `200` carrying
+    /// `cancel_requested: true` cancels `cancel_requested` (the worker
+    /// aborts promptly and reports the attempt as cancelled through the
+    /// fail path — the whole point of the hint).
     fn spawn_heartbeat(
         &self,
         task_id: &str,
         lease_lost: CancellationToken,
+        cancel_requested: CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
         let client = self.client.clone();
         let url = format!("{}/tasks/{task_id}/heartbeat", self.base_url);
@@ -664,13 +789,26 @@ impl ActivityWorker {
                 };
                 match client.post(&url).json(&body).send().await {
                     Ok(response) if response.status() == StatusCode::OK => {
-                        let expires_at = response
-                            .json::<HeartbeatResponse>()
-                            .await
-                            .ok()
-                            .and_then(|r| r.lease_expires_at)
-                            .unwrap_or_else(|| "<undecodable>".to_owned());
-                        tracing::debug!(lease_expires_at = %expires_at, "lease renewed");
+                        match response.json::<HeartbeatResponse>().await {
+                            Ok(renewed) => {
+                                if renewed.cancel_requested {
+                                    tracing::warn!(
+                                        "heartbeat carried cancel_requested; aborting the attempt"
+                                    );
+                                    cancel_requested.cancel();
+                                    return;
+                                }
+                                let expires_at = renewed
+                                    .lease_expires_at
+                                    .unwrap_or_else(|| "<missing>".to_owned());
+                                tracing::debug!(lease_expires_at = %expires_at, "lease renewed");
+                            }
+                            Err(_) => {
+                                // An undecodable renewal is not a lease-loss
+                                // signal; the 409 is. Keep heartbeating.
+                                tracing::warn!("heartbeat reply undecodable; will retry");
+                            }
+                        }
                     }
                     Ok(response) if response.status() == StatusCode::CONFLICT => {
                         tracing::warn!("heartbeat rejected (409): lease lost");
@@ -848,6 +986,8 @@ mod tests {
                 "result": null,
                 "run_id": "run-9",
                 "thread_id": "thread-1",
+                "cancel_requested": false,
+                "deadline": "2026-08-07T13:00:00Z",
                 "lease": {"owner": "w-1", "expires_at": "2026-08-07T12:00:30Z"},
                 "next_attempt_at": null,
                 "created_at": "2026-08-07T12:00:00Z",
@@ -864,16 +1004,26 @@ mod tests {
         assert_eq!(task.idempotency_key.as_deref(), Some("run-9:charge:7"));
         assert_eq!(task.run_id.as_deref(), Some("run-9"));
         assert_eq!(task.thread_id.as_deref(), Some("thread-1"));
+        assert!(!task.cancel_requested);
+        assert_eq!(
+            task.deadline,
+            DateTime::parse_from_rfc3339("2026-08-07T13:00:00Z")
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc))
+        );
     }
 
     #[test]
     fn claimed_task_defaults_optional_fields() {
+        // A pre-wave-2 server omits the cancellation fields entirely.
         let task: ClaimedTask =
             serde_json::from_value(json!({"task_id": "t-1", "kind": "k"})).unwrap();
         assert_eq!(task.payload, Value::Null);
         assert_eq!(task.attempt, 0);
         assert!(task.idempotency_key.is_none());
         assert!(task.run_id.is_none() && task.thread_id.is_none());
+        assert!(!task.cancel_requested);
+        assert!(task.deadline.is_none());
     }
 
     #[test]
@@ -945,6 +1095,14 @@ mod tests {
             heartbeat.lease_expires_at.as_deref(),
             Some("2026-08-07T12:00:30Z")
         );
+        // The cancellation hint defaults off (pre-wave-2 servers omit it).
+        assert!(!heartbeat.cancel_requested);
+
+        let heartbeat: HeartbeatResponse = serde_json::from_value(
+            json!({"lease_expires_at": "2026-08-07T12:00:30Z", "cancel_requested": true}),
+        )
+        .unwrap();
+        assert!(heartbeat.cancel_requested);
 
         let fail: FailResponse = serde_json::from_value(json!({
             "requeued": true,

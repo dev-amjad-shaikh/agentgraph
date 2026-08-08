@@ -313,3 +313,164 @@ async fn postgres_lease_expiry_reclaims_and_tenants_are_isolated() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
 }
+
+// --------------------------------------------------------------------- //
+// Cancellation propagation (R0.6 wave 2a) — parity with the file backend
+// --------------------------------------------------------------------- //
+
+#[tokio::test]
+#[ignore = "requires a live Postgres (DATABASE_URL)"]
+async fn postgres_cancel_matches_the_file_backends_semantics() {
+    let app = postgres_app();
+    // Tests in this file share one scratch database and run concurrently;
+    // a unique pool per test keeps claims from stealing each other's tasks.
+    let pool = format!("cancel-{}", uniq());
+
+    // Queued task: cancel is immediate-terminal, never leased, never DLQ.
+    let (status, v) = call(
+        &app,
+        "POST",
+        "/tasks",
+        Some(json!({"kind": "k", "payload": {}, "pool": pool,
+                    "idempotency_key": format!("cancel-q-{}", uniq())})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "enqueue failed: {v}");
+    let queued = v["task_id"].as_str().unwrap().to_string();
+    let (status, v) = call(&app, "POST", &format!("/tasks/{queued}/cancel"), None).await;
+    assert_eq!(status, StatusCode::OK, "cancel failed: {v}");
+    assert_eq!(v["status"], json!("cancelled"));
+    assert_eq!(v["error_class"], json!("cancelled"));
+    // Re-cancelling a terminal task is 409.
+    let (status, _) = call(&app, "POST", &format!("/tasks/{queued}/cancel"), None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Leased task: cancel signals; the holder's heartbeat carries the
+    // hint; the cancelled fail report lands terminal-cancelled.
+    let (status, v) = call(
+        &app,
+        "POST",
+        "/tasks",
+        Some(json!({"kind": "k", "payload": {}, "pool": pool,
+                    "idempotency_key": format!("cancel-l-{}", uniq())})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "enqueue failed: {v}");
+    let leased = v["task_id"].as_str().unwrap().to_string();
+    let (status, v) = call(
+        &app,
+        "POST",
+        "/tasks/claim",
+        Some(json!({"worker_id": "pg-worker", "pools": [pool], "lease_ms": 60_000})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "claim failed: {v}");
+    assert_eq!(v["task"]["task_id"], json!(leased));
+
+    let (status, v) = call(&app, "POST", &format!("/tasks/{leased}/cancel"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["status"], json!("leased"));
+    assert_eq!(v["cancel_requested"], json!(true));
+
+    let (status, v) = call(
+        &app,
+        "POST",
+        &format!("/tasks/{leased}/heartbeat"),
+        Some(json!({"worker_id": "pg-worker", "lease_ms": 60_000})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "heartbeat failed: {v}");
+    assert_eq!(v["cancel_requested"], json!(true));
+
+    let (status, v) = call(
+        &app,
+        "POST",
+        &format!("/tasks/{leased}/fail"),
+        Some(json!({"worker_id": "pg-worker", "error_class": "cancelled",
+                    "message": "cancelled by the control plane", "retryable": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "fail failed: {v}");
+    assert_eq!(v["dead"], json!(false));
+    assert_eq!(v["requeued"], json!(false));
+    let (status, v) = call(&app, "GET", &format!("/tasks/{leased}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["status"], json!("cancelled"));
+
+    // Neither task is claimable or dead-lettered.
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/tasks/claim",
+        Some(json!({"worker_id": "pg-worker-2", "pools": [pool], "lease_ms": 60_000})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, v) = call(&app, "GET", "/tasks?status=dead", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !v.as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["task_id"] == json!(queued) || t["task_id"] == json!(leased)),
+        "cancelled tasks must never dead-letter"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres (DATABASE_URL)"]
+async fn postgres_cancel_and_claim_race_leaves_a_consistent_record() {
+    let app = postgres_app();
+    // Unique pool per round: tests here share the scratch database (see
+    // the parity test above).
+    let pool = format!("race-{}", uniq());
+
+    // Five rounds of one-task races: whichever lands first, the record
+    // ends in exactly one of the two coherent states.
+    for round in 0..5 {
+        let (status, v) = call(
+            &app,
+            "POST",
+            "/tasks",
+            Some(
+                json!({"kind": "race", "payload": {"round": round}, "pool": pool,
+                        "idempotency_key": format!("race-{round}-{}", uniq())}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "enqueue failed: {v}");
+        let task_id = v["task_id"].as_str().unwrap().to_string();
+
+        let (claim, cancel) = futures::future::join(
+            call(
+                &app,
+                "POST",
+                "/tasks/claim",
+                Some(
+                    json!({"worker_id": format!("racer-{round}"), "pools": [pool],
+                            "lease_ms": 60_000}),
+                ),
+            ),
+            call(&app, "POST", &format!("/tasks/{task_id}/cancel"), None),
+        )
+        .await;
+
+        let (status, v) = call(&app, "GET", &format!("/tasks/{task_id}"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        match (claim.0, cancel.0) {
+            // The cancel landed first: claim saw nothing, task is terminal.
+            (StatusCode::NO_CONTENT, StatusCode::OK) => {
+                assert_eq!(v["status"], json!("cancelled"));
+                assert_eq!(v["lease"], Value::Null);
+            }
+            // The claim landed first: the task is leased with the
+            // cancellation signalled to the holder.
+            (StatusCode::OK, StatusCode::OK) => {
+                assert_eq!(v["status"], json!("leased"));
+                assert_eq!(v["cancel_requested"], json!(true));
+                assert_eq!(v["lease"]["owner"], json!(format!("racer-{round}")));
+            }
+            other => panic!("incoherent race outcome: {other:?}"),
+        }
+    }
+}
