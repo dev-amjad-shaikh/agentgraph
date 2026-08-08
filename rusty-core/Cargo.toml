@@ -20,6 +20,10 @@ autobenches = false
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+# Cooperative cancellation (R0.6 wave 2c): `RunConfig::with_cancellation`
+# threads a `CancellationToken` into the executor — the same token type the
+# worker's lease/heartbeat protocol already uses.
+tokio-util = "0.7"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

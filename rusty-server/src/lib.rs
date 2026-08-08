@@ -87,9 +87,23 @@ use std::path::PathBuf;
 use axum::Router;
 use rusty_agent_runtime::graph::Graph;
 use rusty_agent_runtime::state::StateSpec;
+use tokio_util::sync::CancellationToken;
 
 pub use error::ApiError;
 pub use runs::RunStatus;
+
+/// Default bound on graceful shutdown (25 s): how long
+/// [`serve_with_shutdown`] lets in-flight requests, runs, and the outbox
+/// relay finish after the shutdown signal before the server stops anyway.
+///
+/// Chosen to fit under two outer backstops: Kubernetes' default 30 s
+/// pod-termination grace (so the drain finishes before SIGKILL would
+/// arrive) and the task queue's default 30 s lease (so a drained server has
+/// released its work well before lease expiry would reassign it). The
+/// durable machinery — checkpoint resume, lease expiry — remains the
+/// correctness net; the grace bound only decides how *fast* the common
+/// case is. Override with [`ServerConfig::with_shutdown_grace`].
+pub const DEFAULT_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(25);
 
 /// Names the JSON-file layout already owns at the store root
 /// (`assistants/`, `crons/`, `journals/`, `outbox/`, `store/`, `tasks/`,
@@ -235,6 +249,13 @@ pub struct ServerConfig {
     /// publishing dedupes on the task's idempotency key — so this only
     /// tunes outbox-to-queue latency, not correctness.
     pub outbox_relay_interval: std::time::Duration,
+
+    /// Bound on graceful shutdown (R0.6 wave 2c, default
+    /// [`DEFAULT_SHUTDOWN_GRACE`]): after the shutdown signal, in-flight
+    /// requests and runs get this long to finish before the server stops
+    /// regardless. Runs stopped by the drain are resumable from their last
+    /// checkpoint, so a short grace costs a resume, never work.
+    pub shutdown_grace: std::time::Duration,
 }
 
 impl Default for ServerConfig {
@@ -248,6 +269,7 @@ impl Default for ServerConfig {
             api_keys: Vec::new(),
             event_log_capacity: 1000,
             outbox_relay_interval: crate::outbox::DEFAULT_RELAY_INTERVAL,
+            shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
         }
     }
 }
@@ -356,19 +378,79 @@ impl ServerConfig {
         self.outbox_relay_interval = interval;
         self
     }
+
+    /// Builder-style: set the graceful-shutdown bound (R0.6 wave 2c; see
+    /// [`DEFAULT_SHUTDOWN_GRACE`] for the default's rationale). Past this
+    /// window the server stops even if requests or runs are still in flight
+    /// — durability (checkpoint resume, lease expiry) is the backstop.
+    pub fn with_shutdown_grace(mut self, grace: std::time::Duration) -> Self {
+        self.shutdown_grace = grace;
+        self
+    }
 }
 
 /// Build the axum [`Router`] for a registry and config. Use this to embed the
 /// rusty-server routes into a larger application, or to drive the API in tests
 /// via `tower::ServiceExt::oneshot`.
+///
+/// The router's drain control is internal and never fires (embedders who
+/// want cooperative drain should use [`router_with_shutdown`]).
 pub fn router(registry: GraphRegistry, config: ServerConfig) -> Router {
-    routes::router(registry, config)
+    router_with_shutdown(registry, config, CancellationToken::new())
+}
+
+/// Build the axum [`Router`] with an explicit drain control (R0.6 wave 2c).
+///
+/// Cancelling `shutdown` starts the cooperative drain **inside** the
+/// application — in-flight runs stop at their next checkpoint boundary, the
+/// outbox relay finishes its current pass and stops, the cron scheduler
+/// stops firing, and new run submissions are rejected with `503` — while
+/// the HTTP surface keeps serving so in-flight requests can complete.
+/// Stopping HTTP itself is the embedder's job (axum's
+/// `with_graceful_shutdown`); [`serve_with_shutdown`] wires both halves
+/// together.
+pub fn router_with_shutdown(
+    registry: GraphRegistry,
+    config: ServerConfig,
+    shutdown: CancellationToken,
+) -> Router {
+    routes::router_with_shutdown(registry, config, shutdown)
 }
 
 /// Build the router and bind it to `config.bind_addr`. Blocks until the
-/// server shuts down.
+/// server shuts down: SIGINT or SIGTERM starts the graceful drain described
+/// on [`serve_with_shutdown`].
 pub async fn serve(registry: GraphRegistry, config: ServerConfig) -> std::io::Result<()> {
+    serve_with_shutdown(registry, config, shutdown_signal()).await
+}
+
+/// Build the router, bind it to `config.bind_addr`, and serve until
+/// `shutdown` resolves, then drain gracefully (R0.6 wave 2c). The drain is
+/// ordered so the common case of a rolling deploy strands nothing:
+///
+/// 1. **Stop taking new work.** axum stops accepting connections; the
+///    server's shared drain token fires, so new run submissions answer
+///    `503` and the cron scheduler stops firing.
+/// 2. **Let in-flight work land.** In-flight requests complete (axum waits
+///    for them); in-flight runs are cooperatively cancelled at their next
+///    super-step boundary — where a checkpoint was just persisted — and
+///    end terminal-`cancelled`, resumable by re-running the thread; the
+///    outbox relay finishes its current publish pass and stops (pending
+///    rows are durable and publish on the next process's first pass).
+/// 3. **Stop, bounded.** The whole drain is capped at
+///    [`ServerConfig::shutdown_grace`]. Past it the server returns anyway:
+///    anything still in flight is abandoned mid-step, which is exactly the
+///    crash case the durable machinery already covers — runs resume from
+///    their last checkpoint and leased tasks return to visibility within
+///    one lease period. Grace makes the common case fast; it is never the
+///    correctness mechanism.
+pub async fn serve_with_shutdown(
+    registry: GraphRegistry,
+    config: ServerConfig,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
     let addr = config.bind_addr;
+    let grace = config.shutdown_grace;
     // Open (dev) mode on a non-loopback address exposes the full API — run
     // creation, KV writes, checkpoint deletion — to the network. That's a
     // legitimate dev choice, but it must never be a quiet one.
@@ -379,8 +461,64 @@ pub async fn serve(registry: GraphRegistry, config: ServerConfig) -> std::io::Re
              configure `with_api_key`/`with_tenant_key` or bind 127.0.0.1"
         );
     }
-    let app = router(registry, config);
+    let draining = CancellationToken::new();
+    let app = router_with_shutdown(registry, config, draining.clone());
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "rusty-server listening");
-    axum::serve(listener, app).await
+    let server = axum::serve(listener, app).with_graceful_shutdown({
+        let draining = draining.clone();
+        async move {
+            shutdown.await;
+            tracing::info!(
+                grace_ms = grace.as_millis() as u64,
+                "shutdown requested; draining"
+            );
+            // One token drives the whole cooperative drain: runs stop at
+            // their next checkpoint boundary, the relay finishes its pass,
+            // the cron scheduler stops, new runs are rejected.
+            draining.cancel();
+        }
+    });
+    tokio::select! {
+        // `WithGracefulShutdown` is `IntoFuture`, not `Future`, so it needs
+        // this async wrapper to sit in a `select!` arm.
+        result = async { server.await } => result,
+        () = async {
+            // The grace clock starts when the drain does. axum's graceful
+            // shutdown waits for in-flight connections without a bound of
+            // its own, so this arm is the bound.
+            draining.cancelled().await;
+            tokio::time::sleep(grace).await;
+        } => {
+            tracing::warn!(
+                grace_ms = grace.as_millis() as u64,
+                "drain grace expired; forcing shutdown — in-flight runs resume \
+                 from their last checkpoint and leased tasks return at lease expiry"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// The default shutdown signal for [`serve`]: resolves on SIGINT or SIGTERM
+/// (the two signals orchestrators and terminals actually send). Exposed so
+/// binaries that compose their own shutdown logic can reuse it.
+pub async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        // Signal-handler installation only fails when the fd limit is
+        // exhausted; a server that cannot hear SIGTERM must not start
+        // pretending it drains gracefully.
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("installing the SIGTERM handler must succeed");
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = sigterm.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ctrl_c.await;
+    }
 }

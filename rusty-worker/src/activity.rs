@@ -63,9 +63,20 @@
 //!   never retried, never dead-lettered. A task claimed with the deadline
 //!   already passed (or the cancel flag already set) is reported cancelled
 //!   without running the handler at all.
-//! - **Graceful drain.** Cancelling the shutdown [`CancellationToken`] stops
-//!   claiming; an in-flight activity runs to its outcome and is settled
-//!   before [`ActivityWorker::run`] returns.
+//! - **Graceful drain (R0.6 wave 2c).** Cancelling the shutdown
+//!   [`CancellationToken`] *is* the drain request — idempotent, and
+//!   race-safe against an in-flight claim poll (the poll itself is
+//!   `select!`ed against the token). Draining stops claiming immediately;
+//!   an in-flight activity keeps heartbeating and settles normally,
+//!   bounded by [`ActivityWorker::with_drain_grace`] (default
+//!   [`DEFAULT_DRAIN_GRACE`], 25 s — under the 30 s default lease and
+//!   Kubernetes' 30 s pod-termination grace). An attempt that outlives
+//!   the grace is aborted and deliberately **not** settled: reporting it
+//!   [`ErrorClass::Cancelled`] would kill the task (cancelled is
+//!   terminal), while leaving it unsettled releases it back to visibility
+//!   at lease expiry for another worker — the design's "finishes or
+//!   fast-fails in-flight attempts within a grace period, and releases
+//!   the rest".
 //! - **Failure classification.** Handler errors reach `/fail` under the
 //!   frozen [`ErrorClass`] taxonomy (shared with the server scheduler via
 //!   `rusty_agent_runtime::durable`), with the `retryable` flag mirroring
@@ -126,6 +137,18 @@ pub const DEFAULT_CLAIM_BACKOFF_BASE: Duration = Duration::from_millis(100);
 
 /// Default cap for the claim-poll backoff.
 pub const DEFAULT_CLAIM_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+/// Default drain grace (25 s): once draining starts, an in-flight activity
+/// gets this long to finish and settle before the worker aborts it and
+/// exits, leaving the attempt for the server to reassign at lease expiry.
+///
+/// Chosen to sit under the [`DEFAULT_LEASE`] of 30 s — the drain never
+/// outlives the visibility window the lease already provides — and under
+/// Kubernetes' default 30 s pod-termination grace, so a drained worker
+/// exits before SIGKILL would arrive. Override with
+/// [`ActivityWorker::with_drain_grace`]; when you also change the lease,
+/// keep the grace below it.
+pub const DEFAULT_DRAIN_GRACE: Duration = Duration::from_secs(25);
 
 // The server's accepted `lease_ms` range (`tasks::MIN_LEASE_MS..=MAX_LEASE_MS`
 // in rusty-server): below 100 ms a lease is an instant expiry, above one
@@ -393,6 +416,9 @@ fn classify_error(error: &RustyError) -> (ErrorClass, bool) {
         RustyError::Replay(_) => (ErrorClass::Unknown, false),
         RustyError::Serialization(_) => (ErrorClass::Unknown, false),
         RustyError::Interrupt { .. } => (ErrorClass::Cancelled, false),
+        // A handler whose own inner run was drained propagates the
+        // cancellation class: control flow, never retried.
+        RustyError::Cancelled(_) => (ErrorClass::Cancelled, false),
     }
 }
 
@@ -410,7 +436,9 @@ enum ClaimOutcome {
 /// Why the attempt runner stopped waiting on the handler future: finished
 /// normally, the lease is gone (abandon — the server reassigns), or the
 /// task was cancelled (abort, then report [`ErrorClass::Cancelled`]
-/// through the fail path while we still hold the lease).
+/// through the fail path while we still hold the lease), or the drain
+/// grace expired (abort, then leave the attempt unsettled — see
+/// [`ActivityWorker::run`]'s drain semantics).
 enum AttemptOutcome {
     /// The handler future completed (possibly with an error or panic).
     Finished(std::result::Result<Result<ActivityCompletion>, tokio::task::JoinError>),
@@ -421,6 +449,13 @@ enum AttemptOutcome {
     /// `cancel_requested: true`, or the whole-task deadline expired. The
     /// payload is the reason recorded on the fail report.
     Cancelled(&'static str),
+    /// The worker is draining and the in-flight attempt outlived the
+    /// configured grace. Like [`AttemptOutcome::LeaseLost`] the attempt is
+    /// abandoned without a settle call — but deliberately, not because the
+    /// lease is gone: settling `cancelled` would kill the task outright,
+    /// while leaving it unsettled lets lease expiry hand it to a worker
+    /// that is not being deployed away.
+    DrainGraceExpired,
 }
 
 /// The deadline arm of the attempt runner's `select!`: fires when the
@@ -458,6 +493,9 @@ pub struct ActivityWorker {
     pools: Vec<String>,
     claim_backoff_base: Duration,
     claim_backoff_max: Duration,
+    /// How long an in-flight activity may run after draining starts before
+    /// the worker aborts it and exits (see [`DEFAULT_DRAIN_GRACE`]).
+    drain_grace: Duration,
 }
 
 impl ActivityWorker {
@@ -484,6 +522,7 @@ impl ActivityWorker {
             pools: Vec::new(),
             claim_backoff_base: DEFAULT_CLAIM_BACKOFF_BASE,
             claim_backoff_max: DEFAULT_CLAIM_BACKOFF_MAX,
+            drain_grace: DEFAULT_DRAIN_GRACE,
         }
     }
 
@@ -537,6 +576,18 @@ impl ActivityWorker {
         self
     }
 
+    /// Override the drain grace (default [`DEFAULT_DRAIN_GRACE`]): how long
+    /// an in-flight activity may keep running after the shutdown token
+    /// fires before the worker aborts it and exits. An aborted attempt is
+    /// deliberately **not** settled — it returns to visibility at lease
+    /// expiry for another worker — so keep the grace under the lease:
+    /// beyond the lease the abort buys nothing (the server would reassign
+    /// at the same moment either way).
+    pub fn with_drain_grace(mut self, grace: Duration) -> Self {
+        self.drain_grace = grace;
+        self
+    }
+
     /// The identity this worker presents to the server.
     pub fn worker_id(&self) -> &str {
         &self.worker_id
@@ -544,6 +595,25 @@ impl ActivityWorker {
 
     /// Run the claim → execute → settle loop until `shutdown` is cancelled,
     /// then drain: stop claiming, settle any in-flight activity, and return.
+    ///
+    /// Cancelling `shutdown` **is** the drain request — there is no separate
+    /// `drain()` because the token already is the control: idempotent
+    /// (cancelling twice changes nothing), race-safe (a cancel racing an
+    /// in-flight claim poll still wins, because the claim itself is
+    /// `select!`ed against the token), and shareable (every clone of the
+    /// token observes the same signal). Wire it to SIGTERM/SIGINT in the
+    /// embedding binary; see the crate's `activity_worker_demo` example.
+    ///
+    /// Drain semantics: claiming stops immediately; an in-flight activity
+    /// keeps heartbeating and settles normally, bounded by
+    /// [`ActivityWorker::with_drain_grace`]. An attempt still running when
+    /// the grace expires is aborted and deliberately **not** settled —
+    /// reporting it [`ErrorClass::Cancelled`] would kill the task
+    /// (cancelled is terminal: never retried, never dead-lettered), which
+    /// is exactly what a deployment must not do. Left unsettled, the
+    /// attempt returns to visibility at lease expiry and another worker
+    /// picks it up — the design's "releases the rest, which return to
+    /// visibility for other workers".
     ///
     /// The loop never gives up on the server: claim/heartbeat/settle
     /// transport failures are logged and retried with backoff, because in a
@@ -555,17 +625,24 @@ impl ActivityWorker {
             lease_ms = self.lease_ms(),
             pools = ?self.pools,
             kinds = ?self.registered_kinds(),
+            drain_grace_ms = self.drain_grace.as_millis() as u64,
             "activity worker started"
         );
         let mut backoff = self.claim_backoff_base;
         loop {
-            if shutdown.is_cancelled() {
-                break;
-            }
-            match self.claim().await {
+            // The claim poll itself is raced against the token: a drain
+            // that starts mid-poll still stops this worker from taking the
+            // lease. (If the server answered just as the poll was dropped,
+            // the task is leased to a worker that never runs it — it
+            // returns at lease expiry, the same backstop as a crash.)
+            let claim = tokio::select! {
+                _ = shutdown.cancelled() => break,
+                outcome = self.claim() => outcome,
+            };
+            match claim {
                 ClaimOutcome::Task(task) => {
                     backoff = self.claim_backoff_base;
-                    self.run_activity(task).await;
+                    self.run_activity(task, &shutdown).await;
                 }
                 ClaimOutcome::Empty | ClaimOutcome::Unavailable => {
                     let delay = backoff;
@@ -635,8 +712,10 @@ impl ActivityWorker {
 
     /// Execute one claimed task and settle it, inside a `rusty.activity`
     /// span. The one case without a settle call is lease loss: the server
-    /// owns the task again, so any call from us would `409`.
-    async fn run_activity(&self, task: ClaimedTask) {
+    /// owns the task again, so any call from us would `409`. (Drain-grace
+    /// expiry is the deliberate second case — see
+    /// [`AttemptOutcome::DrainGraceExpired`].)
+    async fn run_activity(&self, task: ClaimedTask, shutdown: &CancellationToken) {
         let span = tracing::info_span!(
             "rusty.activity",
             worker_id = %self.worker_id,
@@ -720,11 +799,20 @@ impl ActivityWorker {
             // `/execute`: a panic must surface as an outcome, not a
             // torn-down worker.
             let mut handle = tokio::spawn(async move { handler.run_with_receipt(ctx).await });
+            // The drain bound: starts counting when the drain starts (not
+            // at claim time), so a worker idle for hours and drained
+            // mid-attempt still gets the full grace for that attempt.
+            let drain_grace = self.drain_grace;
+            let drained = shutdown.clone();
             let outcome = tokio::select! {
                 joined = &mut handle => AttemptOutcome::Finished(joined),
                 _ = lease_lost.cancelled() => AttemptOutcome::LeaseLost,
                 _ = cancel_requested.cancelled() => AttemptOutcome::Cancelled("cancelled by the control plane"),
                 _ = sleep_until_deadline(until_deadline) => AttemptOutcome::Cancelled("whole-task deadline expired mid-attempt"),
+                _ = async {
+                    drained.cancelled().await;
+                    tokio::time::sleep(drain_grace).await;
+                } => AttemptOutcome::DrainGraceExpired,
             };
             heartbeat.abort();
 
@@ -737,6 +825,21 @@ impl ActivityWorker {
                     handle.abort();
                     let _ = handle.await;
                     tracing::warn!("lease lost; activity aborted and left for the server to reassign");
+                    return;
+                }
+                AttemptOutcome::DrainGraceExpired => {
+                    // Same abort discipline as lease loss, and the same "no
+                    // settle call" — but by choice: the lease is still
+                    // held, and reporting `cancelled` would kill the task
+                    // (terminal, never retried). Leaving it unsettled
+                    // releases the task back to visibility at lease expiry
+                    // for a worker that is still serving.
+                    handle.abort();
+                    let _ = handle.await;
+                    tracing::warn!(
+                        drain_grace_ms = drain_grace.as_millis() as u64,
+                        "drain grace expired; activity aborted and left for reassignment at lease expiry"
+                    );
                     return;
                 }
                 AttemptOutcome::Cancelled(reason) => {

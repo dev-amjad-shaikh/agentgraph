@@ -16,6 +16,15 @@
 //! beyond that (active and queued runs are never evicted). Run history is
 //! in-memory by design — durability lives in the checkpoint log.
 //!
+//! Drain (R0.6 wave 2c): the server's shutdown token is threaded into every
+//! run's executor ([`RunConfig::with_cancellation`]). When it fires, each
+//! in-flight run stops at its next super-step boundary — a point where a
+//! checkpoint was just persisted — and ends terminal-[`RunStatus::Cancelled`],
+//! resumable by simply re-running the thread; new submissions answer 503 and
+//! queued runs are not promoted. Anything still mid-step when the grace
+//! window closes is abandoned, which is the crash case the checkpoint log
+//! already covers.
+//!
 //! Flight Recorder: every run is journaled. The journal is attached to the
 //! executor at run start, flushed to the server store at every checkpoint
 //! boundary (in [`forward_events`]) and once more at run completion, and
@@ -154,6 +163,11 @@ pub enum RunStatus {
     Interrupted,
     /// Failed.
     Error,
+    /// Stopped by the graceful-shutdown drain (R0.6 wave 2c) at a
+    /// super-step boundary. Control flow, not failure — the boundary
+    /// checkpoint is intact, so re-running the thread resumes the run from
+    /// exactly where it stopped.
+    Cancelled,
 }
 
 impl RunStatus {
@@ -165,7 +179,18 @@ impl RunStatus {
             RunStatus::Success => "success",
             RunStatus::Interrupted => "interrupted",
             RunStatus::Error => "error",
+            RunStatus::Cancelled => "cancelled",
         }
+    }
+
+    /// `true` once the run can no longer make progress in this process
+    /// (terminal statuses, including `Cancelled`: a drained run resumes in
+    /// a *new* run, never in place).
+    pub(crate) fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            RunStatus::Success | RunStatus::Interrupted | RunStatus::Error | RunStatus::Cancelled
+        )
     }
 }
 
@@ -453,11 +478,18 @@ impl RunManager {
     /// Record the terminal status + JSON, wake waiters, release the thread
     /// slot, and return the next queued run id for the thread (if any), now
     /// marked active.
+    ///
+    /// `draining` (the server's shutdown drain) suppresses queue promotion:
+    /// the slot frees but nothing is returned — a run promoted into a
+    /// shutting-down process would only be cancelled at its first boundary.
+    /// Queued runs stay `Pending`; their threads' checkpoints are intact
+    /// for the next process to re-drive.
     pub(crate) async fn finish(
         &self,
         run_id: &str,
         status: RunStatus,
         terminal: Value,
+        draining: bool,
     ) -> Option<String> {
         let mut inner = self.inner.lock().await;
         let handle = inner.runs.get_mut(run_id)?;
@@ -476,10 +508,14 @@ impl RunManager {
             inner.active_by_thread.remove(&thread_id);
         }
 
-        let next = inner
-            .queues
-            .get_mut(&thread_id)
-            .and_then(VecDeque::pop_front);
+        let next = if draining {
+            None
+        } else {
+            inner
+                .queues
+                .get_mut(&thread_id)
+                .and_then(VecDeque::pop_front)
+        };
         if let Some(next_id) = &next {
             if let Some(h) = inner.runs.get_mut(next_id) {
                 h.status = RunStatus::Running;
@@ -495,12 +531,10 @@ impl RunManager {
             let Some(candidate) = inner.order.pop_front() else {
                 break;
             };
-            let evictable = inner.runs.get(&candidate).is_some_and(|h| {
-                matches!(
-                    h.status,
-                    RunStatus::Success | RunStatus::Interrupted | RunStatus::Error
-                )
-            });
+            let evictable = inner
+                .runs
+                .get(&candidate)
+                .is_some_and(|h| h.status.is_terminal());
             if evictable {
                 inner.runs.remove(&candidate);
                 excess -= 1;
@@ -525,6 +559,9 @@ pub(crate) struct RunDeps {
     pub server_store: Arc<dyn ServerStore>,
     pub queue_cap: usize,
     pub log_capacity: usize,
+    /// The server's drain control (R0.6 wave 2c): threaded into every run's
+    /// executor, which observes it at super-step boundaries.
+    pub shutdown: tokio_util::sync::CancellationToken,
 }
 
 /// The result of successfully scheduling a run: everything an endpoint
@@ -551,6 +588,14 @@ pub(crate) async fn schedule(
     payload: RunPayload,
     strategy: MultitaskStrategy,
 ) -> Result<Scheduled, ApiError> {
+    // A draining server must not take new runs: the token would cancel
+    // them at their first boundary anyway, and a 503 lets the caller (or
+    // its load balancer) retry against a pod that is still serving.
+    if deps.shutdown.is_cancelled() {
+        return Err(ApiError::shutting_down(format!(
+            "server is draining; resubmit run on thread `{wire_thread_id}` against a running instance"
+        )));
+    }
     let run_id = uuid::Uuid::new_v4().to_string();
     let (bcast_tx, _bcast_rx) = broadcast::channel(256);
     let (terminal_tx, terminal_rx) = watch::channel(None);
@@ -657,7 +702,11 @@ async fn execute(deps: RunDeps, run_id: String) {
 
     let mut config = RunConfig::new(snap.thread_id.clone())
         .with_event_tx(evt_tx)
-        .with_journal(journal.clone());
+        .with_journal(journal.clone())
+        // Drain hook: when the server shuts down, this run stops at its
+        // next super-step boundary — a point where a checkpoint was just
+        // persisted — instead of being torn down mid-step.
+        .with_cancellation(deps.shutdown.clone());
     if let Some(command) = &snap.payload.command {
         if let Some(resume) = &command.resume {
             config = config.with_resume(resume.clone());
@@ -723,6 +772,23 @@ async fn execute(deps: RunDeps, run_id: String) {
                 "state": state.to_value(),
             });
             (RunStatus::Interrupted, terminal)
+        }
+        Err(error @ RustyError::Cancelled(_)) => {
+            // Drain, not failure: the executor stopped at a super-step
+            // boundary, so the run's last checkpoint is intact and a fresh
+            // run on the thread resumes from it. The wire status is
+            // `cancelled` — matching the task queue's treatment of
+            // cancellation as control flow, never an error.
+            let message = error.to_string();
+            tracing::info!(%run_id, "run drained at a checkpoint boundary; resumable");
+            sink.push("end", step, json!({"status": "cancelled"}));
+            let terminal = json!({
+                "run_id": run_id,
+                "thread_id": snap.wire_thread_id,
+                "status": "cancelled",
+                "message": message,
+            });
+            (RunStatus::Cancelled, terminal)
         }
         Err(error) => {
             let kind = error_kind(&error);
@@ -859,10 +925,7 @@ fn spawn_execute(deps: RunDeps, run_id: String) {
         };
         // If the panic happened after `terminate` completed, the slot is
         // already released — finishing again would double-promote the queue.
-        if matches!(
-            deps.manager.info(&run_id).await.map(|i| i.status),
-            Some(RunStatus::Success | RunStatus::Interrupted | RunStatus::Error)
-        ) {
+        if matches!(deps.manager.info(&run_id).await, Some(info) if info.status.is_terminal()) {
             return;
         }
         let step = snap.sink.current_step();
@@ -883,9 +946,16 @@ fn spawn_execute(deps: RunDeps, run_id: String) {
     });
 }
 
-/// Record the terminal state and spawn the next queued run, if any.
+/// Record the terminal state and spawn the next queued run, if any. While
+/// the server drains, the queue does not advance (see
+/// [`RunManager::finish`]'s `draining` flag).
 async fn terminate(deps: &RunDeps, run_id: &str, status: RunStatus, terminal: Value) {
-    if let Some(next) = deps.manager.finish(run_id, status, terminal).await {
+    let draining = deps.shutdown.is_cancelled();
+    if let Some(next) = deps
+        .manager
+        .finish(run_id, status, terminal, draining)
+        .await
+    {
         spawn_execute(deps.clone(), next);
     }
 }
@@ -902,5 +972,8 @@ fn error_kind(error: &RustyError) -> &'static str {
         RustyError::Serialization(_) => "serialization_error",
         RustyError::InvalidUpdate(_) => "invalid_update",
         RustyError::Replay(_) => "replay_error",
+        // Drain cancellation is control flow and takes its own terminal
+        // path in `execute`; this arm exists for exhaustiveness only.
+        RustyError::Cancelled(_) => "cancelled",
     }
 }

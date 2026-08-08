@@ -67,8 +67,11 @@
 //! the task's kind while a background heartbeat renews the lease every
 //! `lease / 3`, and settles with `complete` or a classified `fail`. Lease
 //! loss (`409`) aborts the activity via a `CancellationToken`, and
-//! cancelling the shutdown token drains in-flight work before exit. See the
-//! [`activity`] module for the protocol and semantics.
+//! cancelling the shutdown token drains the worker: claiming stops, the
+//! in-flight activity settles within a bounded grace (default
+//! [`activity::DEFAULT_DRAIN_GRACE`]), and an attempt that outlives the
+//! grace is aborted and left for the server to reassign at lease expiry.
+//! See the [`activity`] module for the protocol and semantics.
 
 use std::collections::HashMap;
 use std::sync::Arc;

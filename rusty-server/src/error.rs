@@ -47,6 +47,13 @@ impl ApiError {
     pub fn internal(message: String) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
     }
+
+    /// 503 — the server is draining (graceful shutdown) and rejects new
+    /// work. Distinct from 500 so a load balancer's retry lands on a pod
+    /// that is still serving.
+    pub fn shutting_down(message: String) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, "shutting_down", message)
+    }
 }
 
 impl IntoResponse for ApiError {

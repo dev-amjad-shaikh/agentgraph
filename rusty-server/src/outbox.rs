@@ -131,9 +131,9 @@ pub(crate) fn load(root: &Path) -> HashMap<String, OutboxRecord> {
 // --------------------------------------------------------------------- //
 
 /// Spawn the outbox relay: a background task publishing pending outbox rows
-/// into the task queue every `interval`, forever (the same detached-spawn
-/// discipline as the cron scheduler — the relay lives as long as the server
-/// process).
+/// into the task queue every `interval`, until `shutdown` is cancelled (the
+/// same detached-spawn discipline as the cron scheduler — the relay lives
+/// as long as the server process).
 ///
 /// Crash-safety lives in the store, not here: each row's publish (task
 /// insert + mark-published) is one atomic store operation, and the task
@@ -141,14 +141,30 @@ pub(crate) fn load(root: &Path) -> HashMap<String, OutboxRecord> {
 /// leaves only work a restart will redo — never lost, never doubled. A
 /// failed poll is logged and retried on the next tick: in a durable system
 /// the store coming back is the normal case.
-pub(crate) fn spawn_relay(store: Arc<dyn ServerStore>, interval: Duration) {
+///
+/// Drain semantics (R0.6 wave 2c): the token is only observed *between*
+/// passes, so a pass in flight when shutdown starts always completes — an
+/// aborted pass would be safe (publish is idempotent) but needlessly
+/// wasteful. Rows still pending when the relay stops stay pending; the
+/// next process's relay publishes them on its first pass.
+pub(crate) fn spawn_relay(
+    store: Arc<dyn ServerStore>,
+    interval: Duration,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         // A delayed tick must not burst into a publish storm: the relay is
         // a background pump, not a quota to catch up on.
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = shutdown.cancelled() => {
+                    tracing::info!("outbox relay shutting down; pending rows publish on the next process");
+                    break;
+                }
+            }
             match store
                 .outbox_publish_pending(RELAY_BATCH_LIMIT, Utc::now())
                 .await

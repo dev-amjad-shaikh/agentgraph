@@ -84,6 +84,8 @@ A `GraphRegistry` entry is a name plus the two things the executor needs — a `
 
 **Embedding.** `serve(registry, config)` binds and blocks; if you want the routes inside a larger axum application (or want to drive the API in tests via `tower::ServiceExt::oneshot`), call `rusty_server::router(registry, config)` instead and merge the returned `Router` yourself.
 
+**Graceful shutdown (R0.6 wave 2c).** `serve` drains on SIGINT/SIGTERM: axum stops accepting connections and waits for in-flight requests; a shared token cooperatively cancels in-flight runs at their next super-step boundary — where a checkpoint was just persisted, so re-running the thread resumes the work — and ends them terminal-`cancelled`; new run submissions answer `503 shutting_down`; the outbox relay finishes its current pass and stops (pending rows publish on the next process's first pass); the cron scheduler stops firing. The whole drain is bounded by `ServerConfig::with_shutdown_grace` (default 25 s, under Kubernetes' 30 s pod-termination grace); past it the server stops anyway, which is the crash case the checkpoint log and lease expiry already cover. Embedders get the same pieces: `serve_with_shutdown(registry, config, future)` takes any shutdown future, `shutdown_signal()` is the SIGINT/SIGTERM default, and `router_with_shutdown(registry, config, token)` wires the cooperative drain into a self-hosted `Router`.
+
 ## HTTP API
 
 An Agent-Protocol-compatible subset — wire-compatible with the core run/thread shapes LangGraph Platform uses, without the commercial surface. This table is the v0.5 endpoint inventory; everything listed here is implemented and covered by integration tests.

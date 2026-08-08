@@ -223,7 +223,8 @@ point for a later wave.
 
 ## Cancellation propagation + drain (wave 2)
 
-**Cancellation propagation is implemented (wave 2a); drain remains.**
+**Both are implemented: cancellation propagation in wave 2a, drain in wave
+2c.**
 
 - **Propagation.** Cancellation is a tree: cancelling a run
   (`POST /runs/{run_id}/cancel`) cancels its outstanding tasks — every
@@ -250,6 +251,48 @@ point for a later wave.
   period, and releases the rest — which return to visibility for other
   workers. The server drains its per-thread run queues the same way, so a
   rolling deploy never strands a leased task longer than one lease period.
+
+  As implemented (wave 2c):
+
+  - **Worker side.** `ActivityWorker` has no separate `drain()` method:
+    cancelling the `CancellationToken` passed to `run` *is* the drain
+    request — idempotent by construction, and race-safe because the claim
+    poll itself is `select!`ed against the token (a drain starting
+    mid-poll still wins). Draining stops claiming immediately; an
+    in-flight attempt keeps heartbeating and settles normally, bounded by
+    `with_drain_grace` (default `DEFAULT_DRAIN_GRACE` = **25 s**, under the
+    30 s default lease and Kubernetes' 30 s default pod-termination
+    grace). An attempt that outlives the grace is aborted and
+    **deliberately left unsettled** — this is the documented choice for
+    "releases the rest": reporting `ErrorClass::Cancelled` would be a
+    fast-fail, but `cancelled` is terminal (never retried, never
+    dead-lettered), so a fast-fail would kill the task outright, which is
+    exactly what a deployment must not do. Left unsettled, the attempt
+    returns to visibility at lease expiry and a worker that is still
+    serving claims it. Signal handling stays with the embedding binary
+    (`examples/activity_worker_demo.rs` wires SIGTERM/SIGINT to the
+    token); the library exposes the token, per the usual Rust idiom.
+  - **Server side.** `serve` drains on SIGINT/SIGTERM
+    (`serve_with_shutdown` for embedders, `shutdown_signal` as the default
+    signal source, `router_with_shutdown` for self-hosted routers), in a
+    fixed order: (1) axum stops accepting connections and the shared drain
+    token fires — new run submissions answer `503 shutting_down`, the cron
+    scheduler stops; (2) in-flight requests complete, in-flight runs are
+    cooperatively cancelled at their next super-step boundary via the new
+    `RunConfig::cancellation` hook (the executor returns
+    `RustyError::Cancelled`; the server ends them terminal-`cancelled`),
+    and the outbox relay finishes its current pass and stops; (3) the
+    whole drain is bounded by `ServerConfig::with_shutdown_grace` (default
+    **25 s**, matching the worker's grace). **The checkpoint-resume safety
+    net:** cancellation is only ever observed at a super-step boundary —
+    a point where a checkpoint was *just* persisted — so a drained run
+    resumes by re-running the thread from its last checkpoint; and past
+    the grace bound the server stops anyway, which is precisely the crash
+    case lease expiry and the checkpoint log already cover. Drain never
+    decides correctness; it only makes the common case fast. The
+    rolling-deploy property is tested directly: a task leased to a server
+    that goes away mid-lease is claimable by the replacement instance
+    within one lease period.
 
 ## Pools, quotas, version pinning, autoscaling signals (wave 3)
 

@@ -68,6 +68,19 @@ pub enum RustyError {
     /// write to an undeclared channel.
     #[error("invalid state update: {0}")]
     InvalidUpdate(String),
+
+    /// The run was cancelled cooperatively through
+    /// [`crate::executor::RunConfig::cancellation`] (R0.6 wave 2c, drain):
+    /// the executor stopped *at a super-step boundary*, so the boundary
+    /// checkpoint is intact and the run resumes from exactly there.
+    ///
+    /// Like [`RustyError::Interrupt`], this variant is **not** a failure —
+    /// it is control flow (the `cancelled` class of the Durable Work
+    /// taxonomy: never retried, never dead-lettered). Unlike an interrupt,
+    /// nothing is being asked of a human; whoever cancelled decides whether
+    /// and when to re-drive the run from its last checkpoint.
+    #[error("run cancelled: {0}")]
+    Cancelled(String),
 }
 
 impl RustyError {

@@ -50,6 +50,12 @@ pub(crate) struct AppState {
     /// Per-thread locks serializing `update_state`'s read-modify-write:
     /// without one, two concurrent writes could mint the same `step`.
     pub state_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// The cooperative drain control (R0.6 wave 2c): cancelling it stops
+    /// the cron scheduler and the outbox relay, rejects new runs with 503,
+    /// and parks every in-flight run at its next checkpoint boundary.
+    /// [`crate::router`] wires a token that never fires;
+    /// [`crate::serve_with_shutdown`] wires the real one.
+    pub shutdown: tokio_util::sync::CancellationToken,
 }
 
 /// Build the checkpointer + server-store backends for `config`. The default
@@ -78,8 +84,14 @@ fn build_backends(config: &ServerConfig) -> (Arc<dyn Checkpointer>, Arc<dyn Serv
     )
 }
 
-/// Build the full router (used by [`crate::router`]).
-pub(crate) fn router(registry: GraphRegistry, config: ServerConfig) -> Router {
+/// Build the full router with an explicit drain control (used by
+/// [`crate::router`] with a never-fired token, and by
+/// [`crate::router_with_shutdown`] with the real one).
+pub(crate) fn router_with_shutdown(
+    registry: GraphRegistry,
+    config: ServerConfig,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Router {
     let (checkpointer, server_store) = build_backends(&config);
     let run_deps = RunDeps {
         registry: registry.clone(),
@@ -88,6 +100,7 @@ pub(crate) fn router(registry: GraphRegistry, config: ServerConfig) -> Router {
         server_store: Arc::clone(&server_store),
         queue_cap: config.max_concurrent_runs_per_thread.max(1),
         log_capacity: config.event_log_capacity.max(16),
+        shutdown: shutdown.clone(),
     };
     let outbox_relay_interval = config.outbox_relay_interval;
     let state = Arc::new(AppState {
@@ -97,12 +110,17 @@ pub(crate) fn router(registry: GraphRegistry, config: ServerConfig) -> Router {
         run_deps,
         server_store,
         state_locks: Mutex::new(HashMap::new()),
+        shutdown,
     });
     crons::spawn_scheduler(Arc::clone(&state));
     // The outbox relay: publishes pending outbox rows into the task queue
     // (R0.6 wave 2b). Also the crash-recovery path — rows pending at
     // startup publish on its first tick.
-    crate::outbox::spawn_relay(Arc::clone(&state.server_store), outbox_relay_interval);
+    crate::outbox::spawn_relay(
+        Arc::clone(&state.server_store),
+        outbox_relay_interval,
+        state.shutdown.clone(),
+    );
 
     Router::new()
         .route("/ok", get(ok))
@@ -1067,10 +1085,7 @@ async fn run_evidence(
             wire_thread_id: info.wire_thread_id,
             journal,
             checkpoint_ids: runs::lock_recover(&info.checkpoint_ids).clone(),
-            complete: matches!(
-                info.status,
-                RunStatus::Success | RunStatus::Interrupted | RunStatus::Error
-            ),
+            complete: info.status.is_terminal(),
         });
     }
 

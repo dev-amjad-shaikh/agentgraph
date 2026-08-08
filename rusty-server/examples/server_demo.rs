@@ -109,6 +109,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     );
 
     println!("\nrusty-server demo on http://127.0.0.1:8100\n");
+    println!("  (Ctrl-C / SIGTERM drains gracefully: in-flight requests and runs");
+    println!("   finish within the grace window, runs resume from their checkpoints)\n");
     println!("  # liveness + registered graphs");
     println!("  curl localhost:8100/ok");
     println!("  curl localhost:8100/info | jq\n");

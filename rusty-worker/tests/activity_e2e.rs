@@ -847,3 +847,174 @@ async fn deadline_expiring_mid_attempt_aborts_and_reports_cancelled() {
 
     stop_worker(shutdown, handle).await;
 }
+
+// ---------------------------------------------------------------------------
+// Drain (R0.6 wave 2c)
+
+#[tokio::test]
+async fn drain_grace_exceeded_aborts_and_releases_the_task_for_reassignment() {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    state
+        .lock()
+        .unwrap()
+        .tasks
+        .push_back(task_record("task-20", "stuck", json!({}), ""));
+    let base_url = start_mock(state.clone()).await;
+
+    let started = Arc::new(AtomicBool::new(false));
+    let aborted = Arc::new(AtomicBool::new(false));
+    let (started2, aborted2) = (started.clone(), aborted.clone());
+    let worker = test_worker(&base_url)
+        // A short grace: the stuck handler must outlive it.
+        .with_drain_grace(Duration::from_millis(150))
+        .register("stuck", move |_ctx: ActivityContext| {
+            let (started, aborted) = (started2.clone(), aborted2.clone());
+            async move {
+                started.store(true, Ordering::SeqCst);
+                let _guard = AbortProbe(aborted);
+                let () = std::future::pending().await;
+                #[allow(unreachable_code)]
+                Ok(Value::Null)
+            }
+        });
+
+    let shutdown = CancellationToken::new();
+    let handle = spawn_worker(worker, shutdown.clone());
+
+    wait_for("activity in flight", Duration::from_secs(5), || {
+        started.load(Ordering::SeqCst)
+    })
+    .await;
+
+    // Drain mid-attempt: the grace (150 ms) — not the handler — bounds how
+    // long the worker lingers.
+    shutdown.cancel();
+    wait_for(
+        "handler abort at grace expiry",
+        Duration::from_secs(5),
+        || aborted.load(Ordering::SeqCst),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("worker exits promptly after the grace abort")
+        .expect("worker task did not panic");
+
+    let calls = recorded(&state);
+    // The attempt was left UNSETTLED: no complete, and crucially no fail —
+    // reporting `cancelled` would have killed the task. The server will
+    // reassign it at lease expiry.
+    assert!(calls_to(&calls, "/tasks/task-20/complete").is_empty());
+    assert!(calls_to(&calls, "/tasks/task-20/fail").is_empty());
+    assert_eq!(calls_to(&calls, "/tasks/claim").len(), 1);
+
+    // Reassignment: the task returns to visibility (the mock stands in for
+    // the server's lease expiry) and a worker that is not draining claims
+    // and completes it.
+    state
+        .lock()
+        .unwrap()
+        .tasks
+        .push_back(task_record("task-20", "stuck", json!({}), ""));
+    let replacement = test_worker(&base_url)
+        .with_worker_id("w-other")
+        .register("stuck", |_ctx: ActivityContext| async {
+            Ok(json!({"done": true}))
+        });
+    let shutdown_b = CancellationToken::new();
+    let handle_b = spawn_worker(replacement, shutdown_b.clone());
+
+    wait_for(
+        "complete by the replacement worker",
+        Duration::from_secs(5),
+        || !calls_to(&recorded(&state), "/tasks/task-20/complete").is_empty(),
+    )
+    .await;
+    let calls = recorded(&state);
+    let complete = calls_to(&calls, "/tasks/task-20/complete")[0];
+    assert_eq!(complete.body["worker_id"], json!("w-other"));
+    assert_eq!(complete.body["result"]["done"], json!(true));
+
+    stop_worker(shutdown_b, handle_b).await;
+}
+
+#[tokio::test]
+async fn drain_is_idempotent_and_a_pre_drained_worker_never_claims() {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    state
+        .lock()
+        .unwrap()
+        .tasks
+        .push_back(task_record("task-21", "doubler", json!({"n": 21}), ""));
+    let base_url = start_mock(state.clone()).await;
+
+    let worker = test_worker(&base_url)
+        .register("doubler", |_ctx: ActivityContext| async { Ok(Value::Null) });
+
+    // Cancelling twice (and thrice) must be exactly as effective as once:
+    // drain is a state, not an event.
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+    shutdown.cancel();
+    let handle = spawn_worker(worker, shutdown.clone());
+    shutdown.cancel();
+
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("a pre-drained worker exits immediately")
+        .expect("worker task did not panic");
+
+    // Work was queued and available, yet no claim ever happened.
+    let calls = recorded(&state);
+    assert!(calls.is_empty(), "expected no calls at all, got: {calls:?}");
+}
+
+#[tokio::test]
+async fn no_new_claims_after_drain_starts_even_with_tasks_queued() {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    {
+        let mut s = state.lock().unwrap();
+        s.tasks
+            .push_back(task_record("task-22a", "gate", json!({}), ""));
+        s.tasks
+            .push_back(task_record("task-22b", "gate", json!({}), ""));
+    }
+    let base_url = start_mock(state.clone()).await;
+
+    let started = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (started2, release2) = (started.clone(), release.clone());
+    let worker = test_worker(&base_url).register("gate", move |_ctx: ActivityContext| {
+        let (started, release) = (started2.clone(), release2.clone());
+        async move {
+            started.store(true, Ordering::SeqCst);
+            release.notified().await;
+            Ok(json!({"done": true}))
+        }
+    });
+
+    let shutdown = CancellationToken::new();
+    let handle = spawn_worker(worker, shutdown.clone());
+
+    wait_for("first activity in flight", Duration::from_secs(5), || {
+        started.load(Ordering::SeqCst)
+    })
+    .await;
+
+    // Drain while task-22b sits queued behind the in-flight task-22a.
+    shutdown.cancel();
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("worker drains within 5 s of the activity finishing")
+        .expect("worker task did not panic");
+
+    let calls = recorded(&state);
+    // Exactly the in-flight claim: the queued task was never taken.
+    assert_eq!(calls_to(&calls, "/tasks/claim").len(), 1);
+    assert!(!calls_to(&calls, "/tasks/task-22a/complete").is_empty());
+    assert!(calls_to(&calls, "/tasks/task-22b/complete").is_empty());
+    // The queued task is still waiting in the mock's queue for the next
+    // worker (real servers re-expose it immediately — it was never leased).
+    assert_eq!(state.lock().unwrap().tasks.len(), 1);
+}

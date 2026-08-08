@@ -110,9 +110,18 @@ Semantics:
   mid-effect and should key external side effects by
   `ActivityContext::task_id()` / `idempotency_key()` so redelivery is
   effectively-once.
-- **Graceful drain**: cancelling the shutdown `CancellationToken` stops
-  claiming; an in-flight activity runs to its outcome and is settled before
-  `run` returns.
+- **Graceful drain** (R0.6 wave 2c): cancelling the shutdown
+  `CancellationToken` *is* the drain request — idempotent, and race-safe
+  against an in-flight claim poll. Draining stops claiming immediately; an
+  in-flight activity keeps heartbeating and settles normally, bounded by
+  `with_drain_grace` (default `DEFAULT_DRAIN_GRACE`, 25 s — under the 30 s
+  default lease and Kubernetes' 30 s pod-termination grace). An attempt
+  that outlives the grace is aborted and deliberately **not** settled:
+  reporting `cancelled` would kill the task (terminal, never retried),
+  while leaving it unsettled releases it back to visibility at lease
+  expiry for a worker that is still serving. Wire the token to
+  SIGTERM/SIGINT in your binary — see
+  `examples/activity_worker_demo.rs` for the idiomatic wiring.
 - **Failure classification** uses the shared `ErrorClass` taxonomy: `Llm`
   and `Tool` errors reach `/fail` as `dependency_failure` with
   `retryable: true` (the transient executor classes); `Graph` /
@@ -156,10 +165,10 @@ worker.run(CancellationToken::new()).await;
 | `router(registry) -> Router`                | axum router (`POST /execute` + `GET /ok`) for embedding or tests with an ephemeral listener. |
 | `serve(registry, addr) -> io::Result<()>`   | Bind and serve until the process stops.             |
 | `probe_body() -> Value`                     | A valid `NodeTask` JSON body with the current `PROTOCOL_VERSION`, for manual `curl` probes. |
-| `ActivityWorker`                            | Pull-based durable worker: `new` / `register` / `with_worker_id` / `with_lease` / `with_pools` / `with_claim_backoff` / `worker_id` / `run(shutdown)`. |
+| `ActivityWorker`                            | Pull-based durable worker: `new` / `register` / `with_worker_id` / `with_lease` / `with_pools` / `with_claim_backoff` / `with_drain_grace` / `worker_id` / `run(shutdown)`. |
 | `Activity`, `ActivityContext`               | One durable unit of work (closure-implementable) and its input: `task_id` / `kind` / `attempt` / `idempotency_key` / `payload`. |
 | `activity::ClaimedTask`                     | The claim envelope fields a worker consumes.        |
-| `activity::DEFAULT_LEASE` and friends       | Defaults for lease, request timeout, and claim backoff. |
+| `activity::DEFAULT_LEASE` and friends       | Defaults for lease, request timeout, claim backoff, and drain grace. |
 
 ## Demo
 
@@ -187,5 +196,8 @@ panic all as 200 + one-payload error bodies). The activity e2e suite drives
 `ActivityWorker` against a mock task queue implementing the lease contract
 exactly: claim → execute → complete, heartbeats keeping the lease, `409`
 mid-run aborting the activity, graceful drain finishing in-flight work,
-failure classification with the retryable flag, interrupt-as-cancellation,
+drain-grace expiry aborting the attempt and releasing it for reassignment
+(unsettled — never `cancelled`), drain idempotence, no new claims after
+drain starts even with tasks queued, failure classification with the
+retryable flag, interrupt-as-cancellation,
 panics, unknown kinds, and undecodable claim bodies.

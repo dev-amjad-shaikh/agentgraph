@@ -187,8 +187,8 @@ pub(crate) async fn persist(store_root: &Path, record: &CronRecord) -> std::io::
     tokio::fs::write(path, raw).await
 }
 
-/// Spawn the background scheduler task. Lives for the app's lifetime; the
-/// returned task is deliberately detached.
+/// Spawn the background scheduler task. Lives for the app's lifetime (until
+/// the drain token fires); the returned task is deliberately detached.
 pub(crate) fn spawn_scheduler(state: Arc<AppState>) {
     tokio::spawn(async move {
         // Per-cron next-due bookkeeping, rebuilt as crons come and go.
@@ -201,7 +201,17 @@ pub(crate) fn spawn_scheduler(state: Arc<AppState>) {
         let mut ticker = tokio::time::interval(Duration::from_millis(200));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = ticker.tick() => {}
+                // Drain: firing a cron against a shutting-down server would
+                // only schedule a run the drain is about to cancel — crons
+                // are durable records, the next process's scheduler
+                // re-derives their due times from the schedule.
+                _ = state.shutdown.cancelled() => {
+                    tracing::info!("cron scheduler shutting down");
+                    break;
+                }
+            }
             let crons = match state.server_store.list_crons().await {
                 Ok(crons) => crons,
                 Err(error) => {

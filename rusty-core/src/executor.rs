@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::checkpoint::{Checkpoint, Checkpointer};
@@ -190,6 +191,23 @@ pub struct RunConfig {
     /// `None` records `"unversioned"`. Bump it when node bodies change in
     /// ways the topology hash cannot see.
     pub graph_version: Option<String>,
+
+    /// Cooperative cancellation (R0.6 wave 2c, drain). When set, the
+    /// executor checks the token **at every super-step boundary** and, once
+    /// it is cancelled, stops the run before starting the next super-step,
+    /// returning [`RustyError::Cancelled`].
+    ///
+    /// The boundary is the only cancellation point, deliberately: a
+    /// super-step is transactional (its nodes run off an immutable snapshot
+    /// and its writes merge atomically), and its boundary checkpoint is
+    /// already persisted by the time the token is observed — so a cancelled
+    /// run resumes from exactly where it stopped, with no torn step and no
+    /// lost writes. Cancellation granularity is therefore one super-step;
+    /// work inside the in-flight step runs to its barrier. This is the hook
+    /// graceful shutdown uses: a draining server cancels the token and every
+    /// in-flight run parks itself at a resumable checkpoint instead of being
+    /// torn down mid-step.
+    pub cancellation: Option<CancellationToken>,
 }
 
 impl Default for RunConfig {
@@ -216,6 +234,7 @@ impl RunConfig {
             journal: None,
             policy_version: None,
             graph_version: None,
+            cancellation: None,
         }
     }
 
@@ -279,6 +298,16 @@ impl RunConfig {
     /// checkpoint header (see the [`RunConfig::graph_version`] field docs).
     pub fn with_graph_version(mut self, version: impl Into<String>) -> Self {
         self.graph_version = Some(version.into());
+        self
+    }
+
+    /// Builder-style: make the run cooperatively cancellable (see the
+    /// [`RunConfig::cancellation`] field docs). The token is observed only at
+    /// super-step boundaries: cancelling it stops the run *after* the
+    /// in-flight step's barrier and boundary checkpoint, so the run is left
+    /// resumable from exactly that checkpoint with [`RustyError::Cancelled`].
+    pub fn with_cancellation(mut self, token: CancellationToken) -> Self {
+        self.cancellation = Some(token);
         self
     }
 
@@ -463,8 +492,11 @@ impl Executor {
     ///
     /// The loop returns [`ExecutionOutcome::Done`] when routing yields an
     /// empty next set, [`ExecutionOutcome::Interrupted`] when a node
-    /// interrupts, and an [`RustyError::Graph`] error once
-    /// `config.max_steps` super-steps have run without termination.
+    /// interrupts, an [`RustyError::Graph`] error once `config.max_steps`
+    /// super-steps have run without termination, and
+    /// [`RustyError::Cancelled`] when [`RunConfig::cancellation`] is
+    /// observed cancelled at a super-step boundary (the boundary checkpoint
+    /// is intact; the run resumes from it).
     pub async fn run(
         &self,
         graph: &Graph,
@@ -623,6 +655,27 @@ impl Executor {
                      budget (possible infinite cycle; raise RunConfig::max_steps or add a \
                      terminating route)",
                     config.max_steps
+                )));
+            }
+            // Cooperative cancellation (drain): observed only here, at a
+            // super-step boundary. The last step's barrier merged cleanly
+            // and its boundary checkpoint is already persisted, so
+            // cancelling never tears a step — the run resumes from exactly
+            // this point. Nodes of the in-flight step always run to their
+            // barrier; cancellation granularity is one super-step.
+            if config
+                .cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                tracing::warn!(
+                    steps_run,
+                    "run cancelled at a super-step boundary; resumable from the last checkpoint"
+                );
+                return Err(RustyError::Cancelled(format!(
+                    "cancelled after {steps_run} super-step(s); the boundary checkpoint of \
+                     thread `{}` is intact, so re-running the thread resumes from there",
+                    config.thread_id
                 )));
             }
 
@@ -1900,5 +1953,117 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, RustyError::Checkpoint(_)));
+    }
+
+    /// A self-looping spinner: each super-step increments `n`; the router
+    /// terminates the run once `n` reaches 5.
+    fn spinner_graph() -> (Graph, StateSpec) {
+        let spec = StateSpec::new().channel("n", Reducer::Overwrite);
+        let mut builder = GraphBuilder::new();
+        builder.add_node("spin", |ctx: NodeContext| async move {
+            // A paced step: without it the loop would burn through the
+            // default max_steps budget faster than a test can cancel it.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let n = ctx.state().get("n").and_then(Value::as_i64).unwrap_or(0);
+            Ok(NodeOutput::update("n", json!(n + 1)))
+        });
+        builder.set_entry_point("spin");
+        builder.add_conditional_edges("spin", |state: State| async move {
+            if state.get("n").and_then(Value::as_i64).unwrap_or(0) >= 5 {
+                Ok(Route::End)
+            } else {
+                Ok(Route::Node("spin".into()))
+            }
+        });
+        (builder.compile().unwrap(), spec)
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_token_stops_the_run_before_the_first_step() {
+        let (graph, spec) = spinner_graph();
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let err = Executor::new()
+            .run(
+                &graph,
+                &spec,
+                State::new(),
+                RunConfig::new("t-cancel").with_cancellation(token),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RustyError::Cancelled(_)));
+        assert!(
+            err.to_string().contains("after 0 super-step(s)"),
+            "a pre-cancelled run must not execute a single step: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_at_a_boundary_and_the_run_resumes_from_it() {
+        let (graph, spec) = spinner_graph();
+        let checkpointer = Arc::new(InMemoryCheckpointer::new());
+        let executor = Executor::with_checkpointer(checkpointer.clone());
+        let token = CancellationToken::new();
+
+        // Cancel as soon as the first boundary checkpoint lands: the stop
+        // is then provably the token's doing, not the terminating route.
+        let canceller = token.clone();
+        let watcher = checkpointer.clone();
+        tokio::spawn(async move {
+            loop {
+                if watcher.get_latest("t-cancel").await.unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            canceller.cancel();
+        });
+        let err = executor
+            .run(
+                &graph,
+                &spec,
+                State::new(),
+                RunConfig::new("t-cancel").with_cancellation(token.clone()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RustyError::Cancelled(_)));
+
+        // The boundary checkpoint is intact: n counts the completed steps —
+        // strictly fewer than the terminating route's 5, proving the token
+        // (not the route) ended the run.
+        let checkpoint = checkpointer
+            .get_latest("t-cancel")
+            .await
+            .unwrap()
+            .expect("a boundary checkpoint must survive cancellation");
+        let steps = checkpoint.state.get("n").and_then(Value::as_i64).unwrap();
+        assert!(
+            (1..5).contains(&steps),
+            "unexpected stop point: n = {steps}"
+        );
+
+        // Re-running the thread resumes the spinner from the checkpoint.
+        // Drain tokens are one-shot (a cancelled token stays cancelled), so
+        // the post-deploy process runs under a fresh one.
+        let outcome = executor
+            .run(
+                &graph,
+                &spec,
+                State::new(),
+                RunConfig::new("t-cancel")
+                    .with_resume(json!(null))
+                    .with_cancellation(CancellationToken::new()),
+            )
+            .await
+            .unwrap();
+        match outcome {
+            ExecutionOutcome::Done(state) => {
+                assert_eq!(state.get("n"), Some(&json!(5)));
+            }
+            other => panic!("expected Done after resume, got {other:?}"),
+        }
     }
 }

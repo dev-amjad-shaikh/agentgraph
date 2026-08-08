@@ -22,6 +22,9 @@ postgres = ["dep:sqlx", "rusty-agent-runtime/postgres"]
 rusty-agent-runtime = { path = "../rusty-core", version = "0.5" }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
+# Graceful shutdown (R0.6 wave 2c): one `CancellationToken` drains the run
+# executor, the outbox relay, and the cron scheduler together.
+tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
@@ -44,3 +47,5 @@ sqlx = { version = "0.8", default-features = false, features = [
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["full", "test-util"] }
+# Graceful-shutdown tests drive `serve_with_shutdown` over real sockets.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
