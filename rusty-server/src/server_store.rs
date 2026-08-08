@@ -12,9 +12,10 @@
 //!   `{store_path}/journals/`; durable tasks are an in-memory index persisted
 //!   as one file per task under `{store_path}/tasks/` (R0.6).
 //! - [`PostgresStore`] (feature `postgres`) — tables `server_assistants`,
-//!   `server_crons`, `server_threads`, `server_kv`, `server_journals`, and
+//!   `server_crons`, `server_threads`, `server_kv`, `server_journals`,
 //!   `server_tasks` (the R0.6 durable task queue, column-mapped for
-//!   `FOR UPDATE SKIP LOCKED` claiming), auto-migrated on (lazy) connect.
+//!   `FOR UPDATE SKIP LOCKED` claiming), and `server_outbox` (the R0.6
+//!   wave-2b transactional outbox), auto-migrated on (lazy) connect.
 //!   Selected via `ServerConfig::with_postgres(url)`.
 //!
 //! All trait errors are plain `String`s; routes map them to 500s — no store
@@ -23,13 +24,16 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use rusty_agent_runtime::checkpoint::{Checkpoint, Checkpointer, JsonFileCheckpointer};
 use rusty_agent_runtime::journal::JournalSnapshot;
+use rusty_agent_runtime::record::EffectReceipt;
 use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::assistants::{self, AssistantRecord};
 use crate::crons::{self, CronRecord};
 use crate::journals;
+use crate::outbox::{self, OutboxRecord};
 use crate::store::{self, StoreItem};
 use crate::tasks::{self, CancelOutcome, MutationOutcome, RunCancellation, TaskRecord, TaskStatus};
 use crate::threads::{self, ThreadRecord};
@@ -125,13 +129,16 @@ pub(crate) trait ServerStore: Send + Sync {
         lease_ms: u64,
         now: chrono::DateTime<chrono::Utc>,
     ) -> StoreResult<MutationOutcome>;
-    /// Settle the task held by `worker_id` as completed, storing `result`.
+    /// Settle the task held by `worker_id` as completed, storing `result`
+    /// and the effect `receipt` the worker reported with it (when any — see
+    /// [`crate::tasks::TaskRecord::receipt`]).
     async fn complete_task(
         &self,
         tenant: &str,
         task_id: &str,
         worker_id: &str,
         result: Value,
+        receipt: Option<EffectReceipt>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> StoreResult<MutationOutcome>;
     /// Record a failed attempt on the task held by `worker_id`: requeue with
@@ -178,6 +185,44 @@ pub(crate) trait ServerStore: Send + Sync {
         run_id: &str,
         now: chrono::DateTime<chrono::Utc>,
     ) -> StoreResult<RunCancellation>;
+
+    // -- Transactional outbox (R0.6 wave 2b) ---------------------------- //
+
+    /// Write a task into the transactional outbox instead of the queue. The
+    /// row is pending until the relay publishes it via
+    /// [`ServerStore::outbox_publish_pending`]; use this when the submission
+    /// must commit atomically with a state change (see
+    /// [`ServerStore::checkpoint_and_enqueue`]) rather than become claimable
+    /// immediately. Re-writing the same task id returns the pending row
+    /// unchanged with `deduplicated: true` — outbox writes are safe to
+    /// retry.
+    async fn outbox_enqueue(&self, record: &TaskRecord) -> StoreResult<(TaskRecord, bool)>;
+    /// Publish up to `limit` pending outbox rows into the task queue,
+    /// oldest first, returning the tasks the publish made visible. Each
+    /// row's publish — the queue insert and the mark-published — is atomic
+    /// per row, and the queue insert dedupes on the task's idempotency key
+    /// (the same mechanism as [`ServerStore::enqueue_task`]), so a caller
+    /// that dies mid-publish and retries can neither lose nor double a row;
+    /// a deduped publish resolves to the pre-existing task carrying the
+    /// key. This is the relay's unit of work; it is also the crash-recovery
+    /// path: rows pending at startup publish on the first call.
+    async fn outbox_publish_pending(
+        &self,
+        limit: usize,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<Vec<TaskRecord>>;
+    /// Write a checkpoint and submit tasks in one atomic unit: on Postgres,
+    /// one transaction — a crash between the two writes is impossible, so a
+    /// run can never land "state saved, task lost" or the reverse. On the
+    /// JSON-file backend (which cannot transact across files) the outbox
+    /// rows are written first and the checkpoint second: a crash may leave
+    /// tasks whose checkpoint never landed, but never a checkpoint whose
+    /// tasks are silently gone. Cross-record atomicity is Postgres-only.
+    async fn checkpoint_and_enqueue(
+        &self,
+        checkpoint: &Checkpoint,
+        tasks: &[TaskRecord],
+    ) -> StoreResult<()>;
 }
 
 // --------------------------------------------------------------------- //
@@ -198,6 +243,7 @@ pub(crate) struct JsonFileStore {
     threads: Mutex<HashMap<String, ThreadRecord>>,
     kv_lock: Mutex<()>,
     tasks: Mutex<HashMap<String, TaskRecord>>,
+    outbox: Mutex<HashMap<String, OutboxRecord>>,
 }
 
 impl JsonFileStore {
@@ -210,6 +256,7 @@ impl JsonFileStore {
             threads: Mutex::new(threads::load(root)),
             kv_lock: Mutex::new(()),
             tasks: Mutex::new(tasks::load(root)),
+            outbox: Mutex::new(outbox::load(root)),
         }
     }
 }
@@ -354,22 +401,92 @@ impl ServerStore for JsonFileStore {
 
     async fn enqueue_task(&self, record: &TaskRecord) -> StoreResult<(TaskRecord, bool)> {
         let mut map = self.tasks.lock().await;
-        if let Some(key) = &record.idempotency_key {
-            // Linear dedup scan under the index lock: correct at the file
-            // backend's scale (it backs single-binary deployments); the
-            // Postgres backend enforces this with a unique index instead.
-            if let Some(existing) = map
-                .values()
-                .find(|t| t.tenant == record.tenant && t.idempotency_key.as_deref() == Some(key))
-            {
-                return Ok((existing.clone(), true));
+        self.enqueue_locked(&mut map, record).await
+    }
+
+    async fn outbox_enqueue(&self, record: &TaskRecord) -> StoreResult<(TaskRecord, bool)> {
+        let mut map = self.outbox.lock().await;
+        if let Some(existing) = map.get(&record.task_id) {
+            return Ok((existing.task.clone(), true));
+        }
+        let row = OutboxRecord::new(record.clone(), chrono::Utc::now());
+        outbox::persist(&self.root, &row)
+            .await
+            .map_err(io_err("persist outbox row"))?;
+        map.insert(row.outbox_id.clone(), row);
+        Ok((record.clone(), false))
+    }
+
+    async fn outbox_publish_pending(
+        &self,
+        limit: usize,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<Vec<TaskRecord>> {
+        // Both locks held for the whole pass: a publish is pick + enqueue +
+        // mark-published, and two concurrent passes must never publish the
+        // same row — the file backend's SKIP LOCKED equivalent (as with
+        // claim). Lock order is always outbox-then-tasks.
+        let mut outbox_map = self.outbox.lock().await;
+        let mut tasks_map = self.tasks.lock().await;
+        let mut pending: Vec<(chrono::DateTime<chrono::Utc>, String)> = outbox_map
+            .values()
+            .filter(|row| row.published_at.is_none())
+            .map(|row| (row.created_at, row.outbox_id.clone()))
+            .collect();
+        // Oldest first, with the id tie-break making the order total.
+        pending.sort();
+        pending.truncate(limit);
+        let mut published = Vec::new();
+        for (_, outbox_id) in pending {
+            let mut row = outbox_map
+                .get(&outbox_id)
+                .cloned()
+                .expect("publish candidate came from the outbox index");
+            // The enqueue dedupe absorbs a task that already exists (a
+            // publish retried after a crash, or one submitted directly);
+            // marking the row published is still correct — the task exists.
+            let (task, _deduplicated) = self.enqueue_locked(&mut tasks_map, &row.task).await?;
+            row.published_at = Some(now);
+            outbox::persist(&self.root, &row)
+                .await
+                .map_err(io_err("persist outbox row"))?;
+            outbox_map.insert(outbox_id, row);
+            published.push(task);
+        }
+        Ok(published)
+    }
+
+    async fn checkpoint_and_enqueue(
+        &self,
+        checkpoint: &Checkpoint,
+        tasks: &[TaskRecord],
+    ) -> StoreResult<()> {
+        // Outbox-first ordering — one JSON file cannot transact across
+        // checkpoint and queue, so the file backend guarantees only this: a
+        // crash may leave published tasks whose checkpoint never landed
+        // (visible, inspectable, and the idempotency key still correlates
+        // them), but never a checkpoint whose tasks are silently gone.
+        // Cross-record atomicity is Postgres-only.
+        {
+            let mut map = self.outbox.lock().await;
+            for record in tasks {
+                // A retried checkpoint+enqueue skips rows already pending.
+                if map.contains_key(&record.task_id) {
+                    continue;
+                }
+                let row = OutboxRecord::new(record.clone(), chrono::Utc::now());
+                outbox::persist(&self.root, &row)
+                    .await
+                    .map_err(io_err("persist outbox row"))?;
+                map.insert(row.outbox_id.clone(), row);
             }
         }
-        tasks::persist(&self.root, record)
+        // The checkpoint write goes through the same JSON-file checkpointer
+        // the run routes use, rooted at the same store path.
+        JsonFileCheckpointer::new(self.root.clone())
+            .put(checkpoint.clone())
             .await
-            .map_err(io_err("persist task"))?;
-        map.insert(record.task_id.clone(), record.clone());
-        Ok((record.clone(), false))
+            .map_err(|e| format!("put checkpoint: {e}"))
     }
 
     async fn claim_task(
@@ -449,10 +566,11 @@ impl ServerStore for JsonFileStore {
         task_id: &str,
         worker_id: &str,
         result: Value,
+        receipt: Option<EffectReceipt>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> StoreResult<MutationOutcome> {
         self.mutate_task(tenant, task_id, worker_id, |task| {
-            task.complete(result, now);
+            task.complete(result, receipt, now);
         })
         .await
     }
@@ -562,6 +680,31 @@ impl ServerStore for JsonFileStore {
 }
 
 impl JsonFileStore {
+    /// The dedupe-and-insert half of enqueue, shared by direct enqueue and
+    /// the outbox relay's publish: the caller holds the task index lock. The
+    /// linear dedup scan is correct at the file backend's scale (it backs
+    /// single-binary deployments); the Postgres backend enforces the same
+    /// rule with a unique index instead.
+    async fn enqueue_locked(
+        &self,
+        map: &mut HashMap<String, TaskRecord>,
+        record: &TaskRecord,
+    ) -> StoreResult<(TaskRecord, bool)> {
+        if let Some(key) = &record.idempotency_key {
+            if let Some(existing) = map
+                .values()
+                .find(|t| t.tenant == record.tenant && t.idempotency_key.as_deref() == Some(key))
+            {
+                return Ok((existing.clone(), true));
+            }
+        }
+        tasks::persist(&self.root, record)
+            .await
+            .map_err(io_err("persist task"))?;
+        map.insert(record.task_id.clone(), record.clone());
+        Ok((record.clone(), false))
+    }
+
     /// Shared skeleton of the lease-guarded task mutations (heartbeat /
     /// complete / fail): resolve tenant-scoped, check the lease, mutate a
     /// copy, persist, then swap the index. Persisting before the swap keeps
@@ -601,7 +744,9 @@ impl JsonFileStore {
 #[cfg(feature = "postgres")]
 mod postgres {
     use chrono::{DateTime, Utc};
+    use rusty_agent_runtime::checkpoint::Checkpoint;
     use rusty_agent_runtime::journal::JournalSnapshot;
+    use rusty_agent_runtime::record::EffectReceipt;
     use serde_json::Value;
     use sqlx::{PgPool, Row};
     use tokio::sync::OnceCell;
@@ -609,6 +754,7 @@ mod postgres {
     use super::{ServerStore, StoreResult};
     use crate::assistants::AssistantRecord;
     use crate::crons::CronRecord;
+    use crate::outbox::OutboxRecord;
     use crate::store::StoreItem;
     use crate::tasks::{
         self, CancelOutcome, MutationOutcome, RunCancellation, TaskLease, TaskRecord, TaskStatus,
@@ -685,6 +831,7 @@ mod postgres {
             last_error       TEXT,
             idempotency_key  TEXT,
             result           JSONB,
+            receipt          JSONB,
             run_id           TEXT,
             thread_id        TEXT,
             cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
@@ -719,6 +866,37 @@ mod postgres {
         ALTER TABLE server_tasks
             ADD COLUMN IF NOT EXISTS deadline TIMESTAMPTZ";
 
+    /// Wave-2b additive column for databases whose `server_tasks` predates
+    /// effect receipts (fresh databases get it from [`CREATE_TASKS_SQL`]).
+    /// JSONB, not TEXT: the receipt is a structured core contract
+    /// ([`rusty_agent_runtime::record::EffectReceipt`]), stored verbatim.
+    pub(crate) const ALTER_TASKS_ADD_RECEIPT_SQL: &str = "
+        ALTER TABLE server_tasks
+            ADD COLUMN IF NOT EXISTS receipt JSONB";
+
+    /// `server_outbox`: the transactional outbox (R0.6 wave 2b). One row per
+    /// pending task submission, 1:1 with the task it carries (`outbox_id` is
+    /// the task id — re-writing the same row is a no-op). The task travels
+    /// as JSONB: the relay re-inserts it column-wise into `server_tasks`,
+    /// and column-mapping the outbox row itself would buy nothing — nothing
+    /// filters on task fields here, only on `published_at IS NULL`.
+    pub(crate) const CREATE_OUTBOX_SQL: &str = "
+        CREATE TABLE IF NOT EXISTS server_outbox (
+            outbox_id    TEXT PRIMARY KEY,
+            tenant       TEXT NOT NULL,
+            task         JSONB NOT NULL,
+            published_at TIMESTAMPTZ,
+            created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+        )";
+
+    /// The relay's poll is exactly this partial index: pending rows, oldest
+    /// first. Published rows fall out of the index, so the poll stays cheap
+    /// no matter how much history the table holds.
+    pub(crate) const CREATE_OUTBOX_PENDING_INDEX_SQL: &str = "
+        CREATE INDEX IF NOT EXISTS server_outbox_pending
+            ON server_outbox (created_at, outbox_id)
+            WHERE published_at IS NULL";
+
     /// All idempotent migration statements, executed in order on connect.
     pub(crate) const MIGRATION_SQL: &[&str] = &[
         CREATE_ASSISTANTS_SQL,
@@ -731,6 +909,9 @@ mod postgres {
         CREATE_TASKS_CLAIMABLE_INDEX_SQL,
         ALTER_TASKS_ADD_CANCEL_REQUESTED_SQL,
         ALTER_TASKS_ADD_DEADLINE_SQL,
+        ALTER_TASKS_ADD_RECEIPT_SQL,
+        CREATE_OUTBOX_SQL,
+        CREATE_OUTBOX_PENDING_INDEX_SQL,
     ];
 
     /// Transaction-scoped advisory lock key serializing concurrent
@@ -837,7 +1018,7 @@ mod postgres {
     pub(crate) const SELECT_TASK_BY_IDEMPOTENCY_SQL: &str = "
         SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, next_attempt_at, created_at, updated_at
+            run_id, thread_id, cancel_requested, deadline, receipt, next_attempt_at, created_at, updated_at
         FROM server_tasks
         WHERE tenant = $1 AND idempotency_key = $2";
 
@@ -885,7 +1066,7 @@ mod postgres {
         WHERE task_id = $1
         RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, next_attempt_at, created_at, updated_at";
+            run_id, thread_id, cancel_requested, deadline, receipt, next_attempt_at, created_at, updated_at";
 
     /// Heartbeat: extends the lease only while the caller holds it. No row
     /// means unknown/cross-tenant (404) or lease lost (409), distinguished
@@ -897,24 +1078,27 @@ mod postgres {
         WHERE task_id = $1 AND tenant = $2 AND lease_owner = $3 AND status = 'leased'
         RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, next_attempt_at, created_at, updated_at";
+            run_id, thread_id, cancel_requested, deadline, receipt, next_attempt_at, created_at, updated_at";
 
-    /// Complete: settle only the caller's own lease.
+    /// Complete: settle only the caller's own lease, storing the result and
+    /// the effect receipt the worker reported with it (`$6`, JSONB — `NULL`
+    /// when none).
     pub(crate) const COMPLETE_TASK_SQL: &str = "
         UPDATE server_tasks
         SET status = 'completed', result = $4, lease_owner = NULL,
-            lease_expires_at = NULL, next_attempt_at = NULL, updated_at = $5
+            lease_expires_at = NULL, next_attempt_at = NULL, updated_at = $5,
+            receipt = $6
         WHERE task_id = $1 AND tenant = $2 AND lease_owner = $3 AND status = 'leased'
         RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, next_attempt_at, created_at, updated_at";
+            run_id, thread_id, cancel_requested, deadline, receipt, next_attempt_at, created_at, updated_at";
 
     /// Fail, step 1: lock the row (the requeue-vs-dead decision needs the
     /// current attempt count, and concurrent settlement must serialize).
     pub(crate) const FAIL_SELECT_SQL: &str = "
         SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, next_attempt_at, created_at, updated_at
+            run_id, thread_id, cancel_requested, deadline, receipt, next_attempt_at, created_at, updated_at
         FROM server_tasks
         WHERE task_id = $1 AND tenant = $2
         FOR UPDATE";
@@ -929,14 +1113,14 @@ mod postgres {
         WHERE task_id = $1
         RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, next_attempt_at, created_at, updated_at";
+            run_id, thread_id, cancel_requested, deadline, receipt, next_attempt_at, created_at, updated_at";
 
     /// Cancel, step 1: lock the row (the terminal check and the transition
     /// must serialize against claims and settlements).
     pub(crate) const CANCEL_SELECT_SQL: &str = "
         SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, next_attempt_at, created_at, updated_at
+            run_id, thread_id, cancel_requested, deadline, receipt, next_attempt_at, created_at, updated_at
         FROM server_tasks
         WHERE task_id = $1 AND tenant = $2
         FOR UPDATE";
@@ -953,7 +1137,7 @@ mod postgres {
         WHERE task_id = $1
         RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, next_attempt_at, created_at, updated_at";
+            run_id, thread_id, cancel_requested, deadline, receipt, next_attempt_at, created_at, updated_at";
 
     /// Run cancel, part 1: the run's non-leased, non-terminal tasks move to
     /// the terminal `cancelled` state immediately.
@@ -965,7 +1149,7 @@ mod postgres {
           AND (status = 'queued' OR (status = 'failed' AND next_attempt_at IS NOT NULL))
         RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, next_attempt_at, created_at, updated_at";
+            run_id, thread_id, cancel_requested, deadline, receipt, next_attempt_at, created_at, updated_at";
 
     /// Run cancel, part 2: the run's leased tasks keep their leases and
     /// get `cancel_requested` set — their holders learn on the next
@@ -976,7 +1160,7 @@ mod postgres {
         WHERE tenant = $1 AND run_id = $2 AND status = 'leased'
         RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, next_attempt_at, created_at, updated_at";
+            run_id, thread_id, cancel_requested, deadline, receipt, next_attempt_at, created_at, updated_at";
 
     /// Tenant-scoped existence probe distinguishing 404 from 409 after a
     /// lease-guarded update matched no row.
@@ -986,22 +1170,68 @@ mod postgres {
     pub(crate) const SELECT_TASK_SQL: &str =
         "SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, next_attempt_at, created_at, updated_at
+            run_id, thread_id, cancel_requested, deadline, receipt, next_attempt_at, created_at, updated_at
         FROM server_tasks WHERE task_id = $1 AND tenant = $2";
 
     pub(crate) const LIST_TASKS_SQL: &str = "
         SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, next_attempt_at, created_at, updated_at
+            run_id, thread_id, cancel_requested, deadline, receipt, next_attempt_at, created_at, updated_at
         FROM server_tasks
         WHERE tenant = $1 ORDER BY created_at, task_id";
 
     pub(crate) const LIST_TASKS_BY_STATUS_SQL: &str = "
         SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, next_attempt_at, created_at, updated_at
+            run_id, thread_id, cancel_requested, deadline, receipt, next_attempt_at, created_at, updated_at
         FROM server_tasks
         WHERE tenant = $1 AND status = $2 ORDER BY created_at, task_id";
+
+    // -- Transactional outbox statements (R0.6 wave 2b) ------------------ //
+
+    /// Insert-only outbox write; `ON CONFLICT (outbox_id) DO NOTHING` makes
+    /// a retried outbox enqueue (or a retried checkpoint+enqueue pair whose
+    /// checkpoint already committed) a no-op returning the pending row.
+    pub(crate) const INSERT_OUTBOX_SQL: &str = "
+        INSERT INTO server_outbox (outbox_id, tenant, task, created_at)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (outbox_id) DO NOTHING
+        RETURNING outbox_id";
+
+    /// Read-back after an absorbed outbox conflict.
+    pub(crate) const SELECT_OUTBOX_BY_ID_SQL: &str = "
+        SELECT outbox_id, tenant, task, published_at, created_at
+        FROM server_outbox WHERE outbox_id = $1";
+
+    /// The relay's pick: the oldest pending row, locked `FOR UPDATE SKIP
+    /// LOCKED` inside the publish transaction — concurrent relay instances
+    /// (or a manual pump racing the background relay) take distinct rows
+    /// instead of double-publishing one. One row per transaction: the task
+    /// insert and the mark-published commit or roll back together, so a
+    /// crash mid-batch loses nothing and a poisoned row stalls only itself.
+    pub(crate) const SELECT_OUTBOX_PENDING_SQL: &str = "
+        SELECT outbox_id, tenant, task, published_at, created_at
+        FROM server_outbox
+        WHERE published_at IS NULL
+        ORDER BY created_at, outbox_id
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED";
+
+    /// Mark a row published, applied in the same transaction as its task
+    /// insert ([`INSERT_TASK_SQL`]).
+    pub(crate) const MARK_OUTBOX_PUBLISHED_SQL: &str = "
+        UPDATE server_outbox SET published_at = $2 WHERE outbox_id = $1";
+
+    /// The checkpoint half of `checkpoint_and_enqueue`. This is the same
+    /// insert core's `PostgresCheckpointer` runs (no `ON CONFLICT`: a
+    /// duplicate id must abort the transaction — that abort is precisely
+    /// what keeps the checkpoint and the outbox rows atomic together); it
+    /// lives here because a transaction cannot span the two stores'
+    /// connection pools.
+    pub(crate) const INSERT_CHECKPOINT_SQL: &str = "
+        INSERT INTO rusty_checkpoints
+            (thread_id, checkpoint_id, step, state, next_nodes, created_at, header, journal_ref)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)";
 
     // -- Row <-> record mapping (unit-tested without a database) -------- //
 
@@ -1067,6 +1297,12 @@ mod postgres {
                 tasks::parse_effect(&raw).map_err(|_| format!("corrupt task effect `{raw}`"))
             })
             .transpose()?;
+        let receipt = row
+            .get::<Option<Value>, _>("receipt")
+            .map(|raw| {
+                serde_json::from_value(raw).map_err(|e| format!("corrupt task receipt: {e}"))
+            })
+            .transpose()?;
         Ok(TaskRecord {
             task_id: row.get("task_id"),
             tenant: row.get("tenant"),
@@ -1082,6 +1318,7 @@ mod postgres {
             last_error: row.get("last_error"),
             idempotency_key: row.get("idempotency_key"),
             result: row.get("result"),
+            receipt,
             run_id: row.get("run_id"),
             thread_id: row.get("thread_id"),
             cancel_requested: row.get("cancel_requested"),
@@ -1096,6 +1333,41 @@ mod postgres {
         move |e| format!("{context}: {e}")
     }
 
+    /// [`INSERT_TASK_SQL`] with a record bound to it, shared by direct
+    /// enqueue and the outbox relay's publish — the dedupe semantics
+    /// (`ON CONFLICT DO NOTHING`) are the relay's no-double-publish
+    /// mechanism, so both paths must bind the identical statement.
+    fn insert_task_query(
+        record: &TaskRecord,
+    ) -> sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments> {
+        sqlx::query(INSERT_TASK_SQL)
+            .bind(&record.task_id)
+            .bind(&record.tenant)
+            .bind(&record.kind)
+            .bind(&record.payload)
+            .bind(&record.pool)
+            .bind(record.max_attempts as i32)
+            .bind(record.effect.map(tasks::effect_name))
+            .bind(&record.idempotency_key)
+            .bind(&record.run_id)
+            .bind(&record.thread_id)
+            .bind(record.deadline)
+            .bind(record.created_at)
+    }
+
+    /// Assemble an [`OutboxRecord`] from one `server_outbox` row; a corrupt
+    /// embedded task payload is a store error, not a panic (the same
+    /// discipline as [`record_from_payload`]).
+    fn outbox_from_row(row: &sqlx::postgres::PgRow) -> StoreResult<OutboxRecord> {
+        Ok(OutboxRecord {
+            outbox_id: row.get("outbox_id"),
+            tenant: row.get("tenant"),
+            task: record_from_payload("outbox task", row.get::<Value, _>("task"))?,
+            published_at: row.get("published_at"),
+            created_at: row.get("created_at"),
+        })
+    }
+
     /// Postgres-backed store: assistants / crons / KV in `server_*` tables.
     ///
     /// The connection (and idempotent auto-migration) is established lazily
@@ -1103,6 +1375,9 @@ mod postgres {
     pub(crate) struct PostgresStore {
         url: String,
         pool: OnceCell<PgPool>,
+        /// Set once core's `rusty_checkpoints` table has been migrated
+        /// over this store's pool (see `checkpoint_and_enqueue`).
+        checkpoints_migrated: OnceCell<()>,
     }
 
     impl PostgresStore {
@@ -1111,6 +1386,7 @@ mod postgres {
             Self {
                 url,
                 pool: OnceCell::new(),
+                checkpoints_migrated: OnceCell::new(),
             }
         }
 
@@ -1355,19 +1631,7 @@ mod postgres {
         }
 
         async fn enqueue_task(&self, record: &TaskRecord) -> StoreResult<(TaskRecord, bool)> {
-            let row = sqlx::query(INSERT_TASK_SQL)
-                .bind(&record.task_id)
-                .bind(&record.tenant)
-                .bind(&record.kind)
-                .bind(&record.payload)
-                .bind(&record.pool)
-                .bind(record.max_attempts as i32)
-                .bind(record.effect.map(tasks::effect_name))
-                .bind(&record.idempotency_key)
-                .bind(&record.run_id)
-                .bind(&record.thread_id)
-                .bind(record.deadline)
-                .bind(record.created_at)
+            let row = insert_task_query(record)
                 .fetch_optional(self.pool().await?)
                 .await
                 .map_err(db_err("enqueue task"))?;
@@ -1473,14 +1737,17 @@ mod postgres {
             task_id: &str,
             worker_id: &str,
             result: Value,
+            receipt: Option<EffectReceipt>,
             now: DateTime<Utc>,
         ) -> StoreResult<MutationOutcome> {
+            let receipt = receipt.as_ref().map(record_to_payload).transpose()?;
             let updated = sqlx::query(COMPLETE_TASK_SQL)
                 .bind(task_id)
                 .bind(tenant)
                 .bind(worker_id)
                 .bind(result)
                 .bind(now)
+                .bind(receipt)
                 .fetch_optional(self.pool().await?)
                 .await
                 .map_err(db_err("complete task"))?;
@@ -1643,6 +1910,194 @@ mod postgres {
                     .collect::<StoreResult<Vec<_>>>()?,
             })
         }
+
+        async fn outbox_enqueue(&self, record: &TaskRecord) -> StoreResult<(TaskRecord, bool)> {
+            let payload = record_to_payload(record)?;
+            let row = sqlx::query(INSERT_OUTBOX_SQL)
+                .bind(&record.task_id)
+                .bind(&record.tenant)
+                .bind(payload)
+                .bind(record.created_at)
+                .fetch_optional(self.pool().await?)
+                .await
+                .map_err(db_err("enqueue outbox"))?;
+            if row.is_some() {
+                return Ok((record.clone(), false));
+            }
+            // The insert was absorbed by the outbox_id conflict: a retried
+            // write of the same row — return the pending one.
+            let existing = sqlx::query(SELECT_OUTBOX_BY_ID_SQL)
+                .bind(&record.task_id)
+                .fetch_optional(self.pool().await?)
+                .await
+                .map_err(db_err("enqueue outbox dedup lookup"))?;
+            match existing {
+                Some(row) => Ok((outbox_from_row(&row)?.task, true)),
+                None => Err(format!(
+                    "outbox insert for task `{}` conflicted but no row carries it",
+                    record.task_id
+                )),
+            }
+        }
+
+        async fn outbox_publish_pending(
+            &self,
+            limit: usize,
+            now: DateTime<Utc>,
+        ) -> StoreResult<Vec<TaskRecord>> {
+            let pool = self.pool().await?;
+            let mut published = Vec::new();
+            // One row per transaction: the task insert and the
+            // mark-published commit or roll back together, so a crash
+            // mid-publish leaves the row pending for the next pass (or the
+            // next process) — never lost. The task insert dedupes on the
+            // idempotency-key unique index (and the task-id primary key), so
+            // a retry after the task already exists — however it got there —
+            // can never double it: publishing is at-least-once, visibility
+            // is effectively-once.
+            while published.len() < limit {
+                let mut tx = pool.begin().await.map_err(db_err("publish outbox"))?;
+                let pending = sqlx::query(SELECT_OUTBOX_PENDING_SQL)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db_err("publish outbox"))?;
+                let Some(pending) = pending else {
+                    tx.commit().await.map_err(db_err("publish outbox"))?;
+                    break;
+                };
+                let row = outbox_from_row(&pending)?;
+                let inserted = insert_task_query(&row.task)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db_err("publish outbox task insert"))?;
+                // Resolve the task the publish actually made visible. An
+                // absorbed insert means either the task-id PK absorbed a
+                // publish retried after a crash, or the idempotency-key
+                // unique index absorbed a duplicate submission of the same
+                // effect — the returned record must name the live task, the
+                // same answer the file backend and direct enqueue give.
+                let task = match inserted {
+                    Some(_) => row.task,
+                    None => {
+                        let by_id = sqlx::query(SELECT_TASK_SQL)
+                            .bind(&row.task.task_id)
+                            .bind(&row.task.tenant)
+                            .fetch_optional(&mut *tx)
+                            .await
+                            .map_err(db_err("publish outbox resolve"))?;
+                        match by_id {
+                            Some(existing) => task_from_row(&existing)?,
+                            None => {
+                                let key =
+                                    row.task.idempotency_key.as_deref().ok_or_else(|| {
+                                        format!(
+                                            "outbox publish for task `{}` conflicted but no live task carries it",
+                                            row.task.task_id
+                                        )
+                                    })?;
+                                let by_key = sqlx::query(SELECT_TASK_BY_IDEMPOTENCY_SQL)
+                                    .bind(&row.task.tenant)
+                                    .bind(key)
+                                    .fetch_optional(&mut *tx)
+                                    .await
+                                    .map_err(db_err("publish outbox resolve"))?
+                                    .ok_or_else(|| {
+                                        format!(
+                                            "outbox publish for idempotency key `{key}` conflicted but no live task carries it"
+                                        )
+                                    })?;
+                                task_from_row(&by_key)?
+                            }
+                        }
+                    }
+                };
+                sqlx::query(MARK_OUTBOX_PUBLISHED_SQL)
+                    .bind(&row.outbox_id)
+                    .bind(now)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err("publish outbox mark published"))?;
+                tx.commit().await.map_err(db_err("publish outbox"))?;
+                published.push(task);
+            }
+            Ok(published)
+        }
+
+        async fn checkpoint_and_enqueue(
+            &self,
+            checkpoint: &Checkpoint,
+            tasks: &[TaskRecord],
+        ) -> StoreResult<()> {
+            let step = i64::try_from(checkpoint.step).map_err(|_| {
+                format!(
+                    "checkpoint step {} does not fit into a Postgres bigint",
+                    checkpoint.step
+                )
+            })?;
+            let next_nodes = serde_json::to_value(&checkpoint.next_nodes)
+                .map_err(|e| format!("serialize checkpoint next_nodes: {e}"))?;
+            let header = serde_json::to_value(&checkpoint.header)
+                .map_err(|e| format!("serialize checkpoint header: {e}"))?;
+            let journal_ref = checkpoint
+                .journal_ref
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|e| format!("serialize checkpoint journal ref: {e}"))?;
+            let pool = self.pool().await?;
+            // The checkpoint half writes into `rusty_checkpoints`, whose
+            // schema is owned and auto-migrated by core's
+            // PostgresCheckpointer — the run routes normally ensure it,
+            // but a deployment whose first checkpoint write is an atomic
+            // checkpoint+enqueue has no such guarantee. Migrate it once
+            // per store, over this pool (idempotent, advisory-locked).
+            self.checkpoints_migrated
+                .get_or_try_init(|| async {
+                    rusty_agent_runtime::checkpoint_postgres::PostgresCheckpointer::from_pool(
+                        pool.clone(),
+                    )
+                    .migrate()
+                    .await
+                    .map_err(|e| format!("migrate checkpoints table: {e}"))
+                })
+                .await?;
+            // The one transaction this wave exists for: the checkpoint and
+            // every outbox row commit together or not at all. A duplicate
+            // checkpoint id aborts the whole unit (no silent half-write);
+            // the outbox inserts tolerate a retried pair (ON CONFLICT DO
+            // NOTHING on outbox_id).
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(db_err("checkpoint and enqueue"))?;
+            sqlx::query(INSERT_CHECKPOINT_SQL)
+                .bind(&checkpoint.thread_id)
+                .bind(&checkpoint.id)
+                .bind(step)
+                .bind(checkpoint.state.to_value())
+                .bind(next_nodes)
+                .bind(checkpoint.created_at)
+                .bind(header)
+                .bind(journal_ref)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err("checkpoint and enqueue"))?;
+            for record in tasks {
+                let payload = record_to_payload(record)?;
+                sqlx::query(INSERT_OUTBOX_SQL)
+                    .bind(&record.task_id)
+                    .bind(&record.tenant)
+                    .bind(payload)
+                    .bind(record.created_at)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err("checkpoint and enqueue"))?;
+            }
+            tx.commit()
+                .await
+                .map_err(db_err("checkpoint and enqueue"))?;
+            Ok(())
+        }
     }
 
     impl PostgresStore {
@@ -1760,7 +2215,7 @@ mod postgres {
 
         #[test]
         fn migration_sql_creates_all_tables_idempotently() {
-            assert_eq!(MIGRATION_SQL.len(), 10);
+            assert_eq!(MIGRATION_SQL.len(), 13);
             for stmt in MIGRATION_SQL {
                 assert!(
                     stmt.contains("IF NOT EXISTS"),
@@ -1786,6 +2241,14 @@ mod postgres {
             // Additive columns for pre-wave-2 databases arrive as ALTERs.
             assert!(ALTER_TASKS_ADD_CANCEL_REQUESTED_SQL.contains("ALTER TABLE server_tasks"));
             assert!(ALTER_TASKS_ADD_DEADLINE_SQL.contains("ALTER TABLE server_tasks"));
+            assert!(ALTER_TASKS_ADD_RECEIPT_SQL.contains("ALTER TABLE server_tasks"));
+            assert!(ALTER_TASKS_ADD_RECEIPT_SQL.contains("JSONB"));
+            // The outbox table: 1:1 with its task, pending until published.
+            assert!(CREATE_OUTBOX_SQL.contains("server_outbox"));
+            assert!(CREATE_OUTBOX_SQL.contains("TEXT PRIMARY KEY"));
+            assert!(CREATE_OUTBOX_SQL.contains("published_at TIMESTAMPTZ"));
+            assert!(CREATE_OUTBOX_PENDING_INDEX_SQL.contains("CREATE INDEX"));
+            assert!(CREATE_OUTBOX_PENDING_INDEX_SQL.contains("WHERE published_at IS NULL"));
         }
 
         #[test]
@@ -1803,6 +2266,7 @@ mod postgres {
                 "effect",
                 "cancel_requested",
                 "deadline",
+                "receipt",
             ] {
                 assert!(CREATE_TASKS_SQL.contains(col), "missing column {col}");
             }
@@ -1848,10 +2312,29 @@ mod postgres {
                 assert!(sql.contains("task_id = $1 AND tenant = $2 AND lease_owner = $3"));
                 assert!(sql.contains("status = 'leased'"));
             }
+            // Complete also stores the reported effect receipt (additive
+            // JSONB column; NULL when none is reported).
+            assert!(COMPLETE_TASK_SQL.contains("receipt = $6"));
             // Fail locks the row first: the attempt count read and the
             // requeue/dead write must serialize against other settlers.
             assert!(FAIL_SELECT_SQL.contains("FOR UPDATE"));
             assert!(FAIL_UPDATE_SQL.contains("lease_owner = NULL"));
+        }
+
+        #[test]
+        fn outbox_sql_is_locking_deduped_and_atomic_per_row() {
+            // The relay picks the oldest pending row under SKIP LOCKED, so
+            // concurrent publishers take distinct rows.
+            assert!(SELECT_OUTBOX_PENDING_SQL.contains("WHERE published_at IS NULL"));
+            assert!(SELECT_OUTBOX_PENDING_SQL.contains("FOR UPDATE SKIP LOCKED"));
+            assert!(SELECT_OUTBOX_PENDING_SQL.contains("LIMIT 1"));
+            // Outbox writes dedupe on outbox_id (== task_id), making
+            // retried checkpoint+enqueue pairs no-ops.
+            assert!(INSERT_OUTBOX_SQL.contains("ON CONFLICT (outbox_id) DO NOTHING"));
+            // The checkpoint half keeps the no-overwrite contract: no
+            // ON CONFLICT, so a duplicate id aborts the whole transaction.
+            assert!(INSERT_CHECKPOINT_SQL.contains("INSERT INTO rusty_checkpoints"));
+            assert!(!INSERT_CHECKPOINT_SQL.to_uppercase().contains("ON CONFLICT"));
         }
 
         #[test]
@@ -1970,6 +2453,195 @@ mod postgres {
             assert_eq!(item.value, json!({"v": 1}));
             assert_eq!(item.created_at, created);
             assert_eq!(item.updated_at, updated);
+        }
+
+        // --------------------------------------------------------- //
+        // Live-Postgres outbox tests (`--ignored`, DATABASE_URL)
+        // --------------------------------------------------------- //
+
+        /// The database the live tests run against; panics with guidance
+        /// when unset (these never run in the default suite).
+        fn database_url() -> String {
+            std::env::var("DATABASE_URL").expect(
+                "DATABASE_URL must point at a scratch Postgres database \
+                 (e.g. postgres://user:pass@localhost/rusty_test)",
+            )
+        }
+
+        /// Unique fragment so repeated runs against a shared scratch
+        /// database never collide.
+        fn uniq() -> String {
+            uuid::Uuid::new_v4().simple().to_string()
+        }
+
+        /// A queued task record under `tenant` with a unique task id. The
+        /// pool is unique per record: published tasks stay queued, and a
+        /// unique pool keeps them from ever being claimed by another test
+        /// sharing the scratch database.
+        fn live_task(tenant: &str, idempotency_key: Option<String>) -> TaskRecord {
+            TaskRecord::new(
+                tasks::NewTask {
+                    task_id: format!("task-{}", uniq()),
+                    tenant: tenant.to_string(),
+                    kind: "charge".to_string(),
+                    payload: json!({"cents": 500}),
+                    pool: format!("live-{}", uniq()),
+                    max_attempts: 3,
+                    idempotency_key,
+                    effect: None,
+                    run_id: None,
+                    thread_id: None,
+                    deadline: None,
+                },
+                Utc::now(),
+            )
+        }
+
+        /// Serializes the live tests: they share one scratch database, and
+        /// a publish pass drains *any* pending row, so two concurrent tests
+        /// would publish each other's rows and race the assertions.
+        static LIVE_DB_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+        /// Publish until nothing is pending (bounded), clearing rows left
+        /// over from previous runs against the shared scratch database so
+        /// each test observes exactly its own publishes.
+        async fn drain_outbox(store: &PostgresStore) {
+            for _ in 0..100 {
+                let published = store
+                    .outbox_publish_pending(100, Utc::now())
+                    .await
+                    .expect("drain publish");
+                if published.is_empty() {
+                    return;
+                }
+            }
+            panic!("outbox never drained — a poisoned row is stuck pending");
+        }
+
+        #[tokio::test]
+        #[ignore = "requires a live Postgres (DATABASE_URL)"]
+        async fn live_outbox_publish_is_idempotent_across_calls() {
+            let _guard = LIVE_DB_LOCK.lock().await;
+            let store = PostgresStore::new(database_url());
+            drain_outbox(&store).await;
+            let tenant = format!("t-{}", uniq());
+            let task = live_task(&tenant, Some(format!("charge-{}", uniq())));
+
+            // Enqueue only stages the row; nothing is claimable yet.
+            let (staged, deduplicated) = store.outbox_enqueue(&task).await.unwrap();
+            assert!(!deduplicated);
+            assert_eq!(staged.task_id, task.task_id);
+            assert!(store
+                .get_task(&tenant, &task.task_id)
+                .await
+                .unwrap()
+                .is_none());
+
+            // The first publish inserts the task and marks the row; a
+            // crash-recovery second pass (or the next relay tick) finds
+            // nothing pending — at-least-once publishing, exactly-once
+            // visibility.
+            let published = store.outbox_publish_pending(100, Utc::now()).await.unwrap();
+            assert_eq!(published.len(), 1);
+            assert_eq!(published[0].task_id, task.task_id);
+            assert!(store
+                .get_task(&tenant, &task.task_id)
+                .await
+                .unwrap()
+                .is_some());
+            assert!(store
+                .outbox_publish_pending(100, Utc::now())
+                .await
+                .unwrap()
+                .is_empty());
+        }
+
+        #[tokio::test]
+        #[ignore = "requires a live Postgres (DATABASE_URL)"]
+        async fn live_outbox_publish_dedupes_against_an_existing_task() {
+            let _guard = LIVE_DB_LOCK.lock().await;
+            let store = PostgresStore::new(database_url());
+            drain_outbox(&store).await;
+            let tenant = format!("t-{}", uniq());
+            let key = format!("charge-{}", uniq());
+
+            // The task landed out-of-band (a pre-outbox enqueue, or a
+            // publish whose mark-published was lost to a crash and whose
+            // row is now retried): the same idempotency key is already
+            // live in the queue.
+            let direct = live_task(&tenant, Some(key.clone()));
+            let (landed, deduplicated) = store.enqueue_task(&direct).await.unwrap();
+            assert!(!deduplicated);
+
+            // The outbox row carries a different task id under the same
+            // key; publishing it must not double the effect — the queue
+            // insert dedupes, and the row is still marked published.
+            let staged = live_task(&tenant, Some(key));
+            assert_ne!(staged.task_id, direct.task_id);
+            store.outbox_enqueue(&staged).await.unwrap();
+            let published = store.outbox_publish_pending(100, Utc::now()).await.unwrap();
+            assert_eq!(published.len(), 1);
+            assert_eq!(
+                published[0].task_id, landed.task_id,
+                "the publish resolves to the pre-existing task"
+            );
+            assert!(store
+                .get_task(&tenant, &staged.task_id)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(store
+                .outbox_publish_pending(100, Utc::now())
+                .await
+                .unwrap()
+                .is_empty());
+        }
+
+        #[tokio::test]
+        #[ignore = "requires a live Postgres (DATABASE_URL)"]
+        async fn live_checkpoint_and_enqueue_commits_or_aborts_as_one_unit() {
+            let _guard = LIVE_DB_LOCK.lock().await;
+            let store = PostgresStore::new(database_url());
+            drain_outbox(&store).await;
+            let tenant = format!("t-{}", uniq());
+            let thread_id = format!("thread-{}", uniq());
+            let checkpoint = Checkpoint::new(
+                thread_id,
+                0,
+                rusty_agent_runtime::state::State::from_value(json!({"log": ["manual"]})).unwrap(),
+                Vec::new(),
+            );
+            let first = live_task(&tenant, Some(format!("k-{}", uniq())));
+
+            // Happy path: checkpoint + outbox row commit together; the
+            // relay then publishes the task.
+            store
+                .checkpoint_and_enqueue(&checkpoint, std::slice::from_ref(&first))
+                .await
+                .unwrap();
+            let published = store.outbox_publish_pending(100, Utc::now()).await.unwrap();
+            assert_eq!(published.len(), 1);
+            assert_eq!(published[0].task_id, first.task_id);
+
+            // A retried pair whose checkpoint id already exists must abort
+            // the WHOLE unit: the duplicate checkpoint id violates the
+            // no-overwrite contract, and the transaction rolls back the
+            // paired outbox insert with it — no silent half-write.
+            let second = live_task(&tenant, Some(format!("k-{}", uniq())));
+            let err = store
+                .checkpoint_and_enqueue(&checkpoint, std::slice::from_ref(&second))
+                .await;
+            assert!(err.is_err(), "duplicate checkpoint id must abort");
+            assert!(store
+                .outbox_publish_pending(100, Utc::now())
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(store
+                .get_task(&tenant, &second.task_id)
+                .await
+                .unwrap()
+                .is_none());
         }
     }
 }

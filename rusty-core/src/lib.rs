@@ -119,8 +119,8 @@ pub mod prelude {
     };
     pub use crate::record::{
         ArtifactRef, CheckpointHeader, DecisionAction, DecisionEvent, DecisionFamily,
-        DecisionOutcome, Effect, EventStatus, JournalRef, PayloadRef, PolicyVersion, RunEvent,
-        RunEventKind, CURRENT_FORMAT_VERSION,
+        DecisionOutcome, Effect, EffectReceipt, EventStatus, JournalRef, PayloadRef, PolicyVersion,
+        RunEvent, RunEventKind, CURRENT_FORMAT_VERSION,
     };
     pub use crate::replay::{
         BranchDiff, BranchTotals, ChannelDiff, ExactReplay, FixtureMetadata, LogicalClockParams,

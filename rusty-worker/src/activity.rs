@@ -28,7 +28,11 @@
 //!   (`{lease_expires_at, cancel_requested}`), a `409` means the lease is
 //!   lost.
 //! - `POST {base}/tasks/{task_id}/complete` — body `{worker_id, result}`,
-//!   where `result` is the handler's JSON return value.
+//!   where `result` is the handler's JSON return value; an activity that
+//!   performed an idempotent effect additionally carries its `receipt`
+//!   (the provider's confirmation — see [`Activity::run_with_receipt`]),
+//!   which the server journals into the task's run as an `effect_receipt`
+//!   event.
 //! - `POST {base}/tasks/{task_id}/fail` — body
 //!   `{worker_id, error_class, message, retryable}`; the reply
 //!   `{requeued, next_attempt_at, dead}` is logged for operators.
@@ -102,6 +106,7 @@ use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
 use rusty_agent_runtime::durable::ErrorClass;
 use rusty_agent_runtime::error::{Result, RustyError};
+use rusty_agent_runtime::record::EffectReceipt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -184,10 +189,44 @@ impl ActivityContext {
 /// The returned `Value` is stored verbatim as the task's `result`. An
 /// `Err` is classified into the shared [`ErrorClass`] taxonomy and reported
 /// to `POST /tasks/{id}/fail`.
+///
+/// Activities performing an `Idempotent` effect should override
+/// [`Activity::run_with_receipt`] instead: the receipt it returns — the
+/// provider's own confirmation, under the task's idempotency key — travels
+/// with the completion and is journaled into the task's run as evidence
+/// exact replay can serve instead of re-sending the effect.
 #[async_trait]
 pub trait Activity: Send + Sync {
     /// Execute the activity against a claimed task.
     async fn run(&self, ctx: ActivityContext) -> Result<Value>;
+
+    /// Execute the activity, additionally reporting an effect receipt with
+    /// the result. The default wraps [`Activity::run`] with no receipt, so
+    /// existing activities (and the closure blanket impl) are unaffected —
+    /// a receipt is something an activity opts into reporting, never
+    /// something the worker invents on its behalf: only the code that
+    /// performed the effect knows the provider's confirmation id.
+    async fn run_with_receipt(&self, ctx: ActivityContext) -> Result<ActivityCompletion> {
+        Ok(ActivityCompletion {
+            result: self.run(ctx).await?,
+            receipt: None,
+        })
+    }
+}
+
+/// What an activity reports on success: the stored `result` plus, when the
+/// activity performed an `Idempotent` effect, its [`EffectReceipt`] — the
+/// effect's own confirmation (provider id, idempotency key), which the
+/// server journals into the task's run as a `effect_receipt` event.
+#[derive(Debug, Clone)]
+pub struct ActivityCompletion {
+    /// The value stored as the task's `result` (any JSON).
+    pub result: Value,
+
+    /// The effect's confirmation, when the activity performed an idempotent
+    /// effect and the provider confirmed it. `None` for pure/read-only work
+    /// and for effects that carry no confirmation handle.
+    pub receipt: Option<EffectReceipt>,
 }
 
 /// Blanket implementation for async closures/functions:
@@ -300,11 +339,15 @@ struct HeartbeatResponse {
     cancel_requested: bool,
 }
 
-/// `POST /tasks/{id}/complete` request body.
+/// `POST /tasks/{id}/complete` request body. `receipt` is omitted (not
+/// null) when the activity reports none, keeping the body identical for
+/// pre-receipt activities.
 #[derive(Debug, Serialize)]
 struct CompleteRequest<'a> {
     worker_id: &'a str,
     result: &'a Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt: Option<&'a EffectReceipt>,
 }
 
 /// `POST /tasks/{id}/fail` request body. `error_class` serializes to the
@@ -370,7 +413,7 @@ enum ClaimOutcome {
 /// through the fail path while we still hold the lease).
 enum AttemptOutcome {
     /// The handler future completed (possibly with an error or panic).
-    Finished(std::result::Result<Result<Value>, tokio::task::JoinError>),
+    Finished(std::result::Result<Result<ActivityCompletion>, tokio::task::JoinError>),
     /// A heartbeat answered `409`: the server considers the task lost or
     /// settled. The worker makes no further calls for it.
     LeaseLost,
@@ -676,7 +719,7 @@ impl ActivityWorker {
             // The handler runs on its own task for the same reason as in
             // `/execute`: a panic must surface as an outcome, not a
             // torn-down worker.
-            let mut handle = tokio::spawn(async move { handler.run(ctx).await });
+            let mut handle = tokio::spawn(async move { handler.run_with_receipt(ctx).await });
             let outcome = tokio::select! {
                 joined = &mut handle => AttemptOutcome::Finished(joined),
                 _ = lease_lost.cancelled() => AttemptOutcome::LeaseLost,
@@ -716,9 +759,10 @@ impl ActivityWorker {
             };
 
             match joined {
-                Ok(Ok(result)) => {
-                    tracing::info!("activity succeeded");
-                    self.complete(&task_id, &result).await;
+                Ok(Ok(completion)) => {
+                    tracing::info!(receipt = completion.receipt.is_some(), "activity succeeded");
+                    self.complete(&task_id, &completion.result, completion.receipt.as_ref())
+                        .await;
                 }
                 Ok(Err(e)) => {
                     let (error_class, retryable) = classify_error(&e);
@@ -829,11 +873,13 @@ impl ActivityWorker {
         })
     }
 
-    /// Settle a task successfully via `POST /tasks/{id}/complete`.
-    async fn complete(&self, task_id: &str, result: &Value) {
+    /// Settle a task successfully via `POST /tasks/{id}/complete`, carrying
+    /// the effect receipt when the activity reported one.
+    async fn complete(&self, task_id: &str, result: &Value, receipt: Option<&EffectReceipt>) {
         let body = CompleteRequest {
             worker_id: &self.worker_id,
             result,
+            receipt,
         };
         let response = self
             .client
@@ -918,6 +964,58 @@ mod tests {
 
         let arc: Arc<dyn Activity> = Arc::new(closure);
         assert_activity(&arc);
+    }
+
+    #[tokio::test]
+    async fn run_with_receipt_defaults_to_no_receipt() {
+        // Pre-receipt activities (and the closure blanket impl) complete
+        // through the provided method unchanged: their result is preserved
+        // and no receipt is invented on their behalf.
+        let closure = |ctx: ActivityContext| async move { Ok(json!({"echo": ctx.payload()})) };
+        let ctx = ActivityContext {
+            task_id: "t-1".into(),
+            kind: "k".into(),
+            attempt: 1,
+            idempotency_key: None,
+            payload: json!({"n": 1}),
+        };
+        let completion = closure.run_with_receipt(ctx).await.unwrap();
+        assert_eq!(completion.result, json!({"echo": {"n": 1}}));
+        assert!(completion.receipt.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_with_receipt_carries_the_reported_receipt() {
+        struct Charger;
+        #[async_trait]
+        impl Activity for Charger {
+            async fn run(&self, _ctx: ActivityContext) -> Result<Value> {
+                unreachable!("the worker drives run_with_receipt")
+            }
+            async fn run_with_receipt(&self, ctx: ActivityContext) -> Result<ActivityCompletion> {
+                Ok(ActivityCompletion {
+                    result: json!({"charged": true}),
+                    receipt: Some(EffectReceipt {
+                        provider: "stripe".into(),
+                        provider_id: "ch_3PKd".into(),
+                        idempotency_key: ctx.idempotency_key().unwrap_or_default().to_owned(),
+                        task_id: Some(ctx.task_id().to_owned()),
+                    }),
+                })
+            }
+        }
+        let ctx = ActivityContext {
+            task_id: "t-7".into(),
+            kind: "charge_card".into(),
+            attempt: 1,
+            idempotency_key: Some("run-9:charge:7".into()),
+            payload: json!({}),
+        };
+        let completion = Charger.run_with_receipt(ctx).await.unwrap();
+        let receipt = completion.receipt.expect("receipt reported");
+        assert_eq!(receipt.provider_id, "ch_3PKd");
+        assert_eq!(receipt.idempotency_key, "run-9:charge:7");
+        assert_eq!(receipt.task_id.as_deref(), Some("t-7"));
     }
 
     #[test]
@@ -1064,10 +1162,38 @@ mod tests {
         let complete = CompleteRequest {
             worker_id: "w-1",
             result: &result,
+            receipt: None,
         };
         assert_eq!(
             serde_json::to_value(&complete).unwrap(),
             json!({"worker_id": "w-1", "result": {"sent": true}})
+        );
+
+        // An activity reporting a receipt carries it with the completion;
+        // without one the body is byte-identical to the pre-receipt shape.
+        let receipt = EffectReceipt {
+            provider: "stripe".into(),
+            provider_id: "ch_3PKd".into(),
+            idempotency_key: "run-9:charge:7".into(),
+            task_id: Some("t-1".into()),
+        };
+        let complete = CompleteRequest {
+            worker_id: "w-1",
+            result: &result,
+            receipt: Some(&receipt),
+        };
+        assert_eq!(
+            serde_json::to_value(&complete).unwrap(),
+            json!({
+                "worker_id": "w-1",
+                "result": {"sent": true},
+                "receipt": {
+                    "provider": "stripe",
+                    "provider_id": "ch_3PKd",
+                    "idempotency_key": "run-9:charge:7",
+                    "task_id": "t-1"
+                }
+            })
         );
 
         let fail = FailRequest {

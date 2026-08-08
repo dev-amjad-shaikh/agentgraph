@@ -43,8 +43,8 @@ use serde_json::Value;
 
 use crate::llm::Usage;
 use crate::record::{
-    sha256_hex, ArtifactRef, Effect, EventStatus, PayloadRef, RunEvent, RunEventKind,
-    INLINE_PAYLOAD_MAX_BYTES,
+    sha256_hex, ArtifactRef, Effect, EffectReceipt, EventStatus, PayloadRef, RunEvent,
+    RunEventKind, INLINE_PAYLOAD_MAX_BYTES,
 };
 
 /// The `NodeConfig::extra` key under which the executor passes the
@@ -494,6 +494,31 @@ impl Journal {
             }
         }
     }
+
+    /// Journal an effect receipt (R0.6 Durable Work): the effect's own
+    /// confirmation of an `Idempotent` side effect, recorded as a
+    /// [`RunEventKind::EffectReceipt`] event with the receipt as its output
+    /// payload and `parent` as its causal parent — the task lifecycle event
+    /// that completed the effect once task lifecycle journaling lands; until
+    /// then, the run's journal head is the honest parent (the receipt was
+    /// caused by everything the run did before the task settled).
+    ///
+    /// Recording here — one canonical shape, as with model/tool calls — is
+    /// what lets [`JournalSnapshot::find_effect_receipt`] serve the receipt
+    /// during replay instead of re-sending the effect.
+    pub fn record_effect_receipt(&self, receipt: &EffectReceipt, parent: Option<String>) -> String {
+        let mut draft = EventDraft::new(RunEventKind::EffectReceipt, Effect::Idempotent)
+            // Serialization of a just-built receipt cannot realistically
+            // fail; if it somehow does, record the payload the event must
+            // not lose rather than drop the evidence.
+            .output(serde_json::to_value(receipt).unwrap_or_else(
+                |_| serde_json::json!({ "idempotency_key": receipt.idempotency_key }),
+            ));
+        if let Some(parent) = parent {
+            draft = draft.parent(parent);
+        }
+        self.record(draft)
+    }
 }
 
 /// Store `value` inline or — when its serialized size exceeds
@@ -543,6 +568,37 @@ pub struct JournalSnapshot {
 
     /// The chained head hash over `events`.
     pub head_hash: String,
+}
+
+impl JournalSnapshot {
+    /// The effect-receipt replay lookup (R0.6 Durable Work): the journaled
+    /// [`EffectReceipt`] for `idempotency_key`, when one exists.
+    ///
+    /// This is the queue-dispatched analogue of the seq-ordered serving
+    /// cursor exact replay uses for model and tool calls: a task's effect
+    /// lands outside the run's super-step order, so receipts are matched by
+    /// the idempotency key the effect ran under, not by sequence. A
+    /// re-driven run (or a replayed activity) asks "did this key already
+    /// land?" and serves the receipt instead of re-sending the effect.
+    ///
+    /// Malformed receipt payloads (a hand-edited journal) are skipped rather
+    /// than fatal — integrity failures of the snapshot itself are caught by
+    /// [`Journal::from_snapshot`]'s hash check at load time.
+    pub fn find_effect_receipt(&self, idempotency_key: &str) -> Option<EffectReceipt> {
+        self.events
+            .iter()
+            .filter(|event| event.kind == RunEventKind::EffectReceipt)
+            .find_map(|event| {
+                let value = match event.output.as_ref()? {
+                    PayloadRef::Inline(value) => value.clone(),
+                    PayloadRef::Artifact(reference) => {
+                        self.artifacts.get(&reference.sha256)?.clone()
+                    }
+                };
+                let receipt: EffectReceipt = serde_json::from_value(value).ok()?;
+                (receipt.idempotency_key == idempotency_key).then_some(receipt)
+            })
+    }
 }
 
 #[cfg(test)]
@@ -659,5 +715,56 @@ mod tests {
     fn system_defaults_match_pre_r05_shapes() {
         assert!(matches!(Clock::default(), Clock::System));
         assert!(matches!(RngSource::default(), RngSource::System));
+    }
+
+    fn receipt(key: &str) -> EffectReceipt {
+        EffectReceipt {
+            provider: "stripe".into(),
+            provider_id: "ch_3PKd".into(),
+            idempotency_key: key.into(),
+            task_id: Some("task-9".into()),
+        }
+    }
+
+    #[test]
+    fn effect_receipt_records_with_parentage_and_is_findable_by_key() {
+        let j = journal();
+        let step = j.record(EventDraft::new(RunEventKind::SuperStepStart, Effect::Pure));
+        let event_id = j.record_effect_receipt(&receipt("run-1:charge:7"), Some(step.clone()));
+
+        let events = j.events();
+        let recorded = events.last().unwrap();
+        assert_eq!(recorded.id, event_id);
+        assert_eq!(recorded.kind, RunEventKind::EffectReceipt);
+        // The receipt is an Idempotent effect's confirmation — declared as
+        // such so the replay/retry policies classify it like any other event.
+        assert_eq!(recorded.effect, Effect::Idempotent);
+        assert_eq!(recorded.parent.as_deref(), Some(step.as_str()));
+
+        // The lookup serves the receipt by idempotency key, and only it.
+        let snapshot = j.snapshot();
+        assert_eq!(
+            snapshot.find_effect_receipt("run-1:charge:7"),
+            Some(receipt("run-1:charge:7"))
+        );
+        assert_eq!(snapshot.find_effect_receipt("run-1:charge:8"), None);
+
+        // The journaled snapshot survives the integrity-verified reload with
+        // the receipt still servable (the crash boundary the receipt exists
+        // to cross).
+        let rebuilt = Journal::from_snapshot(snapshot, Clock::System).unwrap();
+        let snapshot = rebuilt.snapshot();
+        assert_eq!(
+            snapshot.find_effect_receipt("run-1:charge:7"),
+            Some(receipt("run-1:charge:7"))
+        );
+    }
+
+    #[test]
+    fn effect_receipt_records_without_a_parent() {
+        let j = journal();
+        j.record_effect_receipt(&receipt("k"), None);
+        let event = j.events().pop().unwrap();
+        assert_eq!(event.parent, None);
     }
 }

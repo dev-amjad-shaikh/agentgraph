@@ -31,7 +31,7 @@
 //! | `POST /threads` | create a thread bound to a registered graph |
 //! | `POST /threads/{id}/fork` | time travel: copy the thread's checkpoint history (full or up to `checkpoint_id`) into a new thread |
 //! | `GET /threads/{id}/state` | latest checkpoint as `{values, next, checkpoint}` |
-//! | `POST /threads/{id}/state` | write a new checkpoint (`update_state` analog; `as_node` is accepted for LangGraph compatibility but not recorded) |
+//! | `POST /threads/{id}/state` | write a new checkpoint (`update_state` analog; `as_node` is accepted for LangGraph compatibility but not recorded; optional `enqueue: [...]` submits tasks atomically with the checkpoint through the R0.6 wave-2b transactional outbox — one transaction on Postgres, outbox-first best-effort ordering on the JSON-file backend) |
 //! | `POST /threads/{id}/history` | checkpoint list, newest first, `limit`/`before` |
 //! | `POST /threads/{id}/runs` | background run: `202 + run_id` |
 //! | `POST /threads/{id}/runs/wait` | blocking run: terminal result as JSON |
@@ -51,9 +51,10 @@
 //! | `GET /store/{ns}/{key}` / `DELETE /store/{ns}/{key}` | fetch / delete one item |
 //! | `GET /store/{ns}` | list a namespace's items |
 //! | `POST /tasks` | R0.6 durable task queue: enqueue a task `{kind, payload, pool?, max_attempts?, idempotency_key?}` → `201 {task_id, deduplicated}` (`200` + `deduplicated: true` when the idempotency key already names a live task in this tenant) |
+//! | `POST /tasks/outbox` | R0.6 wave 2b: enqueue through the transactional outbox (same payload as `POST /tasks`) → `202 {task_id, deduplicated}`; the relay publishes the task into the queue within one poll interval, at-least-once, deduped on the idempotency key |
 //! | `POST /tasks/claim` | R0.6: claim the oldest claimable task `{worker_id, pools?, lease_ms}` → `200 {task}` with a fresh lease, `204` when nothing is claimable |
 //! | `POST /tasks/{id}/heartbeat` | R0.6: extend the held lease `{worker_id, lease_ms}` → `{lease_expires_at}`; `409` when the lease is lost |
-//! | `POST /tasks/{id}/complete` | R0.6: settle the held lease `{worker_id, result}` → updated task record; `409` when the lease is lost |
+//! | `POST /tasks/{id}/complete` | R0.6: settle the held lease `{worker_id, result, receipt?}` → updated task record; `409` when the lease is lost. The optional `receipt` (wave 2b: `{provider, provider_id, idempotency_key, task_id?}`) is the worker's report of an idempotent effect's provider confirmation; the server journals it into the task's run as an `effect_receipt` event |
 //! | `POST /tasks/{id}/fail` | R0.6: record a failed attempt `{worker_id, error_class, message, retryable}` → `{requeued, next_attempt_at, dead}` (backoff + jitter requeue, or dead-letter); `409` when the lease is lost |
 //! | `GET /tasks/{id}` | R0.6: the task record (404 unknown/cross-tenant) |
 //! | `GET /tasks?status=…` | R0.6: the tenant's tasks, oldest first; `status=dead` is the DLQ listing |
@@ -69,6 +70,7 @@ mod auth;
 mod crons;
 mod error;
 mod journals;
+mod outbox;
 mod replay;
 mod routes;
 mod runs;
@@ -90,8 +92,9 @@ pub use error::ApiError;
 pub use runs::RunStatus;
 
 /// Names the JSON-file layout already owns at the store root
-/// (`assistants/`, `crons/`, `journals/`, `store/`, `tasks/`, `threads/`,
-/// plus the `latest` pointer file inside each thread's checkpoint dir).
+/// (`assistants/`, `crons/`, `journals/`, `outbox/`, `store/`, `tasks/`,
+/// `threads/`, plus the `latest` pointer file inside each thread's
+/// checkpoint dir).
 /// Client-chosen ids and tenant ids claiming one of these would write
 /// checkpoints into platform directories (or platform records into
 /// checkpoint dirs), so both `validate_client_id` and
@@ -100,6 +103,7 @@ pub(crate) const RESERVED_NAMES: &[&str] = &[
     "assistants",
     "crons",
     "journals",
+    "outbox",
     "store",
     "tasks",
     "threads",
@@ -224,6 +228,13 @@ pub struct ServerConfig {
     /// Per-run SSE event-log capacity (frames retained for replay, default
     /// 1000).
     pub event_log_capacity: usize,
+
+    /// How often the transactional-outbox relay publishes pending rows into
+    /// the task queue (R0.6 wave 2b, default 250 ms). The relay is
+    /// crash-safe at any interval — pending rows survive restarts and
+    /// publishing dedupes on the task's idempotency key — so this only
+    /// tunes outbox-to-queue latency, not correctness.
+    pub outbox_relay_interval: std::time::Duration,
 }
 
 impl Default for ServerConfig {
@@ -236,6 +247,7 @@ impl Default for ServerConfig {
             api_key: None,
             api_keys: Vec::new(),
             event_log_capacity: 1000,
+            outbox_relay_interval: crate::outbox::DEFAULT_RELAY_INTERVAL,
         }
     }
 }
@@ -334,6 +346,14 @@ impl ServerConfig {
     /// metadata/updates/end frames of a minimal run).
     pub fn with_event_log_capacity(mut self, capacity: usize) -> Self {
         self.event_log_capacity = capacity;
+        self
+    }
+
+    /// Builder-style: set the transactional-outbox relay's poll interval
+    /// (R0.6 wave 2b). Tests can set a long interval to drive publishing
+    /// deterministically; correctness never depends on the interval.
+    pub fn with_outbox_relay_interval(mut self, interval: std::time::Duration) -> Self {
+        self.outbox_relay_interval = interval;
         self
     }
 }

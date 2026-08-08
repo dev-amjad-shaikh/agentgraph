@@ -224,6 +224,49 @@ impl PayloadRef {
     }
 }
 
+/// The effect's own confirmation of an `Idempotent` side effect, journaled
+/// as the output payload of a [`RunEventKind::EffectReceipt`] event (R0.6
+/// Durable Work).
+///
+/// A receipt is the proof the *provider* accepted the effect exactly once:
+/// its own confirmation id, under the idempotency key the caller supplied.
+/// Two consumers depend on it:
+///
+/// - **Operators** auditing a run can trace every effect to the provider's
+///   record of it (`provider` + `provider_id`).
+/// - **Exact replay** serves the journaled receipt instead of re-sending the
+///   effect — the same rule the Flight Recorder applies to journaled model
+///   and tool calls, extended across the crash boundary between a run and
+///   its queue-dispatched tasks. The replay lookup is keyed on
+///   [`EffectReceipt::idempotency_key`] (see
+///   [`crate::journal::JournalSnapshot::find_effect_receipt`]), not on event
+///   sequence: a task completes outside the run's super-step order.
+///
+/// Serialized inside the event's output [`PayloadRef`], so the event
+/// envelope stays unchanged and old journals keep deserializing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EffectReceipt {
+    /// The system that confirmed the effect (a provider name — `stripe`,
+    /// `sendgrid` — or any store with idempotent-put semantics).
+    pub provider: String,
+
+    /// The provider's own confirmation id (charge id, message id, version
+    /// stamp) — the handle an audit uses to find the effect at the provider.
+    pub provider_id: String,
+
+    /// The idempotency key the effect was performed under — the key the task
+    /// envelope carried and the recipient passed to the provider. This is
+    /// the replay lookup key: a re-driven run asks "did this key already
+    /// land?" and the journal answers with this receipt.
+    pub idempotency_key: String,
+
+    /// The durable task whose completion produced this receipt, when the
+    /// effect was queue-dispatched. `None` for effects a run performed
+    /// in-process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+}
+
 /// The outcome status of a journaled event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -275,6 +318,14 @@ pub enum RunEventKind {
     /// A checkpoint was persisted; output carries the checkpoint id, step,
     /// and journal head reference stamped into it.
     CheckpointWritten,
+    /// An `Idempotent` effect's own confirmation, journaled by the effect's
+    /// recipient (R0.6 Durable Work): output carries the [`EffectReceipt`] —
+    /// the provider's confirmation id plus the idempotency key the effect
+    /// ran under. Exact replay serves the receipt instead of re-sending the
+    /// effect: the same journaled-output rule model and tool calls follow,
+    /// extended across the crash boundary between a run and its durable
+    /// tasks.
+    EffectReceipt,
 }
 
 /// One recorded fact about a run: the Flight Recorder's atomic evidence.

@@ -31,7 +31,8 @@ use rusty_agent_runtime::llm::{ChatMessage, ChatModel, ChatResponse, Usage};
 use rusty_agent_runtime::node::{NodeContext, NodeOutput};
 use rusty_agent_runtime::record::{
     ArtifactRef, CheckpointHeader, DecisionAction, DecisionEvent, DecisionFamily, DecisionOutcome,
-    Effect, EventStatus, PayloadRef, PolicyVersion, RunEvent, RunEventKind, CURRENT_FORMAT_VERSION,
+    Effect, EffectReceipt, EventStatus, PayloadRef, PolicyVersion, RunEvent, RunEventKind,
+    CURRENT_FORMAT_VERSION,
 };
 use rusty_agent_runtime::state::{Reducer, State, StateSpec};
 use rusty_agent_runtime::tool::Tool;
@@ -158,6 +159,36 @@ fn golden_checkpoint_header_shape() {
             logical_clock: 1_750_000_000_000,
         },
     );
+}
+
+/// The receipt an `Idempotent` effect's recipient journals (R0.6 wave 2b):
+/// the payload shape exact replay's receipt lookup matches on.
+fn sample_effect_receipt() -> EffectReceipt {
+    EffectReceipt {
+        provider: "stripe".into(),
+        provider_id: "ch_3PKdY2eZvKYlo2C0".into(),
+        idempotency_key: "019157c4-6f1f-7a3b-8c2d-9e4f5a6b7c8d:charge:7".into(),
+        task_id: Some("task-019157c5".into()),
+    }
+}
+
+#[test]
+fn golden_effect_receipt_shape() {
+    assert_golden("effect_receipt.json", &sample_effect_receipt());
+}
+
+#[test]
+fn effect_receipt_without_task_id_omits_the_field() {
+    // Additive evolution: the optional linkage is absent (not null) on the
+    // wire when unset, so pre-receipt consumers see no shape change.
+    let receipt = EffectReceipt {
+        task_id: None,
+        ..sample_effect_receipt()
+    };
+    let value = serde_json::to_value(&receipt).unwrap();
+    assert!(value.get("task_id").is_none());
+    let back: EffectReceipt = serde_json::from_value(value).unwrap();
+    assert_eq!(back, receipt);
 }
 
 // ---------- checkpoint back-compat ----------

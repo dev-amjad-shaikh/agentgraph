@@ -169,20 +169,57 @@ against the tenant — an unbounded DLQ is a quiet disk-full outage.
 
 ## Transactional outbox + effect receipts (wave 2)
 
+**Both are implemented (wave 2b); wiring them into the run executor is the
+documented later integration point.**
+
 The split-brain the outbox kills: a node completes, writes state (or a
-checkpoint), and submits a task — and crashes between the two. Wave 2 makes
-state change and task submission one Postgres transaction: the outbox row
-is written with the checkpoint, and a relay publishes outbox rows into the
-queue at-least-once. Publish is idempotent on the task's idempotency key,
-so a relay retry cannot double-submit.
+checkpoint), and submits a task — and crashes between the two. Wave 2b makes
+state change and task submission one durable unit:
+
+- **The outbox is a table, not a flag.** `POST /tasks/outbox` and
+  `update_state`'s new `enqueue` list write outbox rows (1:1 with their
+  task, `outbox_id == task_id`) and answer `202 Accepted`; the tasks become
+  claimable only when the relay publishes them. On Postgres,
+  `update_state`'s checkpoint write and outbox inserts are **one
+  transaction** — a duplicate checkpoint id aborts the whole unit, so
+  "state saved, task lost" and the reverse are both impossible. The
+  JSON-file backend cannot transact across files, so it writes the outbox
+  rows *first* and the checkpoint second: a crash may leave published
+  tasks whose checkpoint never landed (visible and inspectable), but never
+  a checkpoint whose tasks silently vanished. Cross-record atomicity is
+  Postgres-only.
+- **The relay is a poller** (default 250 ms, `ServerConfig::
+  with_outbox_relay_interval`), publishing up to 100 pending rows per
+  pass, oldest first. On Postgres each row publishes in its own
+  transaction — pick under `FOR UPDATE SKIP LOCKED`, insert the task, mark
+  the row published, commit — so a crash mid-publish leaves the row
+  pending for the next pass (or the next process), and concurrent relays
+  take distinct rows. Correctness never depends on the interval; pending
+  rows survive restarts and publish on the first pass after boot.
+- **Publish dedupes on the task's idempotency key** (the same partial
+  unique index `POST /tasks` uses), so a retried publish — or two
+  submissions of the same effect, outbox and direct — resolves to one
+  task. Delivery stays at-least-once; visibility is exactly-once.
 
 **Effect receipts** close the loop the other way: when a task performing an
-`Idempotent` effect completes, the recipient journals the receipt (the
-effect's own confirmation — the provider's id, the stored key) as a
-`RunEvent` causally parented to the task. Exact replay can then serve the
-receipt instead of re-sending the effect — the same rule the Flight
-Recorder already applies to journaled model and tool calls, extended across
-a crash boundary.
+`Idempotent` effect completes, the worker reports the receipt (the effect's
+own confirmation — `provider`, `provider_id`, `idempotency_key`, optional
+`task_id`) on `POST /tasks/{id}/complete`. The server rejects a receipt
+whose key does not match the task's (`400` — evidence of a wiring bug),
+stores it on the task record (an additive `receipt JSONB` column on
+Postgres), and journals it into the task's run as an `effect_receipt`
+`RunEvent` (`Effect::Idempotent`, the receipt as the output payload). The
+causal parent is the journal's current head — the honest parent while task
+lifecycle events are not yet journaled; once they are, the receipt's parent
+becomes the task's completion event. Exact replay's
+`JournalSnapshot::find_effect_receipt` then serves the receipt instead of
+re-sending the effect — the same rule the Flight Recorder already applies
+to journaled model and tool calls, extended across a crash boundary. Two
+honest edges, by design: journaling is best-effort (the receipt is already
+durable on the task record), and while the run is still live its next
+checkpoint-boundary journal flush would rewrite the stored snapshot —
+run-side task-lifecycle journaling is the durable fix and the integration
+point for a later wave.
 
 ## Cancellation propagation + drain (wave 2)
 

@@ -17,7 +17,7 @@ use rusty_agent_runtime::checkpoint::{
     Checkpoint, Checkpointer, InMemoryCheckpointer, JsonFileCheckpointer,
 };
 use rusty_agent_runtime::journal::{Clock, Journal, JournalSnapshot, RngSource};
-use rusty_agent_runtime::record::RunEventKind;
+use rusty_agent_runtime::record::{EffectReceipt, RunEventKind};
 use rusty_agent_runtime::replay::{BranchDiff, ExactReplay, ReplayFixture, ReplayParams};
 use rusty_agent_runtime::state::State;
 use serde::Deserialize;
@@ -89,6 +89,7 @@ pub(crate) fn router(registry: GraphRegistry, config: ServerConfig) -> Router {
         queue_cap: config.max_concurrent_runs_per_thread.max(1),
         log_capacity: config.event_log_capacity.max(16),
     };
+    let outbox_relay_interval = config.outbox_relay_interval;
     let state = Arc::new(AppState {
         registry,
         config,
@@ -98,6 +99,10 @@ pub(crate) fn router(registry: GraphRegistry, config: ServerConfig) -> Router {
         state_locks: Mutex::new(HashMap::new()),
     });
     crons::spawn_scheduler(Arc::clone(&state));
+    // The outbox relay: publishes pending outbox rows into the task queue
+    // (R0.6 wave 2b). Also the crash-recovery path — rows pending at
+    // startup publish on its first tick.
+    crate::outbox::spawn_relay(Arc::clone(&state.server_store), outbox_relay_interval);
 
     Router::new()
         .route("/ok", get(ok))
@@ -135,6 +140,7 @@ pub(crate) fn router(registry: GraphRegistry, config: ServerConfig) -> Router {
                 .delete(delete_store_item),
         )
         .route("/tasks", post(enqueue_task).get(list_tasks))
+        .route("/tasks/outbox", post(enqueue_task_outbox))
         .route("/tasks/claim", post(claim_task))
         .route("/tasks/{task_id}", get(get_task))
         .route("/tasks/{task_id}/heartbeat", post(heartbeat_task))
@@ -446,6 +452,15 @@ struct UpdateStatePayload {
     /// Override for the next-node set (defaults to the previous value).
     #[serde(default)]
     next_nodes: Option<Vec<String>>,
+    /// Tasks to enqueue atomically with this checkpoint through the
+    /// transactional outbox (R0.6 wave 2b): every entry is validated
+    /// before anything is written, and with the Postgres backend the
+    /// checkpoint write and outbox enqueue commit in one transaction, so
+    /// a crash can never leave a checkpoint whose effects silently
+    /// vanished. The tasks become claimable when the relay publishes
+    /// them; the response returns after the durable outbox write.
+    #[serde(default)]
+    enqueue: Option<Vec<EnqueueTaskPayload>>,
 }
 
 async fn update_state(
@@ -459,8 +474,21 @@ async fn update_state(
         values,
         as_node,
         next_nodes,
+        enqueue,
     } = payload;
     let _ = as_node;
+
+    // Validate every enqueued task before any write: a malformed entry
+    // fails the whole request with nothing persisted, matching the
+    // all-or-nothing contract the Postgres transaction enforces.
+    let outbox_tasks = enqueue
+        .map(|payloads| {
+            payloads
+                .into_iter()
+                .map(|p| build_task_record(p, &tenant))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
 
     let internal_id = tenant.scope(&thread_id);
     let new_state = State::from_value(values)
@@ -486,11 +514,21 @@ async fn update_state(
         new_state,
         next_nodes.unwrap_or(prev_next),
     );
-    state
-        .checkpointer
-        .put(cp.clone())
-        .await
-        .map_err(internal_err)?;
+    match &outbox_tasks {
+        // Checkpoint + outbox enqueue as one durable unit (a single
+        // transaction on Postgres; outbox-first ordering on the file
+        // backend — see `ServerStore::checkpoint_and_enqueue`).
+        Some(tasks) => state
+            .server_store
+            .checkpoint_and_enqueue(&cp, tasks)
+            .await
+            .map_err(internal_err)?,
+        None => state
+            .checkpointer
+            .put(cp.clone())
+            .await
+            .map_err(internal_err)?,
+    }
 
     Ok((
         StatusCode::CREATED,
@@ -746,31 +784,44 @@ async fn get_run_stream(
 /// The `Checkpointer` trait has no delete operation, so removal goes
 /// through the JSON-file layout directly; on the Postgres backend the
 /// endpoint answers 409 rather than silently deleting nothing.
+///
+/// Reachability: the in-memory run record is the fast path; a run lost to
+/// a restart (or evicted past the retention cap) resolves through its
+/// persisted journal ([`run_evidence`]) — terminal by construction once no
+/// live writer remains, with its checkpoint ids recovered from the
+/// journaled `checkpoint_written` events — so rollback answers 409 (or
+/// applies, on the file backend) instead of 404ing on process-local state.
 async fn delete_run_checkpoints(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(tenant): Extension<TenantContext>,
     Path((thread_id, run_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
     require_thread(&state, &tenant, &thread_id).await?;
-    let info = state
-        .run_deps
-        .manager
-        .info(&run_id)
-        .await
-        .ok_or_else(|| ApiError::not_found(format!("run `{run_id}` not found")))?;
-    // Cross-tenant runs are invisible (404, not 403).
-    if !tenant.owns(&info.thread_id) {
-        return Err(ApiError::not_found(format!("run `{run_id}` not found")));
-    }
-    if info.wire_thread_id != thread_id {
+    let (wire_thread_id, checkpoint_ids) = match state.run_deps.manager.info(&run_id).await {
+        Some(info) => {
+            // Cross-tenant runs are invisible (404, not 403).
+            if !tenant.owns(&info.thread_id) {
+                return Err(ApiError::not_found(format!("run `{run_id}` not found")));
+            }
+            if matches!(info.status, RunStatus::Pending | RunStatus::Running) {
+                return Err(ApiError::conflict(
+                    "run is still active; rollback applies to finished runs".to_string(),
+                ));
+            }
+            (
+                info.wire_thread_id,
+                runs::lock_recover(&info.checkpoint_ids).clone(),
+            )
+        }
+        None => {
+            let evidence = run_evidence(&state, &tenant, &run_id).await?;
+            (evidence.wire_thread_id, evidence.checkpoint_ids)
+        }
+    };
+    if wire_thread_id != thread_id {
         return Err(ApiError::bad_request(format!(
             "run `{run_id}` does not belong to thread `{thread_id}`"
         )));
-    }
-    if matches!(info.status, RunStatus::Pending | RunStatus::Running) {
-        return Err(ApiError::conflict(
-            "run is still active; rollback applies to finished runs".to_string(),
-        ));
     }
     if state.config.database_url.is_some() {
         return Err(ApiError::conflict(
@@ -787,7 +838,7 @@ async fn delete_run_checkpoints(
         ));
     }
 
-    let ids = runs::lock_recover(&info.checkpoint_ids).clone();
+    let ids = checkpoint_ids;
     // Rollback is only well-defined when the run's checkpoints are the
     // tail of the current history: deleting mid-history checkpoints would
     // punch holes while the endpoint claims to re-anchor the thread to
@@ -1688,14 +1739,14 @@ struct EnqueueTaskPayload {
     deadline: Option<String>,
 }
 
-/// `POST /tasks` — enqueue a durable task. `201 {task_id, deduplicated:
-/// false}` on creation, `200 {task_id, deduplicated: true}` when the
-/// idempotency key already names a live task in this tenant.
-async fn enqueue_task(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Extension(tenant): Extension<TenantContext>,
-    Json(payload): Json<EnqueueTaskPayload>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+/// Validate an enqueue payload and build the fresh [`TaskRecord`] it
+/// describes (server-minted id, caller's tenant). Shared by `POST /tasks`,
+/// `POST /tasks/outbox`, and `update_state`'s atomic `enqueue` list — one
+/// validation surface, so the three submission paths can never drift apart.
+fn build_task_record(
+    payload: EnqueueTaskPayload,
+    tenant: &TenantContext,
+) -> Result<TaskRecord, ApiError> {
     tasks::validate_label("kind", &payload.kind, 256).map_err(ApiError::bad_request)?;
     let pool = payload
         .pool
@@ -1737,7 +1788,7 @@ async fn enqueue_task(
         })
         .transpose()?;
 
-    let record = TaskRecord::new(
+    Ok(TaskRecord::new(
         tasks::NewTask {
             task_id: uuid::Uuid::new_v4().to_string(),
             tenant: tenant.tenant().to_string(),
@@ -1752,7 +1803,18 @@ async fn enqueue_task(
             deadline,
         },
         Utc::now(),
-    );
+    ))
+}
+
+/// `POST /tasks` — enqueue a durable task. `201 {task_id, deduplicated:
+/// false}` on creation, `200 {task_id, deduplicated: true}` when the
+/// idempotency key already names a live task in this tenant.
+async fn enqueue_task(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
+    Json(payload): Json<EnqueueTaskPayload>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let record = build_task_record(payload, &tenant)?;
     let (task, deduplicated) = state
         .server_store
         .enqueue_task(&record)
@@ -1765,6 +1827,35 @@ async fn enqueue_task(
     };
     Ok((
         status,
+        Json(json!({
+            "task_id": task.task_id,
+            "deduplicated": deduplicated,
+        })),
+    ))
+}
+
+/// `POST /tasks/outbox` — enqueue through the transactional outbox (R0.6
+/// wave 2b): the same payload as `POST /tasks`, but the task is written to
+/// the outbox and becomes claimable only when the relay publishes it into
+/// the queue (within one poll interval). `202 {task_id, deduplicated}` —
+/// accepted, not yet queued. Delivery is at-least-once: the relay publishes
+/// pending rows on every poll and on startup, deduped on the task's
+/// idempotency key, so a crash anywhere in the pipe neither loses nor
+/// doubles the task. Use this (or `update_state`'s `enqueue`) when the
+/// submission must commit atomically with a state change.
+async fn enqueue_task_outbox(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
+    Json(payload): Json<EnqueueTaskPayload>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let record = build_task_record(payload, &tenant)?;
+    let (task, deduplicated) = state
+        .server_store
+        .outbox_enqueue(&record)
+        .await
+        .map_err(internal_err)?;
+    Ok((
+        StatusCode::ACCEPTED,
         Json(json!({
             "task_id": task.task_id,
             "deduplicated": deduplicated,
@@ -1836,6 +1927,11 @@ struct CompleteTaskPayload {
     worker_id: String,
     /// The task's result: any JSON value, stored on the record.
     result: Value,
+    /// The effect receipt (R0.6 wave 2b): the provider's confirmation of an
+    /// idempotent effect performed by this task, journaled into the task's
+    /// run as an `effect_receipt` event when the task carries run linkage.
+    #[serde(default)]
+    receipt: Option<EffectReceipt>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1906,7 +2002,10 @@ async fn heartbeat_task(
 
 /// `POST /tasks/{id}/complete` — settle the held lease successfully, storing
 /// `result` → `200` with the updated task record; `409` when the lease is
-/// lost.
+/// lost. A `receipt` in the payload is stored on the record and journaled
+/// into the task's run (see [`journal_effect_receipt`]); its idempotency key
+/// must match the task's — a receipt under a different key is evidence of a
+/// wiring bug, answered `400`.
 async fn complete_task(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(tenant): Extension<TenantContext>,
@@ -1914,6 +2013,25 @@ async fn complete_task(
     Json(payload): Json<CompleteTaskPayload>,
 ) -> Result<Json<Value>, ApiError> {
     tasks::validate_label("worker_id", &payload.worker_id, 256).map_err(ApiError::bad_request)?;
+    if let Some(receipt) = &payload.receipt {
+        // The receipt claims to confirm *this* task's effect; a key
+        // mismatch means the worker confirmed something else. Checked
+        // against the stored record before settling (an unknown task skips
+        // the check — the lease protocol's 404/409 decides instead).
+        if let Some(task) = state
+            .server_store
+            .get_task(tenant.tenant(), &task_id)
+            .await
+            .map_err(internal_err)?
+        {
+            if task.idempotency_key.as_ref() != Some(&receipt.idempotency_key) {
+                return Err(ApiError::bad_request(format!(
+                    "`receipt.idempotency_key` `{}` does not match the task's idempotency key `{:?}`",
+                    receipt.idempotency_key, task.idempotency_key
+                )));
+            }
+        }
+    }
     let outcome = state
         .server_store
         .complete_task(
@@ -1921,12 +2039,86 @@ async fn complete_task(
             &task_id,
             &payload.worker_id,
             payload.result,
+            payload.receipt,
             Utc::now(),
         )
         .await
         .map_err(internal_err)?;
     let task = lease_outcome(outcome, &task_id, &payload.worker_id)?;
+    journal_effect_receipt(&state, &tenant, &task).await;
     Ok(Json(task.wire()))
+}
+
+/// Journal a completed task's effect receipt into its run's persisted
+/// Flight Recorder journal (R0.6 wave 2b): an `effect_receipt` RunEvent
+/// whose causal parent is the journal's current head — the honest parent
+/// while task lifecycle events (submission, lease, completion) are not yet
+/// journaled; once they are, the receipt's parent becomes the task's
+/// completion event. Exact replay's receipt lookup
+/// (`JournalSnapshot::find_effect_receipt`) then serves the receipt instead
+/// of re-sending the effect.
+///
+/// Deliberately best-effort: the receipt is already durable on the task
+/// record, so a journaling failure (a live run whose journal is not yet
+/// persisted, a cross-tenant run linkage, a store error) is logged, never
+/// surfaced as a request failure. One honest gap, by design: while the run
+/// is still live, its next checkpoint-boundary journal flush rewrites the
+/// stored snapshot and would drop an appended receipt — the durable fix is
+/// the run-side wiring (the run journaling its task lifecycle itself), the
+/// documented integration point for a later wave.
+async fn journal_effect_receipt(state: &AppState, tenant: &TenantContext, task: &TaskRecord) {
+    let (Some(receipt), Some(run_id)) = (&task.receipt, &task.run_id) else {
+        return;
+    };
+    if let Err(error) = try_journal_effect_receipt(state, tenant, receipt, run_id).await {
+        tracing::warn!(
+            task_id = %task.task_id,
+            %run_id,
+            %error,
+            "effect receipt stays on the task record; journaling skipped"
+        );
+    }
+}
+
+/// The fallible body of [`journal_effect_receipt`], split out so the caller
+/// owns the logging decision.
+async fn try_journal_effect_receipt(
+    state: &AppState,
+    tenant: &TenantContext,
+    receipt: &EffectReceipt,
+    run_id: &str,
+) -> Result<(), String> {
+    let Some(snapshot) = state
+        .server_store
+        .get_journal(run_id)
+        .await
+        .map_err(|e| format!("load journal: {e}"))?
+    else {
+        return Err("run has no persisted journal yet".to_string());
+    };
+    // Ownership proof, the same shape as the run-evidence fallback: the
+    // journal's wire thread id scoped to this tenant must resolve, or the
+    // task's run linkage names another tenant's run and journaling into it
+    // would leak evidence across the isolation boundary.
+    let internal_thread_id = tenant.scope(&snapshot.thread_id);
+    let owned = state
+        .server_store
+        .get_thread(&internal_thread_id)
+        .await
+        .map_err(|e| format!("resolve thread: {e}"))?
+        .is_some();
+    if !owned {
+        return Err("run does not resolve in this tenant".to_string());
+    }
+    let journal = Journal::from_snapshot(snapshot, Clock::System)
+        .map_err(|e| format!("journal failed its integrity check: {e}"))?;
+    let parent = journal.events().last().map(|event| event.id.clone());
+    journal.record_effect_receipt(receipt, parent);
+    state
+        .server_store
+        .put_journal(&journal.snapshot())
+        .await
+        .map_err(|e| format!("persist journal: {e}"))
 }
 
 /// `POST /tasks/{id}/fail` — record a failed attempt → `200 {requeued,

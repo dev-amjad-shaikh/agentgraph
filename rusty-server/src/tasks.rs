@@ -1,7 +1,8 @@
 //! Durable task queue (R0.6 — Durable Work): effectively-once activities.
 //!
-//! A *task* is a unit of work enqueued by a control-plane caller (today: any
-//! API client; later waves add the run-side transactional outbox) and
+//! A *task* is a unit of work enqueued by a control-plane caller (`POST
+//! /tasks` directly, or `POST /tasks/outbox` through the wave-2b
+//! transactional outbox — the relay publishes it into this queue) and
 //! executed by an out-of-process worker. The server owns the substrate:
 //! durable records, leases with visibility timeouts, heartbeats, retries, a
 //! dead-letter queue, and cancellation propagation (wave 2a): the cancel
@@ -33,7 +34,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, Utc};
 use rusty_agent_runtime::durable::{classify_retry, ErrorClass, RetryDecision};
-use rusty_agent_runtime::record::Effect;
+use rusty_agent_runtime::record::{Effect, EffectReceipt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -172,6 +173,15 @@ pub(crate) struct TaskRecord {
     /// The completed task's result (any JSON value), set by `complete`.
     #[serde(default)]
     pub result: Option<Value>,
+    /// The effect receipt reported with completion (R0.6 wave 2b): the
+    /// provider's own confirmation of an `Idempotent` effect (provider id,
+    /// stored idempotency key), carried through the complete call. The
+    /// server journals it into the task's run as an `effect_receipt` event
+    /// (see `docs/durable-work-design.md`); the record keeps a durable copy
+    /// so the evidence survives independent of the journal. Additive —
+    /// `None` for tasks that report no receipt.
+    #[serde(default)]
+    pub receipt: Option<EffectReceipt>,
     /// Run/thread linkage: the run this task belongs to. Set at enqueue
     /// time; `POST /runs/{run_id}/cancel` cancels every non-terminal task
     /// carrying its run id (the outbox wave will set these from the run
@@ -262,6 +272,7 @@ impl TaskRecord {
             last_error: None,
             idempotency_key,
             result: None,
+            receipt: None,
             run_id,
             thread_id,
             cancel_requested: false,
@@ -325,12 +336,20 @@ impl TaskRecord {
         self.updated_at = now;
     }
 
-    /// Settle the task successfully, storing `result`. Caller checked
-    /// [`Self::leased_to`]. `error_class` / `last_error` from earlier failed
-    /// attempts are kept — they are the history of what this task survived.
-    pub(crate) fn complete(&mut self, result: Value, now: DateTime<Utc>) {
+    /// Settle the task successfully, storing `result` and the effect
+    /// `receipt` the worker reported with completion (when any). Caller
+    /// checked [`Self::leased_to`]. `error_class` / `last_error` from
+    /// earlier failed attempts are kept — they are the history of what this
+    /// task survived.
+    pub(crate) fn complete(
+        &mut self,
+        result: Value,
+        receipt: Option<EffectReceipt>,
+        now: DateTime<Utc>,
+    ) {
         self.status = TaskStatus::Completed;
         self.result = Some(result);
+        self.receipt = receipt;
         self.lease = None;
         self.next_attempt_at = None;
         self.updated_at = now;
@@ -454,6 +473,7 @@ impl TaskRecord {
             "last_error": self.last_error,
             "idempotency_key": self.idempotency_key,
             "result": self.result,
+            "receipt": self.receipt,
             "run_id": self.run_id,
             "thread_id": self.thread_id,
             "cancel_requested": self.cancel_requested,
@@ -892,7 +912,7 @@ mod tests {
         let expires = task.lease.as_ref().unwrap().expires_at;
         assert_eq!(expires, t0 + Duration::seconds(60));
 
-        task.complete(json!({"ok": true}), t0);
+        task.complete(json!({"ok": true}), None, t0);
         assert_eq!(task.status, TaskStatus::Completed);
         assert_eq!(task.result, Some(json!({"ok": true})));
         assert!(task.lease.is_none());
@@ -1012,7 +1032,7 @@ mod tests {
         let t0 = Utc::now();
         let mut completed = record();
         completed.claim("w-1", 60_000, t0);
-        completed.complete(json!({"ok": true}), t0);
+        completed.complete(json!({"ok": true}), None, t0);
 
         let mut dead = record();
         dead.claim("w-1", 60_000, t0);
@@ -1173,7 +1193,7 @@ mod tests {
         assert!(loaded["task-1"].leased_to("w-1"));
 
         // Overwrite replaces; a corrupt file is skipped, not fatal.
-        task.complete(json!(1), Utc::now());
+        task.complete(json!(1), None, Utc::now());
         persist(&root, &task).await.unwrap();
         std::fs::write(dir(&root).join("corrupt.json"), b"{nope").unwrap();
         let loaded = load(&root);

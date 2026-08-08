@@ -88,7 +88,7 @@ use uuid::Uuid;
 
 pub mod activity;
 
-pub use activity::{Activity, ActivityContext, ActivityWorker};
+pub use activity::{Activity, ActivityCompletion, ActivityContext, ActivityWorker};
 
 /// The registry of named node handlers a worker serves.
 ///

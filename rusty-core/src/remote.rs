@@ -252,10 +252,15 @@ enum AttemptError {
 /// it. This client's own retries cover transport-class failures only (see
 /// the module-level reliability notes).
 ///
-/// ```ignore
+/// ```no_run
+/// use std::time::Duration;
+/// use rusty_agent_runtime::graph::GraphBuilder;
+/// use rusty_agent_runtime::remote::RemoteNode;
+///
 /// let node = RemoteNode::new("doubler", "http://127.0.0.1:8200")
 ///     .with_timeout(Duration::from_secs(5))
 ///     .with_retries(2);
+/// let mut builder = GraphBuilder::new();
 /// builder.add_node("double", node);
 /// ```
 #[derive(Clone)]
