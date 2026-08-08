@@ -6,7 +6,8 @@
  *
  * The API mirrors the rusty-server HTTP surface (Agent-Protocol-compatible
  * subset): threads, runs (background / blocking / SSE-streamed), checkpoints,
- * fork & replay time travel, assistants, crons, and the cross-thread KV store.
+ * fork & replay time travel, assistants, crons, the cross-thread KV store,
+ * and the R0.6 durable task queue's control plane (`client.tasks`).
  *
  * @module @rusty-runtime/client
  */
@@ -105,6 +106,8 @@ export class RustyClient {
   #timeout;
   #fetch;
   #extraHeaders;
+  /** @type {TasksClient|undefined} lazily built on first `.tasks` access */
+  #tasksClient;
 
   /**
    * @param {string} baseUrl Server base URL, e.g. `"http://localhost:8100"`.
@@ -141,6 +144,24 @@ export class RustyClient {
   /** @returns {string} The normalized server base URL. */
   get baseUrl() {
     return this.#baseUrl;
+  }
+
+  /**
+   * The durable task queue's control plane (R0.6): submit, observe, and
+   * cancel tasks. Returns a cached {@link TasksClient} bound to this
+   * client's transport (same base URL, API key, timeout, and fetch).
+   * @returns {TasksClient}
+   */
+  get tasks() {
+    if (!this.#tasksClient) {
+      // The sub-client shares the parent's private transport through a
+      // bound closure — one request path, one error mapping, no second
+      // client to configure.
+      this.#tasksClient = new TasksClient((method, path, opts) =>
+        this.#request(method, path, opts),
+      );
+    }
+    return this.#tasksClient;
   }
 
   /**
@@ -672,6 +693,170 @@ export class RustyClient {
    */
   async kvList(namespace, opts = {}) {
     return this.#request('GET', `/store/${encodeURIComponent(namespace)}`, {
+      signal: opts.signal,
+    });
+  }
+}
+
+/**
+ * Control-plane client for the R0.6 durable task queue.
+ *
+ * Obtained as `client.tasks`; it shares the parent client's transport, so
+ * base URL, API key, timeout, and any custom `fetch` apply unchanged.
+ * Covers the operations a controlling application needs:
+ *
+ * - {@link TasksClient#enqueue} / {@link TasksClient#enqueueOutbox} — submit work.
+ * - {@link TasksClient#get} / {@link TasksClient#list} — observe records
+ *   (`list({ status: 'dead' })` is the dead-letter queue).
+ * - {@link TasksClient#cancel} / {@link TasksClient#cancelRunTasks} — cancellation.
+ *
+ * Why `claim` / `heartbeat` / `complete` / `fail` are deliberately absent:
+ * those four endpoints are the queue's *worker-machine* half — lease-guarded
+ * by `worker_id`, they exist so a worker process can hold, renew, and settle
+ * exactly one lease at a time. A control-plane caller that claimed a lease
+ * would either sit on it (starving real workers until the visibility timeout
+ * reclaims the task) or race a real worker's settlement into 409s. That
+ * surface belongs to the worker SDK (`rusty-worker`'s `ActivityWorker`);
+ * this client never holds leases.
+ */
+export class TasksClient {
+  /** @type {(method: string, path: string, opts?: object) => Promise<any>} */
+  #transport;
+
+  /**
+   * @param {(method: string, path: string, opts?: object) => Promise<any>} transport
+   *   The parent client's request function. Not part of the public API —
+   *   use `client.tasks` instead of constructing this directly.
+   */
+  constructor(transport) {
+    this.#transport = transport;
+  }
+
+  /**
+   * Build the enqueue body shared by `POST /tasks` and `POST /tasks/outbox`:
+   * camelCase options map onto the wire's snake_case; unset options are
+   * omitted so server defaults apply (pool `default`, max_attempts 3).
+   * @param {string} kind
+   * @param {unknown} payload
+   * @param {import('./index.d.ts').EnqueueTaskOptions} opts
+   */
+  static #enqueueBody(kind, payload, opts) {
+    const body = { kind, payload };
+    if (opts.pool !== undefined) body.pool = opts.pool;
+    if (opts.maxAttempts !== undefined) body.max_attempts = opts.maxAttempts;
+    if (opts.idempotencyKey !== undefined) body.idempotency_key = opts.idempotencyKey;
+    if (opts.effect !== undefined) body.effect = opts.effect;
+    if (opts.runId !== undefined) body.run_id = opts.runId;
+    if (opts.threadId !== undefined) body.thread_id = opts.threadId;
+    if (opts.deadline !== undefined) body.deadline = opts.deadline;
+    return body;
+  }
+
+  /**
+   * Enqueue a durable task (`POST /tasks`).
+   * @param {string} kind Work classification the worker fleet dispatches on
+   *   (free-form, e.g. `"send_email"`).
+   * @param {unknown} payload Work payload — any JSON-serializable value,
+   *   stored verbatim.
+   * @param {import('./index.d.ts').EnqueueTaskOptions} [opts]
+   * @returns {Promise<import('./index.d.ts').EnqueueTaskResult>}
+   *   `{ task_id, deduplicated }` — `deduplicated` is `true` when the
+   *   idempotency key already named a live task (HTTP 200) rather than a
+   *   fresh one being created (HTTP 201); the two cases differ in meaning,
+   *   not in shape, so the status code folds into the boolean.
+   */
+  async enqueue(kind, payload, opts = {}) {
+    return this.#transport('POST', '/tasks', {
+      body: TasksClient.#enqueueBody(kind, payload, opts),
+      signal: opts.signal,
+    });
+  }
+
+  /**
+   * Enqueue through the transactional outbox (`POST /tasks/outbox` → 202
+   * accepted). Same arguments as {@link TasksClient#enqueue}. The task is
+   * written to the outbox and becomes claimable only when the relay
+   * publishes it into the queue (within one poll interval). Delivery is
+   * at-least-once: the relay dedupes on the task's idempotency key, so a
+   * crash anywhere in the pipe neither loses nor doubles the task. Prefer
+   * this when the submission must commit atomically with other state;
+   * prefer `enqueue` when the task should be claimable immediately.
+   * @param {string} kind
+   * @param {unknown} payload
+   * @param {import('./index.d.ts').EnqueueTaskOptions} [opts]
+   * @returns {Promise<import('./index.d.ts').EnqueueTaskResult>}
+   */
+  async enqueueOutbox(kind, payload, opts = {}) {
+    return this.#transport('POST', '/tasks/outbox', {
+      body: TasksClient.#enqueueBody(kind, payload, opts),
+      signal: opts.signal,
+    });
+  }
+
+  /**
+   * Fetch one task record (`GET /tasks/{id}`; `404` for unknown or
+   * cross-tenant ids).
+   * @param {string} taskId
+   * @param {object} [opts]
+   * @param {AbortSignal} [opts.signal]
+   * @returns {Promise<import('./index.d.ts').TaskRecord>}
+   */
+  async get(taskId, opts = {}) {
+    return this.#transport('GET', `/tasks/${encodeURIComponent(taskId)}`, {
+      signal: opts.signal,
+    });
+  }
+
+  /**
+   * List the tenant's tasks, oldest first (`GET /tasks`).
+   * @param {object} [opts]
+   * @param {import('./index.d.ts').TaskStatus} [opts.status] Lifecycle
+   *   filter; `"dead"` is the dead-letter queue. The server answers 400
+   *   for an unknown status rather than silently returning everything.
+   * @param {AbortSignal} [opts.signal]
+   * @returns {Promise<import('./index.d.ts').TaskRecord[]>}
+   */
+  async list(opts = {}) {
+    const query = opts.status !== undefined
+      ? `?${new URLSearchParams({ status: opts.status })}`
+      : '';
+    return this.#transport('GET', `/tasks${query}`, { signal: opts.signal });
+  }
+
+  /**
+   * Cancel a non-terminal task (`POST /tasks/{id}/cancel`). Queued and
+   * retry-scheduled tasks move to the terminal `cancelled` state
+   * immediately; a leased task keeps its lease with `cancel_requested`
+   * set, so its holder learns on the next heartbeat and reports the
+   * attempt as cancelled. Cancellation is a hint for promptness — lease
+   * expiry stays the correctness mechanism. `409` when the task is
+   * already terminal, `404` for unknown or cross-tenant ids.
+   * @param {string} taskId
+   * @param {object} [opts]
+   * @param {AbortSignal} [opts.signal]
+   * @returns {Promise<import('./index.d.ts').TaskRecord>} The updated record.
+   */
+  async cancel(taskId, opts = {}) {
+    return this.#transport('POST', `/tasks/${encodeURIComponent(taskId)}/cancel`, {
+      signal: opts.signal,
+    });
+  }
+
+  /**
+   * Cancel every non-terminal task belonging to a run
+   * (`POST /runs/{run_id}/cancel`). Returns task ids split by how each
+   * cancellation landed: `cancelled` (moved terminal immediately) versus
+   * `signalled` (leased; holders learn via `cancel_requested`). Scope:
+   * this is the queue half of run cancellation — a task enqueued *after*
+   * the call is not retroactively cancelled. `404` for unknown or
+   * cross-tenant runs.
+   * @param {string} runId
+   * @param {object} [opts]
+   * @param {AbortSignal} [opts.signal]
+   * @returns {Promise<import('./index.d.ts').RunCancellation>}
+   */
+  async cancelRunTasks(runId, opts = {}) {
+    return this.#transport('POST', `/runs/${encodeURIComponent(runId)}/cancel`, {
       signal: opts.signal,
     });
   }

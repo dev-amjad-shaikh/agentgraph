@@ -7,7 +7,8 @@ JS + CSS, no npm, no framework, no bundler — open it and point it at a running
 studio/
 ├── index.html         ← the entire UI (open this)
 ├── serve.py           ← optional same-origin static host + API proxy
-└── test-recorder.mjs  ← node unit tests for the Flight Recorder timeline helpers
+├── test-recorder.mjs  ← node unit tests for the Flight Recorder timeline helpers
+└── test-tasks.mjs     ← node unit tests for the durable-tasks view helpers
 ```
 
 ## What it does
@@ -77,6 +78,20 @@ studio/
     carried by the diff itself (`added` / `removed`) is shown with a partial-view note.
 - **Status badges** — `pending` / `running` / `success` / `interrupted` / `error`, mapped from the wire
   values returned by `GET /runs/{run_id}`, `runs/wait`, and SSE `end` frames.
+- **Durable tasks view (R0.6)** — **Open task queue** in the sidebar swaps the main panel to the
+  tenant-wide task queue (it belongs to no thread, so it is reachable with no thread selected). A status
+  filter (`queued` / `leased` / `failed` / `completed` / `dead` / `cancelled` — `dead` is the DLQ) drives
+  `GET /tasks?status=…`; the list shows each task's kind, status badge, attempt counter, retry schedule,
+  and pool. Selecting a task opens a detail card with the full envelope (`payload`, `idempotency_key`,
+  declared `effect` with its retry meaning, run/thread linkage, `deadline`), the attempt bookkeeping
+  (`attempt` / `max_attempts`, `error_class` + `last_error` from the last failed attempt — the record
+  carries no per-attempt history), the live lease (`owner`, `expires_at`, the `cancel_requested` hint),
+  and the settled `result` / `receipt`. **Cancel task** calls `POST /tasks/{id}/cancel` — the toast says
+  how the request landed (terminal `cancelled` immediately, or the lease holder signalled via
+  `cancel_requested`); terminal tasks show the button disabled with the reason instead of inviting a 409.
+  On a server build without the routes (pre-R0.6, answered as a non-JSON 404) the panel explains the
+  missing endpoint instead of erroring. Task fields are read defensively, the same posture as the
+  Flight Recorder view.
 
 ## How to open
 
@@ -196,6 +211,13 @@ no network) and `react_agent` (channel `messages`, scripted model + echo tool, n
   divergence jump link / partial response), the 404 / 409 / 422 / route-missing error mapping, and
   fork-compare alignment (dimmed prefix, divergence marking, added/removed classes, presence-derived
   fallback for partial diffs, per-branch totals, HTML escaping). 71 passed, 0 failed.
+- `node studio/test-tasks.mjs` — 39 unit tests over the durable-tasks view helpers (same extraction
+  harness): badge tone per status with the unknown-status fallback, terminality mirroring the server's
+  `TaskRecord::is_terminal` (including the failed-with-retry-scheduled nuance), the list path builder,
+  row rendering (attempt counter, retry schedule, pool, HTML escaping), the detail card (envelope,
+  lease section present only while leased, `cancel_requested` note, DLQ triage fields, result/receipt,
+  cancel disabled with reason on terminal tasks, defensive rendering of partial records), and the
+  route-missing versus real-error note split. 39 passed, 0 failed.
 - The replay and fork-compare helpers were verified against **fixture-shaped JSON** built from the
   documented contracts (`{run_id, verified, expected_events, actual_events, first_divergence}` and the
   `BranchDiff` serde shape in `rusty-core/src/replay.rs`): the replay/diff server endpoints had not

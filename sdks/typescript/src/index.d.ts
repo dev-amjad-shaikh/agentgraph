@@ -396,6 +396,182 @@ export interface StoreItem {
   updated_at: string;
 }
 
+// ---------------------------------------------------------------------
+// Durable task queue (R0.6) — control plane via `client.tasks`
+// ---------------------------------------------------------------------
+
+/** Task lifecycle status. `dead` is the dead-letter queue. */
+export type TaskStatus =
+  | 'queued'
+  | 'leased'
+  | 'failed'
+  | 'completed'
+  | 'dead'
+  | 'cancelled';
+
+/**
+ * The closed failure taxonomy a failed attempt is classified under
+ * (core's `ErrorClass`, snake_case on the wire), shared verbatim with the
+ * worker SDK so both sides of the queue agree.
+ */
+export type TaskErrorClass =
+  | 'transient'
+  | 'rate_limited'
+  | 'timeout'
+  | 'invalid_input'
+  | 'dependency_failure'
+  | 'resource_exhausted'
+  | 'cancelled'
+  | 'unknown';
+
+/** A live lease: the worker allowed to settle the task, and its expiry. */
+export interface TaskLease {
+  owner: string;
+  expires_at: string;
+}
+
+/**
+ * The provider's confirmation of an idempotent effect, reported on task
+ * completion and journaled into the task's run as an `effect_receipt`
+ * event (core's `EffectReceipt`).
+ */
+export interface EffectReceipt {
+  /** The system that confirmed the effect (e.g. `stripe`, `sendgrid`). */
+  provider: string;
+  /** The provider's own confirmation id (charge id, message id, …). */
+  provider_id: string;
+  /** The idempotency key the effect was performed under. */
+  idempotency_key: string;
+  /** The durable task whose completion produced this receipt, if any. */
+  task_id?: string;
+}
+
+/**
+ * One durable task (the server's wire record; `tenant` is an internal
+ * isolation detail and never appears on the wire).
+ *
+ * The record carries the *last* attempt's error (`error_class` +
+ * `last_error`); per-attempt history is not on the HTTP surface. A
+ * `failed` task with `next_attempt_at` set has a retry scheduled (and is
+ * non-terminal); with it `null` the task failed outright — terminal, but
+ * not dead-lettered.
+ */
+export interface TaskRecord {
+  task_id: string;
+  kind: string;
+  payload: JsonValue;
+  pool: string;
+  status: TaskStatus;
+  /** 1-based number of the current/last attempt (0 = never claimed). */
+  attempt: number;
+  max_attempts: number;
+  error_class: TaskErrorClass | null;
+  /** The enqueuer's declared effect classification, when supplied. */
+  effect: Effect | null;
+  last_error: string | null;
+  idempotency_key: string | null;
+  /** The completed task's result. */
+  result: JsonValue | null;
+  receipt: EffectReceipt | null;
+  run_id: string | null;
+  thread_id: string | null;
+  /** Cancellation signalled to the lease holder (see `cancel`). */
+  cancel_requested: boolean;
+  /** Whole-task deadline (RFC 3339), across attempts. */
+  deadline: string | null;
+  /** Present exactly while `status === 'leased'`. */
+  lease: TaskLease | null;
+  /** When a `failed` task becomes claimable again (`null` otherwise). */
+  next_attempt_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Options for {@link TasksClient.enqueue} and {@link TasksClient.enqueueOutbox}. */
+export interface EnqueueTaskOptions {
+  /** Named pool (default `"default"`); workers claim from named pools. */
+  pool?: string;
+  /** Attempt ceiling before dead-lettering (server default 3, max 100). */
+  maxAttempts?: number;
+  /**
+   * Dedup key, unique per tenant across live tasks: re-enqueueing with
+   * the same key returns the existing task (`deduplicated: true`).
+   */
+  idempotencyKey?: string;
+  /**
+   * Declared effect classification of the work. A declared non-repeatable
+   * effect is never silently retried; when absent, the worker's
+   * per-attempt `retryable` flag decides.
+   */
+  effect?: Effect;
+  /** Run this task belongs to — `cancelRunTasks` cancels every non-terminal task carrying it. */
+  runId?: string;
+  /** Thread linkage (companion to `runId`). */
+  threadId?: string;
+  /** Whole-task deadline as an RFC 3339 timestamp, across attempts. */
+  deadline?: string;
+  /** Abort the request. */
+  signal?: AbortSignal;
+}
+
+/** `POST /tasks` / `POST /tasks/outbox` response. */
+export interface EnqueueTaskResult {
+  task_id: string;
+  /**
+   * `true` when the idempotency key already named a live task (HTTP 200)
+   * rather than a fresh one being created (HTTP 201).
+   */
+  deduplicated: boolean;
+}
+
+/** `POST /runs/{run_id}/cancel` response: task ids split by landing. */
+export interface RunCancellation {
+  run_id: string;
+  /** Tasks moved to the terminal `cancelled` state immediately. */
+  cancelled: string[];
+  /** Leased tasks whose holders were signalled via `cancel_requested`. */
+  signalled: string[];
+}
+
+/**
+ * Control-plane client for the R0.6 durable task queue, obtained as
+ * `client.tasks`. Submit (`enqueue` / `enqueueOutbox`), observe (`get` /
+ * `list`), and cancel (`cancel` / `cancelRunTasks`). The worker-machine
+ * operations (`claim` / `heartbeat` / `complete` / `fail`) are
+ * deliberately absent — they are lease-guarded by `worker_id` and belong
+ * to the worker SDK; a control-plane client never holds leases.
+ */
+export declare class TasksClient {
+  /** Enqueue a durable task (`POST /tasks`). */
+  enqueue(
+    kind: string,
+    payload: JsonValue,
+    opts?: EnqueueTaskOptions,
+  ): Promise<EnqueueTaskResult>;
+
+  /** Enqueue through the transactional outbox (`POST /tasks/outbox` → 202). */
+  enqueueOutbox(
+    kind: string,
+    payload: JsonValue,
+    opts?: EnqueueTaskOptions,
+  ): Promise<EnqueueTaskResult>;
+
+  /** Fetch one task record (`404` when unknown or cross-tenant). */
+  get(taskId: string, opts?: RequestOptions): Promise<TaskRecord>;
+
+  /** List the tenant's tasks, oldest first; `status: 'dead'` is the DLQ. */
+  list(opts?: { status?: TaskStatus } & RequestOptions): Promise<TaskRecord[]>;
+
+  /**
+   * Cancel a non-terminal task (`409` when already terminal). A leased
+   * task is signalled via `cancel_requested` rather than forced.
+   */
+  cancel(taskId: string, opts?: RequestOptions): Promise<TaskRecord>;
+
+  /** Cancel every non-terminal task belonging to a run (`404` unknown run). */
+  cancelRunTasks(runId: string, opts?: RequestOptions): Promise<RunCancellation>;
+}
+
 /** Options accepted by most read methods. */
 export interface RequestOptions {
   signal?: AbortSignal;
@@ -478,6 +654,9 @@ export declare class RustyClient {
 
   /** The normalized server base URL. */
   readonly baseUrl: string;
+
+  /** The durable task queue's control plane (R0.6). */
+  readonly tasks: TasksClient;
 
   /** Liveness probe. */
   ok(): Promise<{ ok: boolean }>;

@@ -35,6 +35,20 @@ for await (const frame of client.runStream(thread_id, { input: { /* … */ } }))
   // frame: { event: 'metadata'|'updates'|'values'|'messages'|'error'|'end', data, id? }
   if (frame.event === 'end') console.log('done:', frame.data.status);
 }
+
+// Durable task queue (R0.6) — control plane: submit, observe, cancel
+const enqueued = await client.tasks.enqueue('send_email', { to: 'user@example.com' }, {
+  idempotencyKey: 'welcome-42',        // re-enqueueing dedupes on this key
+  effect: 'idempotent',                // declares the work is safe to retry
+  deadline: '2026-08-11T00:00:00Z',    // RFC 3339, across attempts
+});
+// → { task_id, deduplicated: false }
+
+const task = await client.tasks.get(enqueued.task_id);   // the full TaskRecord
+await client.tasks.list();                               // all tasks, oldest first
+await client.tasks.list({ status: 'dead' });             // the dead-letter queue
+await client.tasks.cancel(enqueued.task_id);             // 409 if already terminal
+await client.tasks.cancelRunTasks(runId);                // cancel a run's open tasks
 ```
 
 ## API surface
@@ -62,6 +76,14 @@ for await (const frame of client.runStream(thread_id, { input: { /* … */ } }))
 | `createCron({ graph, intervalSecs‖cronExpr, input?, metadata?, onRunCompleted? })` | `POST /crons` | cron record |
 | `listCrons()` / `deleteCron(id)` | `GET /crons` · `DELETE /crons/{id}` | cron list / delete |
 | `kvGet(ns, key)` / `kvPut(ns, key, value)` / `kvDelete(ns, key)` / `kvList(ns)` | `GET/PUT/DELETE /store/{ns}/{key}` · `GET /store/{ns}` | KV items |
+| `tasks.enqueue(kind, payload, { pool?, maxAttempts?, idempotencyKey?, effect?, runId?, threadId?, deadline? })` | `POST /tasks` | `{ task_id, deduplicated }` |
+| `tasks.enqueueOutbox(kind, payload, …same opts…)` | `POST /tasks/outbox` | `202` `{ task_id, deduplicated }` |
+| `tasks.get(taskId)` | `GET /tasks/{id}` | task record |
+| `tasks.list({ status? })` | `GET /tasks[?status=…]` | task records, oldest first (`dead` = DLQ) |
+| `tasks.cancel(taskId)` | `POST /tasks/{id}/cancel` | updated record (`409` when terminal) |
+| `tasks.cancelRunTasks(runId)` | `POST /runs/{id}/cancel` | `{ run_id, cancelled, signalled }` |
+
+**Durable tasks (R0.6).** `client.tasks` is the **control plane** of the durable task queue: submit work, observe records, cancel. Task records carry the full envelope — `kind`, `payload`, `pool`, `status` (`queued` / `leased` / `failed` / `completed` / `dead` / `cancelled`), `attempt` / `max_attempts`, the live `lease`, `error_class` + `last_error` from the last failed attempt, `idempotency_key`, `result` / `receipt` when settled, run/thread linkage, `cancel_requested`, `deadline`, and timestamps. `enqueue` makes a task claimable immediately; `enqueueOutbox` writes through the transactional outbox (202 accepted — the relay publishes it into the queue within one poll interval, deduped on the idempotency key). Cancellation is a hint for promptness: a queued or retry-scheduled task goes terminal-`cancelled` immediately, while a leased task keeps its lease with `cancel_requested` set so its holder aborts cleanly on the next heartbeat. The worker-machine endpoints (`claim` / `heartbeat` / `complete` / `fail`) are deliberately absent — they are lease-guarded by `worker_id` and belong to the worker SDK (`rusty-worker`'s `ActivityWorker`); a control-plane client never holds leases.
 
 **Run payload** (all methods that take `payload`): `{ input, command: { resume }, config: { recursion_limit }, checkpoint: { checkpoint_id }, metadata, stream_mode, multitask_strategy, assistant_id }` — see the [server README](../../rusty-server/README.md#http-api) for semantics (resume for human-in-the-loop, `checkpoint_id` for replay).
 
@@ -112,7 +134,7 @@ cargo build -p rusty-server --example server_demo
 node --test test/
 ```
 
-The suite spawns the real `server_demo` binary (it binds `127.0.0.1:8100`, so that port must be free), polls `/ok`, exercises the full API — threads, blocking/background/streamed runs, SSE frame collection, fork + checkpoint replay, assistants, crons, KV CRUD, error shapes, timeouts — then kills the child and removes its scratch store. The 401 test self-skips because the demo binary runs with auth disabled.
+The suite has two halves. `test/client.test.js` is e2e: it spawns the real `server_demo` binary (it binds `127.0.0.1:8100`, so that port must be free), polls `/ok`, exercises the full API — threads, blocking/background/streamed runs, SSE frame collection, fork + checkpoint replay, assistants, crons, KV CRUD, error shapes, timeouts — then kills the child and removes its scratch store. The 401 test self-skips because the demo binary runs with auth disabled. `test/tasks.test.js` is no-I/O: the tasks control plane (`client.tasks`) is exercised against a fake `fetch`, so it runs without the server — `node --test test/tasks.test.js`.
 
 ## License
 

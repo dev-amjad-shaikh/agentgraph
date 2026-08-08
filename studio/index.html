@@ -250,6 +250,23 @@
   .badge.eff-compensatable  { color: #efdfae; background: #3a3325; border-color: var(--accent-dim); }
   .badge.eff-non_idempotent { color: #eac5c0; background: #341f1c; border-color: #5a322c; }
 
+  /* ---------- durable tasks ---------- */
+  .rec-controls select {
+    background: var(--bg-inset); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 6px; font-size: 12px;
+  }
+  .task-item {
+    border: 1px solid var(--border); border-radius: 7px;
+    padding: 7px 10px; margin-bottom: 6px; cursor: pointer;
+    background: var(--bg-raised);
+  }
+  .task-item:hover { border-color: var(--border-hi); }
+  .task-item.selected { border-color: var(--accent-dim); background: #2e2a20; }
+  .task-item .trow { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+  .task-item .tkind { font-family: var(--mono); font-weight: 600; font-size: 12.5px; }
+  .task-item .tkid { font-family: var(--mono); font-size: 10.5px; color: var(--text-faint); word-break: break-all; }
+  .task-item .tmeta { color: var(--text-dim); font-size: 11px; font-family: var(--mono); }
+
   /* ---------- recorder replay banner & fork compare ---------- */
   .rec-banner {
     border: 1px solid var(--border-hi); border-left-width: 3px; border-radius: 6px;
@@ -335,6 +352,13 @@
         <input id="inp-attach" type="text" spellcheck="false" placeholder="attach thread by id…">
         <button class="small" id="btn-attach">Attach</button>
       </div>
+
+      <h2 class="section">Durable tasks</h2>
+      <div class="note tiny">
+        The R0.6 task queue is tenant-wide — it does not belong to any thread.
+        The <code>dead</code> status filter is the dead-letter queue.
+      </div>
+      <button class="small primary" id="btn-tasks-open" style="width:100%">Open task queue</button>
     </aside>
 
     <main id="main">
@@ -459,6 +483,33 @@
         </div>
 
       </div>
+
+      <div id="tasks-view" style="display:none">
+        <div class="card">
+          <h2 class="section" style="margin-top:0">
+            Durable tasks
+            <button class="small" id="btn-tasks-refresh" style="float:right">refresh</button>
+          </h2>
+          <div class="rec-controls">
+            <span class="muted tiny">status:</span>
+            <select id="sel-task-status">
+              <option value="">all</option>
+              <option value="queued">queued</option>
+              <option value="leased">leased</option>
+              <option value="failed">failed</option>
+              <option value="completed">completed</option>
+              <option value="dead">dead (DLQ)</option>
+              <option value="cancelled">cancelled</option>
+            </select>
+            <span class="muted tiny">select a task for its envelope, attempts, and lease</span>
+            <span class="muted tiny" id="tasks-statusline"></span>
+          </div>
+          <div class="rec-split">
+            <div id="tasks-body"><div class="empty">Open the queue to load tasks.</div></div>
+            <div id="tasks-detail" style="display:none"></div>
+          </div>
+        </div>
+      </div>
     </main>
   </div>
 </div>
@@ -492,6 +543,9 @@ const store = {
   recorder: null,      // { runId, events, complete, selected, error } for the Flight Recorder view
   recUnsupported: false, // server build has no GET /runs/{id}/events route (pre-R0.5 server wave)
   compare: null,       // { baseId, branchId, baseEvents, branchEvents, diff, partial } for fork compare
+  view: "thread",      // "thread" | "tasks" — which workspace the main panel shows
+  tasks: null,         // { list, selected, error } for the durable-tasks view
+  tasksUnsupported: false, // server build has no /tasks routes (pre-R0.6 server wave)
 };
 
 /* ---------------- persistence ---------------- */
@@ -637,6 +691,7 @@ async function createThread(graph, threadId) {
       threadId ? { graph, thread_id: threadId } : { graph });
     store.threads.unshift(rec);
     store.selected = rec.thread_id;
+    store.view = "thread";
     saveThreads();
     renderThreads();
     renderMain();
@@ -652,7 +707,8 @@ async function attachThread() {
   const id = $("inp-attach").value.trim();
   if (!id) return;
   if (store.threads.some((t) => t.thread_id === id)) {
-    store.selected = id; saveThreads(); renderThreads(); renderMain(); return;
+    store.selected = id; store.view = "thread";
+    saveThreads(); renderThreads(); renderMain(); return;
   }
   // No GET /threads/{id} exists; probe via /state. A 404 means the in-memory
   // thread registry doesn't know it (e.g. after a server restart).
@@ -660,6 +716,7 @@ async function attachThread() {
     await api("GET", `/threads/${encodeURIComponent(id)}/state`);
     store.threads.unshift({ thread_id: id, graph: "?", metadata: null, created_at: null });
     store.selected = id;
+    store.view = "thread";
   } catch (e) {
     if (e.status === 404) {
       const graphs = (store.info && store.info.graphs.map((g) => g.name)) || [];
@@ -706,6 +763,7 @@ function renderThreads() {
     div.querySelector(".forget").onclick = (ev) => forgetThread(t.thread_id, ev);
     div.onclick = () => {
       store.selected = t.thread_id;
+      store.view = "thread"; // leave the tasks view when a thread is picked
       saveThreads();
       renderThreads();
       renderMain();
@@ -717,9 +775,15 @@ function renderThreads() {
 /* ---------------- main panel ---------------- */
 
 function renderMain() {
+  const tasks = store.view === "tasks";
+  $("tasks-view").style.display = tasks ? "block" : "none";
   const t = currentThread();
-  $("main-empty").style.display = t ? "none" : "block";
-  $("thread-view").style.display = t ? "block" : "none";
+  $("main-empty").style.display = !tasks && !t ? "block" : "none";
+  $("thread-view").style.display = !tasks && t ? "block" : "none";
+  if (tasks) {
+    tasksLoad(true); // quiet: a pre-R0.6 server shows a panel note, not toast spam
+    return;
+  }
   if (!t) return;
 
   stopPoll();
@@ -1106,6 +1170,7 @@ async function forkAtSelected() {
     };
     store.threads.unshift(rec);
     store.selected = res.thread_id;
+    store.view = "thread";
     saveThreads();
     renderThreads();
     renderMain();
@@ -1134,6 +1199,7 @@ async function forkAtSelected() {
   } catch (e) { toast(`fork thread created but state write failed: ${e.message}`, "err"); }
   store.threads.unshift(rec);
   store.selected = newId;
+  store.view = "thread";
   saveThreads();
   renderThreads();
   renderMain();
@@ -1708,6 +1774,247 @@ async function recCompare() {
 
 
 
+/* ---------------- durable tasks (R0.6) ----------------
+ * Control-plane view over the task queue: GET /tasks?status=… (the list
+ * payload doubles as the detail source — GET /tasks/{id} returns the same
+ * record) and POST /tasks/{id}/cancel, the one mutation this view performs.
+ * Wire contract is TaskRecord::wire in rusty-server/src/tasks.rs; fields
+ * are read defensively, the same posture as the Flight Recorder view. The
+ * pure helpers below take data and return data/HTML strings;
+ * studio/test-tasks.mjs exercises them under node.
+ * ------------------------------------------------------------------------- */
+
+/* Task statuses map onto the existing badge tones: leased pulses like a
+ * running run, cancelled takes the interrupt tone (control flow, not a
+ * failure), failed and dead share the error tone — the DLQ is a list of
+ * failures the retry policy gave up on. Unknown future statuses fall back
+ * to the pending tone so a newer server never breaks the view. */
+const TASK_STATUS_BADGE = {
+  queued:    "pending",
+  leased:    "running",
+  failed:    "error",
+  completed: "success",
+  dead:      "error",
+  cancelled: "interrupted",
+};
+
+function taskBadgeHtml(status) {
+  const s = String(status || "queued");
+  const cls = TASK_STATUS_BADGE[s] || "pending";
+  return `<span class="badge ${cls}">${escapeHtml(s)}</span>`;
+}
+
+/* Mirrors the server's TaskRecord::is_terminal: completed/dead/cancelled
+ * are final; a failed task with a retry scheduled (next_attempt_at set) is
+ * non-terminal — it would re-queue, which cancellation exists to prevent. */
+function taskIsTerminal(task) {
+  const s = task && task.status;
+  if (s === "completed" || s === "dead" || s === "cancelled") return true;
+  if (s === "failed") return !(task && task.next_attempt_at);
+  return false;
+}
+
+function tasksListPath(status) {
+  return status ? `/tasks?status=${encodeURIComponent(status)}` : "/tasks";
+}
+
+/* One task row: kind + status badge as the headline, then the id and the
+ * attempt/pool metadata a triage scan needs. */
+function taskRowHtml(task) {
+  const t = task || {};
+  const attempt = `attempt ${t.attempt ?? 0}/${t.max_attempts ?? "?"}`;
+  const retry = t.status === "failed" && t.next_attempt_at
+    ? ` · retry at ${t.next_attempt_at}`
+    : "";
+  return `<div class="trow"><span class="tkind">${escapeHtml(t.kind || "?")}</span>` +
+    taskBadgeHtml(t.status) +
+    `<span class="tmeta">${escapeHtml(`${attempt}${retry} · pool ${t.pool || "default"}`)}</span></div>` +
+    `<div class="tkid">${escapeHtml(t.task_id || "")}</div>`;
+}
+
+/* The detail card: the envelope a worker would see (minus `tenant`, which
+ * never crosses the wire), the attempt bookkeeping DLQ triage needs, the
+ * live lease, result/receipt when settled, and the cancel control —
+ * disabled with the reason when the task is already terminal. */
+function taskDetailHtml(task) {
+  const t = task || {};
+  const terminal = taskIsTerminal(t);
+  const kv = (k, v) => `<span class="k">${k}</span><span class="v">${v}</span>`;
+  const kvRow = (k, v) => kv(k, escapeHtml(v));
+  const rows = [
+    ["task", t.task_id || "?"],
+    ["pool", t.pool || "default"],
+    ["idempotency", t.idempotency_key || "—"],
+    ["run", t.run_id || "—"],
+    ["thread", t.thread_id || "—"],
+    ["deadline", t.deadline || "—"],
+    ["created", t.created_at || "—"],
+    ["updated", t.updated_at || "—"],
+  ];
+  let html = `<div class="rec-detail-card"><h3>${escapeHtml(t.kind || "?")}&nbsp;${taskBadgeHtml(t.status)}</h3>`;
+  html += `<div class="rec-kv">` + rows.map(([k, v]) => kvRow(k, v)).join("") + `</div>`;
+  if (t.effect) {
+    // The recorder's effect badge carries the retry/replay meaning too.
+    html += `<div class="rec-kv">${kv("effect", recEffectHtml(t.effect))}</div>`;
+  }
+
+  html += `<div class="rec-payload-label">attempts</div><div class="rec-kv">` +
+    kvRow("attempt", `${t.attempt ?? 0} of ${t.max_attempts ?? "?"}`) +
+    kvRow("error class", t.error_class || "—") +
+    kvRow("next attempt", t.next_attempt_at || "—") +
+    `</div>`;
+  if (t.last_error) html += `<pre class="json">${escapeHtml(String(t.last_error))}</pre>`;
+  html += `<div class="muted tiny">the record carries the last attempt's error; ` +
+    `per-attempt history is not on the wire (v0.6)</div>`;
+
+  if (t.lease || t.cancel_requested) {
+    html += `<div class="rec-payload-label">lease</div><div class="rec-kv">` +
+      kvRow("owner", (t.lease && t.lease.owner) || "—") +
+      kvRow("expires", (t.lease && t.lease.expires_at) || "—") +
+      `</div>`;
+    if (t.cancel_requested) {
+      html += `<div class="note tiny">cancellation requested — the holder learns on its next ` +
+        `heartbeat and reports the attempt cancelled; if it never asks, the claim path ` +
+        `finalizes the task once the lease lapses.</div>`;
+    }
+  }
+
+  html += `<div class="rec-payload-label">payload</div>` +
+    `<pre class="json">${escapeHtml(pretty(t.payload))}</pre>`;
+  if (t.result !== null && t.result !== undefined) {
+    html += `<div class="rec-payload-label">result</div>` +
+      `<pre class="json">${escapeHtml(pretty(t.result))}</pre>`;
+  }
+  if (t.receipt) {
+    const r = t.receipt;
+    html += `<div class="rec-payload-label">effect receipt</div><div class="rec-kv">` +
+      kvRow("provider", r.provider || "?") +
+      kvRow("provider id", r.provider_id || "?") +
+      kvRow("idempotency", r.idempotency_key || "?") +
+      (r.task_id ? kvRow("task", r.task_id) : "") +
+      `</div>`;
+  }
+
+  const disabled = terminal
+    ? ` disabled title="already terminal — cancellation can no longer change it"`
+    : "";
+  html += `<div style="margin-top:10px">` +
+    `<button class="small" data-cancel-id="${escapeHtml(t.task_id || "")}"${disabled}>Cancel task</button>`;
+  if (terminal) {
+    html += ` <span class="muted tiny">terminal tasks cannot be cancelled (the server answers 409)</span>`;
+  }
+  html += `</div></div>`;
+  return html;
+}
+
+/* Failure note for the tasks endpoints: route-missing (a pre-R0.6 server
+ * build, answered as a non-JSON 404) versus a real error — the same split
+ * the Flight Recorder view makes. */
+function tasksErrorHtml(status, body) {
+  const msg = escapeHtml((body && body.message) || `HTTP ${status || "?"}`);
+  if (status === 404 && !(body && body.error)) {
+    return `<div class="note">This server build has no <code>/tasks</code> routes yet — the durable ` +
+      `task queue lands with the R0.6 server wave. Rebuild rusty-server from the R0.6 branch ` +
+      `to use this view.</div>`;
+  }
+  return `<div class="note">${msg}</div>`;
+}
+
+async function tasksLoad(quiet) {
+  const status = $("sel-task-status").value;
+  $("tasks-statusline").textContent = "loading…";
+  try {
+    const list = await api("GET", tasksListPath(status));
+    const arr = Array.isArray(list) ? list : [];
+    const keep = store.tasks && store.tasks.selected;
+    store.tasks = {
+      list: arr,
+      // Keep the selection across refreshes while the task still exists.
+      selected: keep && arr.some((t) => t && t.task_id === keep) ? keep : null,
+      error: null,
+    };
+    store.tasksUnsupported = false;
+  } catch (e) {
+    // A 404 with a non-JSON body means a server build without the routes
+    // at all (pre-R0.6); a JSON 404 cannot happen on the list route, but
+    // any other error renders verbatim.
+    const noRoute = e.status === 404 && !(e.body && e.body.error);
+    if (noRoute) store.tasksUnsupported = true;
+    store.tasks = { list: [], selected: null, error: tasksErrorHtml(e.status, e.body) };
+    if (!quiet && !noRoute) toast(e.message, "err");
+  }
+  tasksRender();
+}
+
+function tasksRender() {
+  const body = $("tasks-body"), detail = $("tasks-detail");
+  const ts = store.tasks;
+  detail.style.display = "none";
+  detail.innerHTML = "";
+  if (!ts) {
+    $("tasks-statusline").textContent = "";
+    body.innerHTML = `<div class="empty">Open the queue to load tasks.</div>`;
+    return;
+  }
+  if (ts.error) {
+    $("tasks-statusline").textContent = "";
+    body.innerHTML = ts.error;
+    return;
+  }
+  const status = $("sel-task-status").value;
+  $("tasks-statusline").textContent =
+    `${ts.list.length} task(s)` + (status === "dead" ? " — the dead-letter queue" : "");
+  if (!ts.list.length) {
+    body.innerHTML = `<div class="empty">No tasks` +
+      (status ? ` with status ${escapeHtml(status)}` : "") + `.</div>`;
+    return;
+  }
+  body.innerHTML = "";
+  for (const task of ts.list) {
+    const div = document.createElement("div");
+    div.className = "task-item" + (task && task.task_id === ts.selected ? " selected" : "");
+    div.innerHTML = taskRowHtml(task);
+    div.onclick = () => tasksSelect(task && task.task_id);
+    body.appendChild(div);
+  }
+  const selected = ts.list.find((t) => t && t.task_id === ts.selected);
+  if (selected) {
+    detail.style.display = "block";
+    detail.innerHTML = taskDetailHtml(selected);
+  }
+}
+
+function tasksSelect(taskId) {
+  if (!store.tasks || !taskId) return;
+  store.tasks.selected = store.tasks.selected === taskId ? null : taskId;
+  tasksRender();
+}
+
+/* Cancel is the view's one mutation. The response says how the request
+ * landed — a queued/retry-scheduled task is terminal `cancelled`
+ * immediately, a leased task is only signalled — and the toast says which;
+ * the list refresh then makes the transition visible. */
+async function taskCancel(taskId) {
+  try {
+    const updated = await api("POST", `/tasks/${encodeURIComponent(taskId)}/cancel`);
+    if (updated && updated.status === "cancelled") {
+      toast(`task ${shortId(taskId)} cancelled`, "ok");
+    } else if (updated && updated.cancel_requested) {
+      toast(`task ${shortId(taskId)} is leased — its holder was signalled via cancel_requested`, "warn");
+    } else {
+      toast(`cancel requested for task ${shortId(taskId)}`, "ok");
+    }
+  } catch (e) {
+    toast(e.message, "err");
+  }
+  await tasksLoad(true);
+}
+
+function openTasks() {
+  store.view = "tasks";
+  renderMain();
+}
+
 function init() {
   loadConn();
   $("inp-url").value = (store.conn && store.conn.baseUrl) || "http://127.0.0.1:8100";
@@ -1766,6 +2073,16 @@ function init() {
     const ev = r && r.events.find((x) => x && x.seq === seq);
     if (ev && ev.id) recSelect(ev.id, true);
     else toast(`seq ${seq} is not in the loaded timeline`, "warn");
+  });
+
+  // Durable tasks: open the tenant-wide queue view, filter, refresh, and
+  // one delegated click handler for the detail card's cancel button.
+  $("btn-tasks-open").onclick = openTasks;
+  $("btn-tasks-refresh").onclick = () => tasksLoad(false);
+  $("sel-task-status").onchange = () => tasksLoad(false);
+  $("tasks-detail").addEventListener("click", (e) => {
+    const target = e.target.closest("[data-cancel-id]");
+    if (target && !target.disabled) taskCancel(target.getAttribute("data-cancel-id"));
   });
 
   if (store.conn) {

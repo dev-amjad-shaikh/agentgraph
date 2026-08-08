@@ -2,9 +2,11 @@
 
 Everything here is built on ``urllib.request``, ``json``, and
 ``urllib.error`` — no ``requests``, no ``httpx``, no ``sseclient``.
-The module has three public names:
+The module has four public names:
 
 - :class:`RustyClient` — the API client.
+- :class:`TasksClient` — the control-plane face of the R0.6 durable
+  task queue, reached as ``client.tasks``.
 - :class:`RustyError` — raised for any non-2xx response or
   transport failure; carries ``status`` and ``body``.
 - :class:`SSEEvent` — one parsed Server-Sent-Events frame
@@ -21,7 +23,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, Generator, Iterable, List, Optional
 
-__all__ = ["RustyClient", "RustyError", "SSEEvent"]
+__all__ = ["RustyClient", "TasksClient", "RustyError", "SSEEvent"]
 
 
 class RustyError(Exception):
@@ -95,6 +97,18 @@ class RustyClient:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
+        self._tasks: Optional[TasksClient] = None
+
+    @property
+    def tasks(self) -> "TasksClient":
+        """The durable task queue's control plane (R0.6).
+
+        Returns a cached :class:`TasksClient` bound to this client's
+        transport — same base URL, API key, and timeout.
+        """
+        if self._tasks is None:
+            self._tasks = TasksClient(self)
+        return self._tasks
 
     # ------------------------------------------------------------------
     # Low-level transport
@@ -649,6 +663,215 @@ class RustyClient:
         """List a namespace's items, sorted by key (``GET /store/{ns}``;
         empty array for an unwritten namespace)."""
         return self._request("GET", f"/store/{_q(namespace)}")
+
+
+# The lifecycle values `GET /tasks?status=…` accepts. `dead` is the DLQ
+# listing. Mirrored from the server's TaskStatus::parse so a typo fails
+# client-side with a clear error instead of a round trip answered 400.
+_TASK_STATUSES = frozenset(
+    {"queued", "leased", "failed", "completed", "dead", "cancelled"}
+)
+
+
+class TasksClient:
+    """Control-plane client for the R0.6 durable task queue.
+
+    Obtained as ``client.tasks``; shares the parent client's transport
+    (base URL, API key, timeout). Covers the submit/observe/cancel
+    operations a controlling application needs:
+
+    - :meth:`enqueue` / :meth:`enqueue_outbox` — submit work.
+    - :meth:`get` / :meth:`list` — observe records (``list`` with
+      ``status="dead"`` is the dead-letter queue).
+    - :meth:`cancel` / :meth:`cancel_run_tasks` — cancellation.
+
+    Why ``claim`` / ``heartbeat`` / ``complete`` / ``fail`` are
+    deliberately absent: those four endpoints are the queue's
+    *worker-machine* half — lease-guarded by ``worker_id``, they exist
+    so a worker process can hold, renew, and settle exactly one lease
+    at a time. A control-plane caller that claimed a lease would either
+    sit on it (starving real workers until the visibility timeout
+    reclaims the task) or race a real worker's settlement and answer
+    409s. That surface belongs to the worker SDK (``rusty-worker``'s
+    ``ActivityWorker``); this client never holds leases.
+    """
+
+    def __init__(self, client: RustyClient) -> None:
+        self._client = client
+
+    @staticmethod
+    def _enqueue_body(
+        kind: str,
+        payload: Any,
+        pool: Optional[str],
+        max_attempts: Optional[int],
+        idempotency_key: Optional[str],
+        effect: Optional[str],
+        run_id: Optional[str],
+        thread_id: Optional[str],
+        deadline: Optional[str],
+    ) -> Dict[str, Any]:
+        body: Dict[str, Any] = {"kind": kind, "payload": payload}
+        if pool is not None:
+            body["pool"] = pool
+        if max_attempts is not None:
+            body["max_attempts"] = max_attempts
+        if idempotency_key is not None:
+            body["idempotency_key"] = idempotency_key
+        if effect is not None:
+            body["effect"] = effect
+        if run_id is not None:
+            body["run_id"] = run_id
+        if thread_id is not None:
+            body["thread_id"] = thread_id
+        if deadline is not None:
+            body["deadline"] = deadline
+        return body
+
+    def enqueue(
+        self,
+        kind: str,
+        payload: Any,
+        *,
+        pool: Optional[str] = None,
+        max_attempts: Optional[int] = None,
+        idempotency_key: Optional[str] = None,
+        effect: Optional[str] = None,
+        run_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        deadline: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Enqueue a durable task (``POST /tasks``).
+
+        Args:
+            kind: Work classification the worker fleet dispatches on
+                (free-form label, e.g. ``"send_email"``).
+            payload: Work payload — any JSON-serializable value, stored
+                verbatim.
+            pool: Named pool (default ``"default"``); workers claim
+                from named pools.
+            max_attempts: Attempt ceiling before dead-lettering
+                (server default 3, max 100).
+            idempotency_key: Dedup key, unique per tenant across live
+                tasks. Re-enqueueing with the same key returns the
+                existing task instead of creating a duplicate — check
+                ``deduplicated`` in the response.
+            effect: Declared effect classification (``"pure"``,
+                ``"read_only"``, ``"idempotent"``, ``"compensatable"``,
+                ``"non_idempotent"``). A declared non-repeatable effect
+                is never silently retried; when absent, the worker's
+                per-attempt ``retryable`` flag decides.
+            run_id: Run this task belongs to. ``cancel_run_tasks`` (and
+                ``POST /runs/{run_id}/cancel``) cancels every
+                non-terminal task carrying it.
+            thread_id: Thread linkage (companion to ``run_id``).
+            deadline: Whole-task deadline as an RFC 3339 timestamp,
+                across attempts. Past it the task is finalized as
+                cancelled instead of being leased again.
+
+        Returns:
+            ``{"task_id": ..., "deduplicated": bool}`` — ``True`` when
+            the idempotency key already named a live task (HTTP 200)
+            rather than a fresh one being created (HTTP 201). The
+            status code is intentionally folded into the boolean: the
+            two cases differ in meaning, not in shape.
+        """
+        body = self._enqueue_body(
+            kind, payload, pool, max_attempts, idempotency_key,
+            effect, run_id, thread_id, deadline,
+        )
+        return self._client._request("POST", "/tasks", body)
+
+    def enqueue_outbox(
+        self,
+        kind: str,
+        payload: Any,
+        *,
+        pool: Optional[str] = None,
+        max_attempts: Optional[int] = None,
+        idempotency_key: Optional[str] = None,
+        effect: Optional[str] = None,
+        run_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        deadline: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Enqueue through the transactional outbox (``POST
+        /tasks/outbox`` -> 202 accepted).
+
+        Same arguments as :meth:`enqueue`. The task is written to the
+        outbox and becomes claimable only when the relay publishes it
+        into the queue (within one poll interval). Delivery is
+        at-least-once: the relay dedupes on the task's idempotency key,
+        so a crash anywhere in the pipe neither loses nor doubles the
+        task. Prefer this when the submission must commit atomically
+        with other state; prefer :meth:`enqueue` when the task should
+        be claimable immediately.
+        """
+        body = self._enqueue_body(
+            kind, payload, pool, max_attempts, idempotency_key,
+            effect, run_id, thread_id, deadline,
+        )
+        return self._client._request("POST", "/tasks/outbox", body)
+
+    def get(self, task_id: str) -> Dict[str, Any]:
+        """Fetch one task record (``GET /tasks/{id}``).
+
+        Unknown or cross-tenant ids raise :class:`RustyError` with
+        ``status == 404``.
+        """
+        return self._client._request("GET", f"/tasks/{_q(task_id)}")
+
+    def list(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        """List the tenant's tasks, oldest first (``GET /tasks``).
+
+        Args:
+            status: Optional lifecycle filter — one of ``"queued"``,
+                ``"leased"``, ``"failed"``, ``"completed"``, ``"dead"``,
+                ``"cancelled"``. ``"dead"`` is the dead-letter queue.
+                Validated client-side (``ValueError``) because an
+                unknown filter could never match a task.
+        """
+        if status is not None and status not in _TASK_STATUSES:
+            raise ValueError(
+                f"unknown task status {status!r} "
+                f"(expected {'|'.join(sorted(_TASK_STATUSES))})"
+            )
+        path = "/tasks"
+        if status is not None:
+            path += "?" + urllib.parse.urlencode({"status": status})
+        return self._client._request("GET", path)
+
+    def cancel(self, task_id: str) -> Dict[str, Any]:
+        """Cancel a non-terminal task (``POST /tasks/{id}/cancel``).
+
+        Queued and retry-scheduled tasks move to the terminal
+        ``cancelled`` state immediately; a leased task keeps its lease
+        with ``cancel_requested`` set, so its holder learns on the next
+        heartbeat and reports the attempt as cancelled. Cancellation is
+        a hint for promptness — lease expiry stays the correctness
+        mechanism: a holder that never asks is finalized as cancelled
+        once its lease lapses.
+
+        Returns the updated task record. Raises :class:`RustyError`
+        with ``status == 409`` when the task is already terminal and
+        ``status == 404`` for unknown or cross-tenant ids.
+        """
+        return self._client._request("POST", f"/tasks/{_q(task_id)}/cancel")
+
+    def cancel_run_tasks(self, run_id: str) -> Dict[str, Any]:
+        """Cancel every non-terminal task belonging to a run
+        (``POST /runs/{run_id}/cancel``).
+
+        Returns ``{"run_id": ..., "cancelled": [...], "signalled":
+        [...]}`` — task ids that moved to the terminal ``cancelled``
+        state immediately (queued, or failed with a retry scheduled)
+        versus leased task ids whose holders were signalled via
+        ``cancel_requested``. Note the scope: this waves the queue half
+        of run cancellation; a task enqueued *after* the call is not
+        retroactively cancelled. Unknown or cross-tenant runs raise
+        :class:`RustyError` with ``status == 404``.
+        """
+        return self._client._request("POST", f"/runs/{_q(run_id)}/cancel")
 
 
 # ----------------------------------------------------------------------

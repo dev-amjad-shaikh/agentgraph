@@ -3,7 +3,8 @@
 A stdlib-only (``urllib.request`` + ``json``) HTTP/SSE client for the
 ``rusty-server`` HTTP API: threads, runs (background / blocking /
 SSE-streaming), checkpoint history, time travel (fork + replay),
-assistants, crons, and the cross-thread KV store.
+assistants, crons, the cross-thread KV store, and the R0.6 durable
+task queue's control plane (``client.tasks``).
 
 Quickstart::
 
@@ -19,7 +20,7 @@ Quickstart::
 No third-party packages are required — Python 3.8+ is enough.
 """
 
-from .client import RustyClient, RustyError, SSEEvent
+from .client import RustyClient, RustyError, SSEEvent, TasksClient
 
-__all__ = ["RustyClient", "RustyError", "SSEEvent"]
+__all__ = ["RustyClient", "TasksClient", "RustyError", "SSEEvent"]
 __version__ = "0.1.0"
