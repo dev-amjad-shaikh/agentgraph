@@ -157,6 +157,18 @@ pub(crate) struct TaskRecord {
     /// object of its own making — the server stores the value verbatim.
     pub payload: Value,
     pub pool: String,
+    /// Recipient addressing (R0.7 Agent Fabric wave 1): the queue recipient
+    /// this task is addressed to, today always a mailbox address of the
+    /// form `agent:{agent_id}` (see
+    /// [`rusty_agent_runtime::agents::AGENT_RECIPIENT_PREFIX`]). `None` (the
+    /// default) is ordinary pool work, claimable through `POST
+    /// /tasks/claim`. A recipient-addressed task is mailbox traffic: the
+    /// pool claim path never hands it out, and it is drained one message at
+    /// a time through the turn-serialized agent claim
+    /// ([`ServerStore::claim_agent_task`](crate::server_store::ServerStore::claim_agent_task)).
+    /// Additive — records written before R0.7 deserialize with `None`.
+    #[serde(default)]
+    pub recipient: Option<String>,
     pub status: TaskStatus,
     /// 1-based number of the current/last attempt (0 = never claimed).
     pub attempt: u32,
@@ -241,6 +253,8 @@ pub(crate) struct NewTask {
     pub kind: String,
     pub payload: Value,
     pub pool: String,
+    /// Recipient addressing (R0.7 wave 1); see [`TaskRecord::recipient`].
+    pub recipient: Option<String>,
     pub max_attempts: u32,
     pub idempotency_key: Option<String>,
     pub effect: Option<Effect>,
@@ -271,6 +285,7 @@ impl TaskRecord {
             kind,
             payload,
             pool,
+            recipient,
             max_attempts,
             idempotency_key,
             effect,
@@ -285,6 +300,7 @@ impl TaskRecord {
             kind,
             payload,
             pool,
+            recipient,
             status: TaskStatus::Queued,
             attempt: 0,
             max_attempts,
@@ -500,6 +516,7 @@ impl TaskRecord {
             "kind": self.kind,
             "payload": self.payload,
             "pool": self.pool,
+            "recipient": self.recipient,
             "status": self.status.as_str(),
             "attempt": self.attempt,
             "max_attempts": self.max_attempts,
@@ -828,6 +845,7 @@ mod tests {
                 kind: "send_email".to_string(),
                 payload: json!({"to": "a@b.c"}),
                 pool: DEFAULT_POOL.to_string(),
+                recipient: None,
                 max_attempts: DEFAULT_MAX_ATTEMPTS,
                 idempotency_key: None,
                 effect: None,
@@ -1235,6 +1253,15 @@ mod tests {
         assert_eq!(wire["deadline"], Value::Null);
         assert_eq!(wire["worker_version"], Value::Null);
         assert_eq!(wire["next_attempt_at"], Value::Null);
+        assert_eq!(wire["recipient"], Value::Null);
+    }
+
+    #[test]
+    fn wire_carries_the_recipient_when_addressed() {
+        let mut task = record();
+        task.recipient = Some("agent:researcher-7".to_string());
+        let wire = task.wire();
+        assert_eq!(wire["recipient"], json!("agent:researcher-7"));
     }
 
     #[test]
@@ -1274,6 +1301,10 @@ mod tests {
         assert!(
             back.worker_version.is_none(),
             "wave-3 pin defaults to unpinned"
+        );
+        assert!(
+            back.recipient.is_none(),
+            "R0.7 recipient addressing defaults to ordinary pool work"
         );
     }
 

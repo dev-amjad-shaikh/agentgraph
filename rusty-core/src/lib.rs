@@ -41,6 +41,14 @@
 //!   serde-versioned [`durable::TaskEnvelope`]. Queue, leases, and workers
 //!   live in `rusty-server` / `rusty-worker`; these are the pure contracts
 //!   both sides agree on.
+//! - **Agent fabric** ([`agents`], R0.7 wave 1): the durable-agent
+//!   contracts — stable [`agents::AgentId`] identity with its
+//!   `agent:{id}` mailbox/thread addressing grammar, the versioned
+//!   [`agents::CapabilityManifest`] (accepted message kinds, declared
+//!   [`agents::StateScope`]s, budget ceiling), and the agent
+//!   [`record::RunEventKind`] variants (`AgentSpawn`, `MailboxSend`, …).
+//!   The registry, activation leases, and turn-serialized mailbox live in
+//!   `rusty-server`; these are the pure contracts both sides agree on.
 //! - **Effect kernel v2** ([`effects`], R0.7): the R0.5 [`record::Effect`]
 //!   taxonomy moved into the type system — marker traits declare an effect's
 //!   safety class at compile time, deterministic [`effects::EffectId`]s let
@@ -78,6 +86,7 @@
 //! # }
 //! ```
 
+pub mod agents;
 pub mod checkpoint;
 #[cfg(feature = "postgres")]
 pub mod checkpoint_postgres;
@@ -101,6 +110,10 @@ pub mod wasm_node;
 
 /// Convenience re-exports of the main public API.
 pub mod prelude {
+    pub use crate::agents::{
+        agent_id_from_recipient, AgentBudget, AgentId, CapabilityManifest, StateScope,
+        AGENT_RECIPIENT_PREFIX,
+    };
     pub use crate::checkpoint::{
         Checkpoint, Checkpointer, InMemoryCheckpointer, JsonFileCheckpointer,
     };

@@ -47,6 +47,26 @@
 //!   idempotency key, so a redelivered attempt is a no-op at the effect and
 //!   the ledger is inspectable evidence of exactly how many times the
 //!   effect fired.
+//! - `RUSTY_DEMO_AGENT_ID` — when set, the worker runs as an **agent host**
+//!   (R0.7 Agent Fabric, wave 1) instead of a pool worker: it claims the
+//!   named agent's single activation lease (retrying while a dead
+//!   predecessor's lease is still live — expiry makes it stealable), then
+//!   drains the agent's mailbox one turn at a time through
+//!   `POST /agents/{id}/mailbox/next`, heartbeating both the activation
+//!   and the turn's task lease for the turn's duration. The turn settles
+//!   through the ordinary `/tasks/{id}/complete|fail` protocol. Register
+//!   the agent and send it a message first:
+//!
+//!   ```sh
+//!   curl -X POST localhost:8100/agents -H 'content-type: application/json' -d '{
+//!     "agent_id": "receipt-agent",
+//!     "manifest": {"agent_kind": "demo", "manifest_version": "demo/1.0.0",
+//!                  "accepts": {"send_receipt": {"kind": "application/json"}}}}'
+//!   curl -X POST localhost:8100/agents/receipt-agent/mailbox \
+//!     -H 'content-type: application/json' \
+//!     -d '{"kind": "send_receipt", "payload": {"to": "a@b.c"}}'
+//!   RUSTY_DEMO_AGENT_ID=receipt-agent cargo run --example activity_worker_demo
+//!   ```
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -139,28 +159,27 @@ impl FileProvider {
         file.sync_all()
             .expect("the effect must be durable at the provider before we report it");
     }
-}
 
-#[async_trait]
-impl Activity for FileProvider {
-    async fn run(&self, ctx: ActivityContext) -> Result<Value> {
-        Ok(self.run_with_receipt(ctx).await?.result)
-    }
-
-    async fn run_with_receipt(&self, ctx: ActivityContext) -> Result<ActivityCompletion> {
+    /// The effect logic, factored off [`ActivityContext`] so the agent-host
+    /// half of the demo (which claims through the mailbox, not the
+    /// `ActivityWorker`) runs the identical code path.
+    async fn execute(
+        &self,
+        task_id: &str,
+        attempt: u32,
+        idempotency_key: Option<&str>,
+        payload: &Value,
+    ) -> ActivityCompletion {
         // The correlation handle the whole effectively-once contract hangs
         // on: enqueue-time idempotency key, falling back to the task id.
-        let key = ctx
-            .idempotency_key()
-            .unwrap_or_else(|| ctx.task_id())
-            .to_owned();
-        let to = ctx.payload()["to"].as_str().unwrap_or("unknown").to_owned();
+        let key = idempotency_key.unwrap_or(task_id).to_owned();
+        let to = payload["to"].as_str().unwrap_or("unknown").to_owned();
 
         let make_receipt = |provider_id: String| EffectReceipt {
             provider: "file-provider".to_string(),
             provider_id,
             idempotency_key: key.clone(),
-            task_id: Some(ctx.task_id().to_owned()),
+            task_id: Some(task_id.to_owned()),
             effect_id: None,
         };
 
@@ -169,11 +188,11 @@ impl Activity for FileProvider {
         // is the branch the crash-recovery proof's second attempt must take.
         if let Some(record) = self.find(&key) {
             let provider_id = record["provider_id"].as_str().unwrap_or("").to_owned();
-            return Ok(ActivityCompletion {
+            return ActivityCompletion {
                 result: json!({"sent": true, "to": to, "provider_id": provider_id,
                                "deduplicated": true}),
                 receipt: Some(make_receipt(provider_id)),
-            });
+            };
         }
 
         // Perform the effect, then pause: the window in which the proof
@@ -183,22 +202,248 @@ impl Activity for FileProvider {
         self.fire(&json!({
             "idempotency_key": key,
             "provider_id": provider_id,
-            "task_id": ctx.task_id(),
-            "attempt": ctx.attempt(),
+            "task_id": task_id,
+            "attempt": attempt,
             "to": to,
         }));
         tokio::time::sleep(self.pause).await;
-        Ok(ActivityCompletion {
+        ActivityCompletion {
             result: json!({"sent": true, "to": to, "provider_id": provider_id,
                            "deduplicated": false}),
             receipt: Some(make_receipt(provider_id)),
-        })
+        }
+    }
+}
+
+#[async_trait]
+impl Activity for FileProvider {
+    async fn run(&self, ctx: ActivityContext) -> Result<Value> {
+        Ok(self.run_with_receipt(ctx).await?.result)
+    }
+
+    async fn run_with_receipt(&self, ctx: ActivityContext) -> Result<ActivityCompletion> {
+        Ok(self
+            .execute(
+                ctx.task_id(),
+                ctx.attempt(),
+                ctx.idempotency_key(),
+                ctx.payload(),
+            )
+            .await)
     }
 }
 
 /// Read an env-var test hook, falling back to `default` when unset.
 fn env_or(var: &str, default: &str) -> String {
     std::env::var(var).unwrap_or_else(|_| default.to_string())
+}
+
+/// Claim the agent's activation lease, retrying while it is unavailable:
+/// `409` means another (possibly dead) host's lease is still live —
+/// expiry makes it stealable, so the retry IS the wait — and `404` means
+/// the agent is not registered yet (the demo boots before the operator's
+/// `POST /agents`). Returns the granted fencing ordinal.
+async fn activate_loop(
+    client: &reqwest::Client,
+    server_url: &str,
+    agent_id: &str,
+    worker_id: &str,
+    lease_ms: u64,
+    drain: &CancellationToken,
+) -> u64 {
+    loop {
+        if drain.is_cancelled() {
+            return 0;
+        }
+        let response = client
+            .post(format!("{server_url}/agents/{agent_id}/activate"))
+            .json(&json!({"worker_id": worker_id, "lease_ms": lease_ms}))
+            .send()
+            .await;
+        match response {
+            Ok(r) if r.status() == reqwest::StatusCode::OK => {
+                let body: Value = r.json().await.unwrap_or(Value::Null);
+                let fencing = body["fencing"].as_u64().unwrap_or(0);
+                println!("agent host: activation claimed (fencing {fencing})");
+                return fencing;
+            }
+            Ok(r) => {
+                println!(
+                    "agent host: activation unavailable ({}); retrying",
+                    r.status()
+                );
+            }
+            Err(e) => println!("agent host: activate failed ({e}); retrying"),
+        }
+        tokio::select! {
+            _ = drain.cancelled() => return 0,
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {},
+        }
+    }
+}
+
+/// The agent-host main loop (R0.7 wave 1): hold the agent's single
+/// activation lease, drain its mailbox one turn at a time, settle each
+/// turn through the ordinary task protocol. One message at a time is
+/// server-enforced; this loop is the host-side half of the contract.
+async fn run_agent_host(
+    server_url: &str,
+    worker_id: &str,
+    agent_id: &str,
+    lease_ms: u64,
+    provider: Option<FileProvider>,
+    pause: Duration,
+    drain: CancellationToken,
+) {
+    let client = reqwest::Client::new();
+    // Same renewal cadence the pool worker uses: three heartbeats per
+    // lease period absorb a lost request without losing the lease.
+    let heartbeat_every = (Duration::from_millis(lease_ms) / 3).max(Duration::from_millis(50));
+    let mut fencing =
+        activate_loop(&client, server_url, agent_id, worker_id, lease_ms, &drain).await;
+
+    while !drain.is_cancelled() {
+        let response = client
+            .post(format!("{server_url}/agents/{agent_id}/mailbox/next"))
+            .json(&json!({"worker_id": worker_id, "fencing": fencing, "lease_ms": lease_ms}))
+            .send()
+            .await;
+        let task = match response {
+            Ok(r) if r.status() == reqwest::StatusCode::OK => {
+                r.json::<Value>().await.unwrap_or(Value::Null)["task"].clone()
+            }
+            // Empty mailbox, or a turn already in flight (server-enforced
+            // one-at-a-time): poll again shortly.
+            Ok(r) if r.status() == reqwest::StatusCode::NO_CONTENT => {
+                tokio::select! {
+                    _ = drain.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(200)) => {},
+                }
+                continue;
+            }
+            // Activation lost (stolen after an expiry, or the process was
+            // partitioned past its lease): re-activate before claiming.
+            Ok(r) if r.status() == reqwest::StatusCode::CONFLICT => {
+                println!("agent host: activation lost; re-activating");
+                fencing =
+                    activate_loop(&client, server_url, agent_id, worker_id, lease_ms, &drain).await;
+                continue;
+            }
+            Ok(r) => {
+                println!("agent host: mailbox/next answered {}; retrying", r.status());
+                tokio::select! {
+                    _ = drain.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {},
+                }
+                continue;
+            }
+            Err(e) => {
+                println!("agent host: mailbox/next failed ({e}); retrying");
+                tokio::select! {
+                    _ = drain.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {},
+                }
+                continue;
+            }
+        };
+
+        let task_id = task["task_id"].as_str().unwrap_or_default().to_string();
+        let attempt = task["attempt"].as_u64().unwrap_or(1) as u32;
+        println!("agent host: turn started for task {task_id} (attempt {attempt})");
+
+        // Heartbeat BOTH leases for the turn's duration: the task lease
+        // keeps the turn claimed, the activation lease keeps the turn
+        // gate closed — a long turn must hold both, or another host could
+        // activate and find the mailbox open under it.
+        let heartbeats = CancellationToken::new();
+        let heartbeat_task = {
+            let client = client.clone();
+            let server_url = server_url.to_string();
+            let agent_id = agent_id.to_string();
+            let worker_id = worker_id.to_string();
+            let task_id = task_id.clone();
+            let heartbeats = heartbeats.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = heartbeats.cancelled() => break,
+                        _ = tokio::time::sleep(heartbeat_every) => {
+                            let _ = client
+                                .post(format!("{server_url}/tasks/{task_id}/heartbeat"))
+                                .json(&json!({"worker_id": worker_id, "lease_ms": lease_ms}))
+                                .send()
+                                .await;
+                            let _ = client
+                                .post(format!(
+                                    "{server_url}/agents/{agent_id}/activate/heartbeat"
+                                ))
+                                .json(&json!({"worker_id": worker_id, "fencing": fencing,
+                                              "lease_ms": lease_ms}))
+                                .send()
+                                .await;
+                        }
+                    }
+                }
+            })
+        };
+
+        // The activity itself — the identical code path the pool worker
+        // would run, provider-backed or the plain stand-in.
+        let outcome = match &provider {
+            Some(file_provider) => {
+                file_provider
+                    .execute(
+                        &task_id,
+                        attempt,
+                        task["idempotency_key"].as_str(),
+                        &task["payload"],
+                    )
+                    .await
+            }
+            None => {
+                let to = task["payload"]["to"].as_str().unwrap_or("unknown");
+                tokio::time::sleep(pause).await;
+                ActivityCompletion {
+                    result: json!({"sent": true, "to": to}),
+                    receipt: None,
+                }
+            }
+        };
+        heartbeats.cancel();
+        let _ = heartbeat_task.await;
+
+        // Settle through the ordinary task protocol. A 409 here means the
+        // lease was lost mid-turn — abandon without settling; the server
+        // re-leases the message at expiry and the next attempt dedupes at
+        // the provider.
+        let mut body = json!({"worker_id": worker_id, "result": outcome.result});
+        if let Some(receipt) = &outcome.receipt {
+            body["receipt"] = serde_json::to_value(receipt).unwrap_or(Value::Null);
+        }
+        let settled = client
+            .post(format!("{server_url}/tasks/{task_id}/complete"))
+            .json(&body)
+            .send()
+            .await;
+        match settled {
+            Ok(r) if r.status() == reqwest::StatusCode::OK => {
+                println!("agent host: turn completed for task {task_id}");
+            }
+            Ok(r) => println!(
+                "agent host: settle answered {} for task {task_id} — abandoned unsettled",
+                r.status()
+            ),
+            Err(e) => println!("agent host: settle failed for task {task_id} ({e})"),
+        }
+    }
+
+    // Draining: release the activation so a replacement host activates
+    // promptly instead of waiting out the expiry.
+    let _ = client
+        .post(format!("{server_url}/agents/{agent_id}/activate/release"))
+        .json(&json!({"worker_id": worker_id, "fencing": fencing}))
+        .send()
+        .await;
 }
 
 #[tokio::main]
@@ -221,6 +466,35 @@ async fn main() {
     let provider_file = std::env::var("RUSTY_DEMO_PROVIDER_FILE")
         .ok()
         .map(PathBuf::from);
+    let agent_id = std::env::var("RUSTY_DEMO_AGENT_ID").ok();
+
+    let drain = CancellationToken::new();
+    tokio::spawn(watch_signals(drain.clone()));
+
+    // Agent-host mode (R0.7 wave 1): claim the agent's activation and
+    // drain its mailbox one turn at a time, instead of pool claiming.
+    if let Some(agent_id) = agent_id {
+        let provider = provider_file.map(|ledger| FileProvider {
+            ledger,
+            pause: Duration::from_millis(pause_ms),
+        });
+        println!("rusty agent-host demo (against {server_url}, agent `{agent_id}`)");
+        println!("  activate + drain the mailbox one turn at a time;");
+        println!("  drain: Ctrl-C or `kill <pid>` — claiming stops, the in-flight");
+        println!("         turn settles, the activation is released");
+        run_agent_host(
+            &server_url,
+            &worker_id,
+            &agent_id,
+            lease_ms,
+            provider,
+            Duration::from_millis(pause_ms),
+            drain,
+        )
+        .await;
+        println!("drained: activation released; exiting");
+        return;
+    }
 
     let worker = ActivityWorker::new(&server_url);
     // The provider-backed activity replaces the plain stand-in when the test
@@ -257,8 +531,6 @@ async fn main() {
     println!("  drain:   Ctrl-C or `kill <pid>` — claiming stops, the in-flight");
     println!("           activity settles within the grace, then the worker exits");
 
-    let drain = CancellationToken::new();
-    tokio::spawn(watch_signals(drain.clone()));
     worker.run(drain).await;
     println!("drained: in-flight work settled or released; exiting");
 }

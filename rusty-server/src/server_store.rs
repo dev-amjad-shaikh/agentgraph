@@ -30,6 +30,10 @@ use rusty_agent_runtime::record::EffectReceipt;
 use serde_json::Value;
 use tokio::sync::Mutex;
 
+use crate::agents::{
+    self, ActivationLease, ActivationMutation, ActivationOutcome, AgentRecord, MailboxClaim,
+    MailboxClaimScope,
+};
 use crate::assistants::{self, AssistantRecord};
 use crate::crons::{self, CronRecord};
 use crate::journals;
@@ -256,6 +260,104 @@ pub(crate) trait ServerStore: Send + Sync {
         checkpoint: &Checkpoint,
         tasks: &[TaskRecord],
     ) -> StoreResult<()>;
+
+    // -- Agent registry (R0.7 Agent Fabric, wave 1) --------------------- //
+
+    /// Insert a new agent registration; `false` (no write) when the id
+    /// exists. Agent ids are tenant-scoped in the id itself (the
+    /// assistants/crons convention), so there is no separate tenant
+    /// argument.
+    async fn create_agent(&self, record: &AgentRecord) -> StoreResult<bool>;
+    /// Fetch one agent by its tenant-scoped id.
+    async fn get_agent(&self, agent_id: &str) -> StoreResult<Option<AgentRecord>>;
+    /// All registered agents (order unspecified; routes sort and filter by
+    /// tenant).
+    async fn list_agents(&self) -> StoreResult<Vec<AgentRecord>>;
+
+    // -- Activation leases (R0.7 wave 1) -------------------------------- //
+    //
+    // The single-activation mechanism behind turn-serialized mailbox
+    // draining — see `crate::agents` for the model. Every operation is
+    // keyed by the tenant-scoped agent id.
+
+    /// Claim the agent's activation lease for `owner`: a fresh claim when
+    /// no lease exists or the current one has expired (a steal — the dead
+    /// host's replacement), bumping the fencing ordinal; [`ActivationOutcome::Held`]
+    /// when a live lease belongs to another owner (route answers 409 with
+    /// the current record).
+    ///
+    /// On Postgres the claim is one atomic transaction (the existing
+    /// lease row is locked `FOR UPDATE` before the steal decision), so
+    /// two racing claimants can never both win — the activation-lease
+    /// equivalent of `FOR UPDATE SKIP LOCKED`. On the JSON-file backend the
+    /// one index lock gives the same exactness in-process; the documented
+    /// one-writer-process precondition covers the rest (design open
+    /// question 1's chosen default).
+    async fn claim_activation(
+        &self,
+        agent_id: &str,
+        owner: &str,
+        lease_ms: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<ActivationOutcome>;
+    /// Renew the activation lease held by `owner` under `fencing`
+    /// (heartbeat). The owner + fencing + liveness check is atomic with the
+    /// renewal: a stale holder can never resurrect its activation.
+    async fn renew_activation(
+        &self,
+        agent_id: &str,
+        owner: &str,
+        fencing: u64,
+        lease_ms: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<ActivationMutation>;
+    /// Release the activation lease held by `owner` under `fencing` (a
+    /// draining host letting another activate promptly instead of waiting
+    /// out the expiry). Same atomic owner + fencing guard as the renewal.
+    async fn release_activation(
+        &self,
+        agent_id: &str,
+        owner: &str,
+        fencing: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<ActivationMutation>;
+    /// Fetch the agent's current activation lease (live or expired), for
+    /// status reads; `None` when the agent has never been activated.
+    async fn get_activation(&self, agent_id: &str) -> StoreResult<Option<ActivationLease>>;
+
+    // -- Turn-serialized mailbox claim (R0.7 wave 1) -------------------- //
+
+    /// Claim the oldest claimable task addressed to `scope.recipient` (the
+    /// agent's mailbox) as one turn of work, leased to `scope.owner`.
+    ///
+    /// Two gates, both applied before a candidate is chosen:
+    ///
+    /// 1. **Activation.** The caller must hold the agent's live activation
+    ///    lease (`scope.owner` + `scope.fencing`); otherwise
+    ///    [`MailboxClaim::ActivationLost`] — the host must (re-)activate.
+    /// 2. **Turn serialization.** A live-leased message already in flight
+    ///    for this recipient makes the whole mailbox answer
+    ///    [`MailboxClaim::Empty`]: one message at a time per agent is
+    ///    server-enforced, not host discipline. On Postgres the claim
+    ///    transaction locks the activation-lease row (`FOR UPDATE`), so
+    ///    concurrent claims by one holder serialize on it and the gate is
+    ///    exact; on the file backend the index locks give the same
+    ///    exactness in-process.
+    ///
+    /// The claim runs the same cancellation/deadline finalization sweep as
+    /// [`ServerStore::claim_task`], and the task lease it grants is the
+    /// ordinary one — the turn settles through the unchanged
+    /// `/tasks/{id}/heartbeat|complete|fail` protocol. Pool capacity and
+    /// worker-version pins do not apply here: pools are deployment-level
+    /// worker groups, and the manifest pin (not the worker pin) is the
+    /// agent-level version story.
+    async fn claim_agent_task(
+        &self,
+        tenant: &str,
+        scope: &MailboxClaimScope<'_>,
+        lease_ms: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<MailboxClaim>;
 }
 
 // --------------------------------------------------------------------- //
@@ -277,6 +379,8 @@ pub(crate) struct JsonFileStore {
     kv_lock: Mutex<()>,
     tasks: Mutex<HashMap<String, TaskRecord>>,
     outbox: Mutex<HashMap<String, OutboxRecord>>,
+    agents: Mutex<HashMap<String, AgentRecord>>,
+    agent_leases: Mutex<HashMap<String, ActivationLease>>,
 }
 
 impl JsonFileStore {
@@ -290,6 +394,8 @@ impl JsonFileStore {
             kv_lock: Mutex::new(()),
             tasks: Mutex::new(tasks::load(root)),
             outbox: Mutex::new(outbox::load(root)),
+            agents: Mutex::new(agents::load(root)),
+            agent_leases: Mutex::new(agents::load_leases(root)),
         }
     }
 }
@@ -531,25 +637,7 @@ impl ServerStore for JsonFileStore {
         now: chrono::DateTime<chrono::Utc>,
     ) -> StoreResult<Option<TaskRecord>> {
         let mut map = self.tasks.lock().await;
-        // Finalize before handing out work: a cancel request the lease
-        // holder never acknowledged, or a whole-task deadline that has
-        // passed, turns the task terminal-cancelled — never re-leased.
-        let due: Vec<String> = map
-            .values()
-            .filter(|t| t.tenant == tenant && t.cancellation_due(now))
-            .map(|t| t.task_id.clone())
-            .collect();
-        for task_id in due {
-            let mut task = map
-                .get(&task_id)
-                .cloned()
-                .expect("finalization candidate came from the task index");
-            task.apply_cancellation(now);
-            tasks::persist(&self.root, &task)
-                .await
-                .map_err(io_err("persist task"))?;
-            map.insert(task_id, task);
-        }
+        self.finalize_due_locked(&mut map, tenant, now).await?;
         // Pool capacity (wave 3): live — unexpired — leases per pool. An
         // expired lease holds no capacity: its task is visible again. A pool
         // at its configured limit is excluded from this claim, so one
@@ -571,11 +659,14 @@ impl ServerStore for JsonFileStore {
         };
         // The whole claim (pick + mutate + persist) runs under the one
         // index lock, so two concurrent claims can never take the same
-        // task — the file backend's SKIP LOCKED equivalent.
+        // task — the file backend's SKIP LOCKED equivalent. Mailbox traffic
+        // (`recipient` set, R0.7) is excluded: it drains only through the
+        // turn-serialized agent claim, never through a pool.
         let candidate = map
             .values()
             .filter(|t| {
                 t.tenant == tenant
+                    && t.recipient.is_none()
                     && scope.pools.iter().any(|p| p == &t.pool)
                     && t.claimable_at(now)
                     && !saturated(&t.pool)
@@ -810,6 +901,188 @@ impl ServerStore for JsonFileStore {
         stats.sort_by(|a, b| a.pool.cmp(&b.pool));
         Ok(stats)
     }
+
+    async fn create_agent(&self, record: &AgentRecord) -> StoreResult<bool> {
+        let mut map = self.agents.lock().await;
+        if map.contains_key(&record.agent_id) {
+            return Ok(false);
+        }
+        // Hold the lock across the file write so a concurrent create of the
+        // same id can't interleave (the assistants convention).
+        agents::persist(&self.root, record)
+            .await
+            .map_err(io_err("persist agent"))?;
+        map.insert(record.agent_id.clone(), record.clone());
+        Ok(true)
+    }
+
+    async fn get_agent(&self, agent_id: &str) -> StoreResult<Option<AgentRecord>> {
+        Ok(self.agents.lock().await.get(agent_id).cloned())
+    }
+
+    async fn list_agents(&self) -> StoreResult<Vec<AgentRecord>> {
+        Ok(self.agents.lock().await.values().cloned().collect())
+    }
+
+    async fn claim_activation(
+        &self,
+        agent_id: &str,
+        owner: &str,
+        lease_ms: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<ActivationOutcome> {
+        let mut map = self.agent_leases.lock().await;
+        // The whole claim (check + insert + persist) runs under the one
+        // index lock, so two racing claimants can never both win — the file
+        // backend's row-lock equivalent.
+        if let Some(current) = map.get(agent_id) {
+            if current.expires_at > now {
+                return Ok(ActivationOutcome::Held(Box::new(current.clone())));
+            }
+        }
+        let fencing = map.get(agent_id).map_or(1, |lease| lease.fencing + 1);
+        let lease = ActivationLease {
+            agent_id: agent_id.to_string(),
+            owner: owner.to_string(),
+            fencing,
+            expires_at: now + agents::lease_duration(lease_ms),
+            acquired_at: now,
+        };
+        agents::persist_lease(&self.root, &lease)
+            .await
+            .map_err(io_err("persist agent lease"))?;
+        map.insert(agent_id.to_string(), lease.clone());
+        Ok(ActivationOutcome::Claimed(Box::new(lease)))
+    }
+
+    async fn renew_activation(
+        &self,
+        agent_id: &str,
+        owner: &str,
+        fencing: u64,
+        lease_ms: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<ActivationMutation> {
+        let mut map = self.agent_leases.lock().await;
+        let Some(current) = map.get(agent_id) else {
+            return Ok(ActivationMutation::Unknown);
+        };
+        if !current.held_by(owner, fencing, now) {
+            return Ok(ActivationMutation::FencingLost);
+        }
+        let mut lease = current.clone();
+        lease.expires_at = now + agents::lease_duration(lease_ms);
+        agents::persist_lease(&self.root, &lease)
+            .await
+            .map_err(io_err("persist agent lease"))?;
+        map.insert(agent_id.to_string(), lease.clone());
+        Ok(ActivationMutation::Applied(Box::new(lease)))
+    }
+
+    async fn release_activation(
+        &self,
+        agent_id: &str,
+        owner: &str,
+        fencing: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<ActivationMutation> {
+        let mut map = self.agent_leases.lock().await;
+        let Some(current) = map.get(agent_id) else {
+            return Ok(ActivationMutation::Unknown);
+        };
+        // Release names the fencing ordinal the holder believes it holds;
+        // an expired lease is already stealable, so only a live holder
+        // match releases — anyone else gets FencingLost either way.
+        if !current.held_by(owner, fencing, now) {
+            return Ok(ActivationMutation::FencingLost);
+        }
+        let lease = current.clone();
+        // Remove from the index first, then the file: a failed file removal
+        // resurrects the lease at next boot, which is safe (it simply
+        // expires); an index entry without a file would lie to status reads
+        // until restart.
+        map.remove(agent_id);
+        agents::remove_lease(&self.root, agent_id)
+            .await
+            .map_err(io_err("remove agent lease"))?;
+        Ok(ActivationMutation::Applied(Box::new(lease)))
+    }
+
+    async fn get_activation(&self, agent_id: &str) -> StoreResult<Option<ActivationLease>> {
+        Ok(self.agent_leases.lock().await.get(agent_id).cloned())
+    }
+
+    async fn claim_agent_task(
+        &self,
+        tenant: &str,
+        scope: &MailboxClaimScope<'_>,
+        lease_ms: u64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<MailboxClaim> {
+        // Lock order is always leases-then-tasks, and both are held for the
+        // whole claim: the activation check, the turn gate, and the task
+        // claim must be one atomic observation (the file backend's
+        // transaction equivalent).
+        let leases = self.agent_leases.lock().await;
+        let mut map = self.tasks.lock().await;
+
+        // Gate 1 — activation: the caller must hold the agent's live lease.
+        let Some(lease) = leases.get(scope.agent_id) else {
+            return Ok(MailboxClaim::ActivationLost);
+        };
+        if !lease.held_by(scope.owner, scope.fencing, now) {
+            return Ok(MailboxClaim::ActivationLost);
+        }
+
+        // The same finalization sweep the pool claim runs: unanswered
+        // cancels and elapsed deadlines turn terminal-cancelled instead of
+        // being re-leased to a turn.
+        self.finalize_due_locked(&mut map, tenant, now).await?;
+
+        // Gate 2 — turn serialization: a live-leased message already in
+        // flight for this recipient makes the whole mailbox unclaimable.
+        // One message at a time per agent is server-enforced.
+        let turn_in_flight = map.values().any(|t| {
+            t.tenant == tenant
+                && t.recipient.as_deref() == Some(scope.recipient)
+                && t.status == TaskStatus::Leased
+                && t.lease.as_ref().is_some_and(|l| l.expires_at > now)
+        });
+        if turn_in_flight {
+            return Ok(MailboxClaim::Empty);
+        }
+
+        // The oldest claimable message for this mailbox — approximate FIFO
+        // on the happy path, per the design's honest ordering edge. Pool
+        // capacity and worker-version pins do not apply (see the trait
+        // contract).
+        let candidate = map
+            .values()
+            .filter(|t| {
+                t.tenant == tenant
+                    && t.recipient.as_deref() == Some(scope.recipient)
+                    && t.claimable_at(now)
+            })
+            .min_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| a.task_id.cmp(&b.task_id))
+            })
+            .map(|t| t.task_id.clone());
+        let Some(task_id) = candidate else {
+            return Ok(MailboxClaim::Empty);
+        };
+        let mut task = map
+            .get(&task_id)
+            .cloned()
+            .expect("claim candidate came from the task index");
+        task.claim(scope.owner, lease_ms, now);
+        tasks::persist(&self.root, &task)
+            .await
+            .map_err(io_err("persist task"))?;
+        map.insert(task_id, task.clone());
+        Ok(MailboxClaim::Claimed(Box::new(task)))
+    }
 }
 
 impl JsonFileStore {
@@ -836,6 +1109,36 @@ impl JsonFileStore {
             .map_err(io_err("persist task"))?;
         map.insert(record.task_id.clone(), record.clone());
         Ok((record.clone(), false))
+    }
+
+    /// The cancellation/deadline finalization sweep, shared by the pool
+    /// claim and the agent-mailbox claim (the caller holds the task index
+    /// lock). Finalize before handing out work: a cancel request the lease
+    /// holder never acknowledged, or a whole-task deadline that has passed,
+    /// turns the task terminal-cancelled — never re-leased.
+    async fn finalize_due_locked(
+        &self,
+        map: &mut HashMap<String, TaskRecord>,
+        tenant: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<()> {
+        let due: Vec<String> = map
+            .values()
+            .filter(|t| t.tenant == tenant && t.cancellation_due(now))
+            .map(|t| t.task_id.clone())
+            .collect();
+        for task_id in due {
+            let mut task = map
+                .get(&task_id)
+                .cloned()
+                .expect("finalization candidate came from the task index");
+            task.apply_cancellation(now);
+            tasks::persist(&self.root, &task)
+                .await
+                .map_err(io_err("persist task"))?;
+            map.insert(task_id, task);
+        }
+        Ok(())
     }
 
     /// Shared skeleton of the lease-guarded task mutations (heartbeat /
@@ -885,6 +1188,10 @@ mod postgres {
     use tokio::sync::OnceCell;
 
     use super::{ServerStore, StoreResult};
+    use crate::agents::{
+        self, ActivationLease, ActivationMutation, ActivationOutcome, AgentRecord, MailboxClaim,
+        MailboxClaimScope,
+    };
     use crate::assistants::AssistantRecord;
     use crate::crons::CronRecord;
     use crate::outbox::OutboxRecord;
@@ -970,6 +1277,7 @@ mod postgres {
             cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
             deadline         TIMESTAMPTZ,
             worker_version   TEXT,
+            recipient        TEXT,
             next_attempt_at  TIMESTAMPTZ,
             created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -1017,6 +1325,16 @@ mod postgres {
         ALTER TABLE server_tasks
             ADD COLUMN IF NOT EXISTS worker_version TEXT";
 
+    /// R0.7 wave-1 additive column for databases whose `server_tasks`
+    /// predates the agent fabric: the mailbox recipient (`agent:{id}`) the
+    /// task is addressed to (`NULL` = ordinary pool work). The agent claim
+    /// scans filter on `(tenant, recipient, status)` — covered by the
+    /// claimable index's leading columns closely enough at wave-1 scale;
+    /// a dedicated partial index can land with the scale wave.
+    pub(crate) const ALTER_TASKS_ADD_RECIPIENT_SQL: &str = "
+        ALTER TABLE server_tasks
+            ADD COLUMN IF NOT EXISTS recipient TEXT";
+
     /// `server_outbox`: the transactional outbox (R0.6 wave 2b). One row per
     /// pending task submission, 1:1 with the task it carries (`outbox_id` is
     /// the task id — re-writing the same row is a no-op). The task travels
@@ -1040,6 +1358,31 @@ mod postgres {
             ON server_outbox (created_at, outbox_id)
             WHERE published_at IS NULL";
 
+    /// `server_agents` (R0.7 Agent Fabric, wave 1): the agent registry.
+    /// Same shape discipline as `server_assistants` — the id is the primary
+    /// key (tenant-scoped inside the id itself) and the record travels as
+    /// one JSONB payload.
+    pub(crate) const CREATE_AGENTS_SQL: &str = "
+        CREATE TABLE IF NOT EXISTS server_agents (
+            agent_id   TEXT PRIMARY KEY,
+            payload    JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )";
+
+    /// `server_agent_leases` (R0.7 wave 1): one row per agent's activation
+    /// lease — the single-activation record. The fencing ordinal and lease
+    /// columns are real columns, not JSONB: the claim/renew/release
+    /// statements filter and compare on them directly, so the stale-holder
+    /// guard is enforced by the database, not by read-modify-write.
+    pub(crate) const CREATE_AGENT_LEASES_SQL: &str = "
+        CREATE TABLE IF NOT EXISTS server_agent_leases (
+            agent_id    TEXT PRIMARY KEY,
+            owner       TEXT NOT NULL,
+            fencing     BIGINT NOT NULL,
+            expires_at  TIMESTAMPTZ NOT NULL,
+            acquired_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )";
+
     /// All idempotent migration statements, executed in order on connect.
     pub(crate) const MIGRATION_SQL: &[&str] = &[
         CREATE_ASSISTANTS_SQL,
@@ -1054,8 +1397,11 @@ mod postgres {
         ALTER_TASKS_ADD_DEADLINE_SQL,
         ALTER_TASKS_ADD_RECEIPT_SQL,
         ALTER_TASKS_ADD_WORKER_VERSION_SQL,
+        ALTER_TASKS_ADD_RECIPIENT_SQL,
         CREATE_OUTBOX_SQL,
         CREATE_OUTBOX_PENDING_INDEX_SQL,
+        CREATE_AGENTS_SQL,
+        CREATE_AGENT_LEASES_SQL,
     ];
 
     /// Transaction-scoped advisory lock key serializing concurrent
@@ -1151,9 +1497,9 @@ mod postgres {
         INSERT INTO server_tasks (
             task_id, tenant, kind, payload, pool, status,
             attempt, max_attempts, error_class, effect, idempotency_key,
-            run_id, thread_id, deadline, worker_version, next_attempt_at, created_at, updated_at
+            run_id, thread_id, deadline, worker_version, recipient, next_attempt_at, created_at, updated_at
         ) VALUES (
-            $1, $2, $3, $4, $5, 'queued', 0, $6, NULL, $7, $8, $9, $10, $11, $12, NULL, $13, $13
+            $1, $2, $3, $4, $5, 'queued', 0, $6, NULL, $7, $8, $9, $10, $11, $12, $13, NULL, $14, $14
         )
         ON CONFLICT DO NOTHING
         RETURNING task_id";
@@ -1162,7 +1508,7 @@ mod postgres {
     pub(crate) const SELECT_TASK_BY_IDEMPOTENCY_SQL: &str = "
         SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, next_attempt_at, created_at, updated_at
+            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, recipient, next_attempt_at, created_at, updated_at
         FROM server_tasks
         WHERE tenant = $1 AND idempotency_key = $2";
 
@@ -1198,10 +1544,15 @@ mod postgres {
     /// unpinned tasks. This is the SQL spelling of
     /// [`crate::tasks::TaskRecord::matches_worker_version`]; the two must
     /// agree.
+    ///
+    /// R0.7: mailbox traffic (`recipient` set) is excluded — it drains only
+    /// through the turn-serialized agent claim
+    /// ([`AGENT_CLAIM_SELECT_SQL`]), never through a pool.
     pub(crate) const CLAIM_SELECT_SQL: &str = "
         SELECT task_id, attempt FROM server_tasks
         WHERE tenant = $1
           AND pool = ANY($2)
+          AND recipient IS NULL
           AND NOT (pool = ANY($4))
           AND (worker_version IS NULL OR worker_version = $5)
           AND (
@@ -1233,7 +1584,7 @@ mod postgres {
         WHERE task_id = $1
         RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, next_attempt_at, created_at, updated_at";
+            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, recipient, next_attempt_at, created_at, updated_at";
 
     /// Heartbeat: extends the lease only while the caller holds it. No row
     /// means unknown/cross-tenant (404) or lease lost (409), distinguished
@@ -1245,7 +1596,7 @@ mod postgres {
         WHERE task_id = $1 AND tenant = $2 AND lease_owner = $3 AND status = 'leased'
         RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, next_attempt_at, created_at, updated_at";
+            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, recipient, next_attempt_at, created_at, updated_at";
 
     /// Complete: settle only the caller's own lease, storing the result and
     /// the effect receipt the worker reported with it (`$6`, JSONB — `NULL`
@@ -1258,14 +1609,14 @@ mod postgres {
         WHERE task_id = $1 AND tenant = $2 AND lease_owner = $3 AND status = 'leased'
         RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, next_attempt_at, created_at, updated_at";
+            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, recipient, next_attempt_at, created_at, updated_at";
 
     /// Fail, step 1: lock the row (the requeue-vs-dead decision needs the
     /// current attempt count, and concurrent settlement must serialize).
     pub(crate) const FAIL_SELECT_SQL: &str = "
         SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, next_attempt_at, created_at, updated_at
+            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, recipient, next_attempt_at, created_at, updated_at
         FROM server_tasks
         WHERE task_id = $1 AND tenant = $2
         FOR UPDATE";
@@ -1280,14 +1631,14 @@ mod postgres {
         WHERE task_id = $1
         RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, next_attempt_at, created_at, updated_at";
+            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, recipient, next_attempt_at, created_at, updated_at";
 
     /// Cancel, step 1: lock the row (the terminal check and the transition
     /// must serialize against claims and settlements).
     pub(crate) const CANCEL_SELECT_SQL: &str = "
         SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, next_attempt_at, created_at, updated_at
+            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, recipient, next_attempt_at, created_at, updated_at
         FROM server_tasks
         WHERE task_id = $1 AND tenant = $2
         FOR UPDATE";
@@ -1304,7 +1655,7 @@ mod postgres {
         WHERE task_id = $1
         RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, next_attempt_at, created_at, updated_at";
+            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, recipient, next_attempt_at, created_at, updated_at";
 
     /// Run cancel, part 1: the run's non-leased, non-terminal tasks move to
     /// the terminal `cancelled` state immediately.
@@ -1316,7 +1667,7 @@ mod postgres {
           AND (status = 'queued' OR (status = 'failed' AND next_attempt_at IS NOT NULL))
         RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, next_attempt_at, created_at, updated_at";
+            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, recipient, next_attempt_at, created_at, updated_at";
 
     /// Run cancel, part 2: the run's leased tasks keep their leases and
     /// get `cancel_requested` set — their holders learn on the next
@@ -1327,7 +1678,7 @@ mod postgres {
         WHERE tenant = $1 AND run_id = $2 AND status = 'leased'
         RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, next_attempt_at, created_at, updated_at";
+            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, recipient, next_attempt_at, created_at, updated_at";
 
     /// Tenant-scoped existence probe distinguishing 404 from 409 after a
     /// lease-guarded update matched no row.
@@ -1337,20 +1688,20 @@ mod postgres {
     pub(crate) const SELECT_TASK_SQL: &str =
         "SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, next_attempt_at, created_at, updated_at
+            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, recipient, next_attempt_at, created_at, updated_at
         FROM server_tasks WHERE task_id = $1 AND tenant = $2";
 
     pub(crate) const LIST_TASKS_SQL: &str = "
         SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, next_attempt_at, created_at, updated_at
+            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, recipient, next_attempt_at, created_at, updated_at
         FROM server_tasks
         WHERE tenant = $1 ORDER BY created_at, task_id";
 
     pub(crate) const LIST_TASKS_BY_STATUS_SQL: &str = "
         SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, next_attempt_at, created_at, updated_at
+            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, recipient, next_attempt_at, created_at, updated_at
         FROM server_tasks
         WHERE tenant = $1 AND status = $2 ORDER BY created_at, task_id";
 
@@ -1438,6 +1789,101 @@ mod postgres {
         INSERT INTO rusty_checkpoints
             (thread_id, checkpoint_id, step, state, next_nodes, created_at, header, journal_ref)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)";
+
+    // -- Agent fabric statements (R0.7, wave 1) -------------------------- //
+
+    /// Insert-only agent create; returns no row on conflict → 409 (the
+    /// assistants convention).
+    pub(crate) const INSERT_AGENT_SQL: &str = "
+        INSERT INTO server_agents (agent_id, payload)
+        VALUES ($1, $2)
+        ON CONFLICT (agent_id) DO NOTHING
+        RETURNING agent_id";
+
+    pub(crate) const SELECT_AGENT_SQL: &str =
+        "SELECT payload FROM server_agents WHERE agent_id = $1";
+
+    pub(crate) const LIST_AGENTS_SQL: &str = "SELECT payload FROM server_agents";
+
+    /// The activation lease row, locked `FOR UPDATE`: the claim's
+    /// insert-or-steal decision and the mailbox claim's activation gate
+    /// both serialize on this lock inside their transactions, so two
+    /// racing claimants (or two concurrent turns by one holder) can never
+    /// both pass.
+    pub(crate) const SELECT_ACTIVATION_FOR_UPDATE_SQL: &str = "
+        SELECT agent_id, owner, fencing, expires_at, acquired_at
+        FROM server_agent_leases
+        WHERE agent_id = $1
+        FOR UPDATE";
+
+    pub(crate) const SELECT_ACTIVATION_SQL: &str = "
+        SELECT agent_id, owner, fencing, expires_at, acquired_at
+        FROM server_agent_leases
+        WHERE agent_id = $1";
+
+    /// The activation claim's insert half (no existing row): fencing
+    /// starts at 1.
+    pub(crate) const INSERT_ACTIVATION_SQL: &str = "
+        INSERT INTO server_agent_leases (agent_id, owner, fencing, expires_at, acquired_at)
+        VALUES ($1, $2, 1, $3, $4)
+        RETURNING agent_id, owner, fencing, expires_at, acquired_at";
+
+    /// The activation claim's steal half, applied to the row locked by
+    /// [`SELECT_ACTIVATION_FOR_UPDATE_SQL`]: the expired holder's fencing
+    /// ordinal is bumped, so the dead host's stale pair can never pass a
+    /// guard again.
+    pub(crate) const STEAL_ACTIVATION_SQL: &str = "
+        UPDATE server_agent_leases
+        SET owner = $2, fencing = fencing + 1, expires_at = $3, acquired_at = $4
+        WHERE agent_id = $1
+        RETURNING agent_id, owner, fencing, expires_at, acquired_at";
+
+    /// Activation heartbeat: extends the lease only while the exact
+    /// owner + fencing pair holds it live. No row means unknown (404) or
+    /// fencing lost (409), distinguished by [`SELECT_ACTIVATION_SQL`].
+    pub(crate) const RENEW_ACTIVATION_SQL: &str = "
+        UPDATE server_agent_leases
+        SET expires_at = $4
+        WHERE agent_id = $1 AND owner = $2 AND fencing = $3 AND expires_at > $5
+        RETURNING agent_id, owner, fencing, expires_at, acquired_at";
+
+    /// Activation release: same owner + fencing + liveness guard as the
+    /// renewal — an expired lease is already stealable, so only a live
+    /// holder match releases.
+    pub(crate) const RELEASE_ACTIVATION_SQL: &str = "
+        DELETE FROM server_agent_leases
+        WHERE agent_id = $1 AND owner = $2 AND fencing = $3 AND expires_at > $4
+        RETURNING agent_id, owner, fencing, expires_at, acquired_at";
+
+    /// Turn-serialization gate, run inside the mailbox-claim transaction
+    /// after the activation-lease row is locked: a live-leased message
+    /// already in flight for this recipient makes the whole mailbox
+    /// answer empty. One message at a time per agent is server-enforced.
+    pub(crate) const AGENT_TURN_IN_FLIGHT_SQL: &str = "
+        SELECT 1 AS busy FROM server_tasks
+        WHERE tenant = $1 AND recipient = $2
+          AND status = 'leased' AND lease_expires_at > $3
+        LIMIT 1";
+
+    /// Mailbox candidate selection: the oldest claimable message
+    /// addressed to this recipient. Same claimability rule as
+    /// [`CLAIM_SELECT_SQL`] minus the pool predicates — pool capacity and
+    /// worker-version pins do not apply to agent claims (see the trait
+    /// contract). `FOR UPDATE SKIP LOCKED` pairs with the activation-row
+    /// lock: the lease lock serializes one holder's concurrent claims,
+    /// SKIP LOCKED keeps a racing *steal* from double-claiming.
+    pub(crate) const AGENT_CLAIM_SELECT_SQL: &str = "
+        SELECT task_id, attempt FROM server_tasks
+        WHERE tenant = $1
+          AND recipient = $2
+          AND (
+              (status IN ('queued', 'failed')
+                  AND (next_attempt_at IS NULL OR next_attempt_at <= $3))
+              OR (status = 'leased' AND lease_expires_at <= $3)
+          )
+        ORDER BY created_at, task_id
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED";
 
     // -- Row <-> record mapping (unit-tested without a database) -------- //
 
@@ -1530,6 +1976,7 @@ mod postgres {
             cancel_requested: row.get("cancel_requested"),
             deadline: row.get("deadline"),
             worker_version: row.get("worker_version"),
+            recipient: row.get("recipient"),
             next_attempt_at: row.get("next_attempt_at"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
@@ -1538,6 +1985,12 @@ mod postgres {
 
     fn db_err(context: &str) -> impl Fn(sqlx::Error) -> String + '_ {
         move |e| format!("{context}: {e}")
+    }
+
+    /// `23505` — a primary-key/unique-index violation. The activation
+    /// claim's fresh-insert half uses it to recognize a lost create race.
+    fn is_unique_violation(e: &sqlx::Error) -> bool {
+        matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505"))
     }
 
     /// [`INSERT_TASK_SQL`] with a record bound to it, shared by direct
@@ -1560,6 +2013,7 @@ mod postgres {
             .bind(&record.thread_id)
             .bind(record.deadline)
             .bind(&record.worker_version)
+            .bind(&record.recipient)
             .bind(record.created_at)
     }
 
@@ -1574,6 +2028,27 @@ mod postgres {
             published_at: row.get("published_at"),
             created_at: row.get("created_at"),
         })
+    }
+
+    /// Assemble an [`ActivationLease`] from one `server_agent_leases` row.
+    /// The fencing ordinal is a `BIGINT`; a negative value is corruption
+    /// (a store error, not a panic — [`task_from_row`]'s discipline).
+    fn activation_from_row(row: &sqlx::postgres::PgRow) -> StoreResult<ActivationLease> {
+        let fencing = u64::try_from(row.get::<i64, _>("fencing"))
+            .map_err(|_| "corrupt activation fencing (negative)".to_string())?;
+        Ok(ActivationLease {
+            agent_id: row.get("agent_id"),
+            owner: row.get("owner"),
+            fencing,
+            expires_at: row.get("expires_at"),
+            acquired_at: row.get("acquired_at"),
+        })
+    }
+
+    /// `u64` fencing ordinals bind as `BIGINT`; a fencing beyond `i64::MAX`
+    /// is a store error, never a wraparound.
+    fn fencing_i64(fencing: u64) -> StoreResult<i64> {
+        i64::try_from(fencing).map_err(|_| "fencing ordinal exceeds BIGINT".to_string())
     }
 
     /// Postgres-backed store: assistants / crons / KV in `server_*` tables.
@@ -2383,6 +2858,251 @@ mod postgres {
                 .map_err(db_err("checkpoint and enqueue"))?;
             Ok(())
         }
+
+        async fn create_agent(&self, record: &AgentRecord) -> StoreResult<bool> {
+            let payload = record_to_payload(record)?;
+            let row = sqlx::query(INSERT_AGENT_SQL)
+                .bind(&record.agent_id)
+                .bind(payload)
+                .fetch_optional(self.pool().await?)
+                .await
+                .map_err(db_err("insert agent"))?;
+            Ok(row.is_some())
+        }
+
+        async fn get_agent(&self, agent_id: &str) -> StoreResult<Option<AgentRecord>> {
+            let row = sqlx::query(SELECT_AGENT_SQL)
+                .bind(agent_id)
+                .fetch_optional(self.pool().await?)
+                .await
+                .map_err(db_err("select agent"))?;
+            row.map(|r| record_from_payload("agent", r.get::<Value, _>("payload")))
+                .transpose()
+        }
+
+        async fn list_agents(&self) -> StoreResult<Vec<AgentRecord>> {
+            let rows = sqlx::query(LIST_AGENTS_SQL)
+                .fetch_all(self.pool().await?)
+                .await
+                .map_err(db_err("list agents"))?;
+            rows.into_iter()
+                .map(|r| record_from_payload("agent", r.get::<Value, _>("payload")))
+                .collect()
+        }
+
+        async fn claim_activation(
+            &self,
+            agent_id: &str,
+            owner: &str,
+            lease_ms: u64,
+            now: DateTime<Utc>,
+        ) -> StoreResult<ActivationOutcome> {
+            let pool = self.pool().await?;
+            let expires_at = now + agents::lease_duration(lease_ms);
+            // The claim is one atomic transaction: the existing lease row
+            // (if any) is locked FOR UPDATE before the steal decision, so
+            // two racing claimants can never both win — the
+            // activation-lease equivalent of `FOR UPDATE SKIP LOCKED`.
+            //
+            // The fresh-insert half needs a retry: when the row does not
+            // exist yet, EVERY racer's locked select sees no row, so all
+            // of them insert and all but one violate the primary key (a
+            // failed statement aborts the transaction, so the loser cannot
+            // re-read inside it). The loser rolls back, re-reads the now
+            // visible winner's row, and answers Held. Bounded: a row that
+            // keeps vanishing (a release racing the claims) retries.
+            for _ in 0..3 {
+                let mut tx = pool.begin().await.map_err(db_err("claim activation"))?;
+                let current = sqlx::query(SELECT_ACTIVATION_FOR_UPDATE_SQL)
+                    .bind(agent_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db_err("claim activation"))?;
+                if let Some(row) = &current {
+                    let lease = activation_from_row(row)?;
+                    // A live lease holds, whoever the claimant is — even
+                    // the owner itself (it should heartbeat, not
+                    // re-activate).
+                    if lease.expires_at > now {
+                        tx.rollback().await.map_err(db_err("claim activation"))?;
+                        return Ok(ActivationOutcome::Held(Box::new(lease)));
+                    }
+                }
+                let claimed = match &current {
+                    Some(_) => {
+                        sqlx::query(STEAL_ACTIVATION_SQL)
+                            .bind(agent_id)
+                            .bind(owner)
+                            .bind(expires_at)
+                            .bind(now)
+                            .fetch_one(&mut *tx)
+                            .await
+                    }
+                    None => {
+                        sqlx::query(INSERT_ACTIVATION_SQL)
+                            .bind(agent_id)
+                            .bind(owner)
+                            .bind(expires_at)
+                            .bind(now)
+                            .fetch_one(&mut *tx)
+                            .await
+                    }
+                };
+                let claimed = match claimed {
+                    Ok(row) => row,
+                    Err(e) if is_unique_violation(&e) => {
+                        tx.rollback().await.map_err(db_err("claim activation"))?;
+                        match self.get_activation(agent_id).await? {
+                            Some(lease) => {
+                                return Ok(ActivationOutcome::Held(Box::new(lease)));
+                            }
+                            // The winner released before the re-read —
+                            // the race is over; try the claim again.
+                            None => continue,
+                        }
+                    }
+                    Err(e) => return Err(db_err("claim activation")(e)),
+                };
+                let lease = activation_from_row(&claimed)?;
+                tx.commit().await.map_err(db_err("claim activation"))?;
+                return Ok(ActivationOutcome::Claimed(Box::new(lease)));
+            }
+            Err("claim activation: create race did not settle in 3 attempts".to_string())
+        }
+
+        async fn renew_activation(
+            &self,
+            agent_id: &str,
+            owner: &str,
+            fencing: u64,
+            lease_ms: u64,
+            now: DateTime<Utc>,
+        ) -> StoreResult<ActivationMutation> {
+            let expires_at = now + agents::lease_duration(lease_ms);
+            let updated = sqlx::query(RENEW_ACTIVATION_SQL)
+                .bind(agent_id)
+                .bind(owner)
+                .bind(fencing_i64(fencing)?)
+                .bind(expires_at)
+                .bind(now)
+                .fetch_optional(self.pool().await?)
+                .await
+                .map_err(db_err("renew activation"))?;
+            self.activation_outcome(agent_id, updated).await
+        }
+
+        async fn release_activation(
+            &self,
+            agent_id: &str,
+            owner: &str,
+            fencing: u64,
+            now: DateTime<Utc>,
+        ) -> StoreResult<ActivationMutation> {
+            let updated = sqlx::query(RELEASE_ACTIVATION_SQL)
+                .bind(agent_id)
+                .bind(owner)
+                .bind(fencing_i64(fencing)?)
+                .bind(now)
+                .fetch_optional(self.pool().await?)
+                .await
+                .map_err(db_err("release activation"))?;
+            self.activation_outcome(agent_id, updated).await
+        }
+
+        async fn get_activation(&self, agent_id: &str) -> StoreResult<Option<ActivationLease>> {
+            let row = sqlx::query(SELECT_ACTIVATION_SQL)
+                .bind(agent_id)
+                .fetch_optional(self.pool().await?)
+                .await
+                .map_err(db_err("select activation"))?;
+            row.as_ref().map(activation_from_row).transpose()
+        }
+
+        async fn claim_agent_task(
+            &self,
+            tenant: &str,
+            scope: &MailboxClaimScope<'_>,
+            lease_ms: u64,
+            now: DateTime<Utc>,
+        ) -> StoreResult<MailboxClaim> {
+            let pool = self.pool().await?;
+            let mut tx = pool.begin().await.map_err(db_err("claim agent task"))?;
+
+            // Gate 1 — activation: the caller must hold the agent's live
+            // lease. The row is locked FOR UPDATE for the rest of the
+            // transaction, which does double duty: concurrent claims by
+            // the one holder serialize on it, so the turn gate below is
+            // exact rather than best-effort.
+            let lease = sqlx::query(SELECT_ACTIVATION_FOR_UPDATE_SQL)
+                .bind(scope.agent_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err("claim agent task activation"))?;
+            let Some(lease) = lease else {
+                tx.rollback().await.map_err(db_err("claim agent task"))?;
+                return Ok(MailboxClaim::ActivationLost);
+            };
+            if !activation_from_row(&lease)?.held_by(scope.owner, scope.fencing, now) {
+                tx.rollback().await.map_err(db_err("claim agent task"))?;
+                return Ok(MailboxClaim::ActivationLost);
+            }
+
+            // The same finalization sweep the pool claim runs: unanswered
+            // cancels and elapsed deadlines turn terminal-cancelled
+            // instead of being re-leased to a turn.
+            sqlx::query(CLAIM_FINALIZE_SQL)
+                .bind(tenant)
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err("claim agent task finalization"))?;
+
+            // Gate 2 — turn serialization: a live-leased message already
+            // in flight for this recipient makes the whole mailbox
+            // unclaimable. One message at a time per agent is
+            // server-enforced, not host discipline.
+            let busy = sqlx::query(AGENT_TURN_IN_FLIGHT_SQL)
+                .bind(tenant)
+                .bind(scope.recipient)
+                .bind(now)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err("claim agent task turn gate"))?;
+            if busy.is_some() {
+                tx.rollback().await.map_err(db_err("claim agent task"))?;
+                return Ok(MailboxClaim::Empty);
+            }
+
+            // The oldest claimable message for this mailbox — approximate
+            // FIFO on the happy path, per the design's honest ordering
+            // edge.
+            let candidate = sqlx::query(AGENT_CLAIM_SELECT_SQL)
+                .bind(tenant)
+                .bind(scope.recipient)
+                .bind(now)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err("claim agent task"))?;
+            let Some(candidate) = candidate else {
+                tx.rollback().await.map_err(db_err("claim agent task"))?;
+                return Ok(MailboxClaim::Empty);
+            };
+            // The granted task lease is the ordinary one — the turn
+            // settles through the unchanged heartbeat/complete/fail
+            // protocol.
+            let expires_at = now + agents::lease_duration(lease_ms);
+            let updated = sqlx::query(CLAIM_UPDATE_SQL)
+                .bind(candidate.get::<String, _>("task_id"))
+                .bind(scope.owner)
+                .bind(expires_at)
+                .bind(candidate.get::<i32, _>("attempt") + 1)
+                .bind(now)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db_err("claim agent task"))?;
+            tx.commit().await.map_err(db_err("claim agent task"))?;
+            Ok(MailboxClaim::Claimed(Box::new(task_from_row(&updated)?)))
+        }
     }
 
     impl PostgresStore {
@@ -2409,6 +3129,34 @@ mod postgres {
                 MutationOutcome::LeaseLost
             } else {
                 MutationOutcome::Unknown
+            })
+        }
+
+        /// Map a guarded activation mutation's outcome (the renew and
+        /// release statements share their guard shape): the returned row
+        /// means applied; no row means either no lease exists at all
+        /// (unknown → 404) or the owner + fencing + liveness check failed
+        /// (fencing lost → 409) — the existence probe decides. Same
+        /// discipline as [`PostgresStore::lease_outcome`].
+        async fn activation_outcome(
+            &self,
+            agent_id: &str,
+            updated: Option<sqlx::postgres::PgRow>,
+        ) -> StoreResult<ActivationMutation> {
+            if let Some(row) = updated {
+                return Ok(ActivationMutation::Applied(Box::new(activation_from_row(
+                    &row,
+                )?)));
+            }
+            let exists = sqlx::query(SELECT_ACTIVATION_SQL)
+                .bind(agent_id)
+                .fetch_optional(self.pool().await?)
+                .await
+                .map_err(db_err("activation existence probe"))?;
+            Ok(if exists.is_some() {
+                ActivationMutation::FencingLost
+            } else {
+                ActivationMutation::Unknown
             })
         }
     }
@@ -2500,7 +3248,7 @@ mod postgres {
 
         #[test]
         fn migration_sql_creates_all_tables_idempotently() {
-            assert_eq!(MIGRATION_SQL.len(), 14);
+            assert_eq!(MIGRATION_SQL.len(), 17);
             for stmt in MIGRATION_SQL {
                 assert!(
                     stmt.contains("IF NOT EXISTS"),
@@ -2537,6 +3285,15 @@ mod postgres {
             assert!(CREATE_OUTBOX_SQL.contains("published_at TIMESTAMPTZ"));
             assert!(CREATE_OUTBOX_PENDING_INDEX_SQL.contains("CREATE INDEX"));
             assert!(CREATE_OUTBOX_PENDING_INDEX_SQL.contains("WHERE published_at IS NULL"));
+            // R0.7 wave 1: the recipient column arrives additively, and the
+            // agent registry + activation leases get their own tables.
+            assert!(ALTER_TASKS_ADD_RECIPIENT_SQL.contains("ALTER TABLE server_tasks"));
+            assert!(ALTER_TASKS_ADD_RECIPIENT_SQL.contains("recipient TEXT"));
+            assert!(CREATE_AGENTS_SQL.contains("server_agents"));
+            assert!(CREATE_AGENTS_SQL.contains("JSONB"));
+            assert!(CREATE_AGENT_LEASES_SQL.contains("server_agent_leases"));
+            assert!(CREATE_AGENT_LEASES_SQL.contains("fencing"));
+            assert!(CREATE_AGENT_LEASES_SQL.contains("expires_at"));
         }
 
         #[test]
@@ -2556,6 +3313,7 @@ mod postgres {
                 "deadline",
                 "receipt",
                 "worker_version",
+                "recipient",
             ] {
                 assert!(CREATE_TASKS_SQL.contains(col), "missing column {col}");
             }
@@ -2579,6 +3337,8 @@ mod postgres {
             // `TaskRecord::matches_worker_version`.
             assert!(CLAIM_SELECT_SQL.contains("NOT (pool = ANY($4))"));
             assert!(CLAIM_SELECT_SQL.contains("worker_version IS NULL OR worker_version = $5"));
+            // R0.7: pool claims never hand out mailbox traffic.
+            assert!(CLAIM_SELECT_SQL.contains("recipient IS NULL"));
             assert!(CLAIM_INFLIGHT_SQL.contains("status = 'leased'"));
             assert!(CLAIM_INFLIGHT_SQL.contains("lease_expires_at > $2"));
             assert!(CLAIM_UPDATE_SQL.contains("status = 'leased'"));
@@ -2652,6 +3412,29 @@ mod postgres {
             assert!(POOL_STATS_SQL.contains("status = 'leased' AND lease_expires_at > $2"));
             assert!(POOL_STATS_SQL.contains("status = 'leased' AND lease_expires_at <= $2"));
             assert!(POOL_STATS_SQL.contains("GROUP BY pool"));
+        }
+
+        #[test]
+        fn agent_fabric_sql_locks_the_lease_row_and_guards_fencing() {
+            // The claim's steal decision and the mailbox claim's
+            // activation gate both serialize on the lease row's FOR UPDATE.
+            assert!(SELECT_ACTIVATION_FOR_UPDATE_SQL.contains("FOR UPDATE"));
+            // The steal bumps the fencing ordinal, so a dead host's stale
+            // owner + fencing pair can never pass a guard again.
+            assert!(STEAL_ACTIVATION_SQL.contains("fencing = fencing + 1"));
+            // Renew and release hold only for the exact live holder.
+            for sql in [RENEW_ACTIVATION_SQL, RELEASE_ACTIVATION_SQL] {
+                assert!(sql.contains("agent_id = $1 AND owner = $2 AND fencing = $3"));
+                assert!(sql.contains("expires_at > $"));
+            }
+            // Turn serialization is server-enforced: a live-leased message
+            // in flight for the recipient makes the mailbox unclaimable,
+            // and the candidate select excludes nothing else.
+            assert!(AGENT_TURN_IN_FLIGHT_SQL.contains("recipient = $2"));
+            assert!(AGENT_TURN_IN_FLIGHT_SQL.contains("lease_expires_at > $3"));
+            assert!(AGENT_CLAIM_SELECT_SQL.contains("recipient = $2"));
+            assert!(AGENT_CLAIM_SELECT_SQL.contains("FOR UPDATE SKIP LOCKED"));
+            assert!(!AGENT_CLAIM_SELECT_SQL.contains("pool"));
         }
 
         #[test]
@@ -2803,6 +3586,7 @@ mod postgres {
                     kind: "charge".to_string(),
                     payload: json!({"cents": 500}),
                     pool: format!("live-{}", uniq()),
+                    recipient: None,
                     max_attempts: 3,
                     idempotency_key,
                     effect: None,

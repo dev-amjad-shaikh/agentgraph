@@ -194,6 +194,7 @@ mod tests {
                 kind: "send_email".to_string(),
                 payload: serde_json::json!({"to": "a@b.c"}),
                 pool: DEFAULT_POOL.to_string(),
+                recipient: None,
                 max_attempts: DEFAULT_MAX_ATTEMPTS,
                 idempotency_key: None,
                 effect: None,

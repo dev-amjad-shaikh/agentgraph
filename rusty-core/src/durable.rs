@@ -214,9 +214,10 @@ pub fn classify_retry(
 ///
 /// v1 carries a kind identifier and an optional size bound only — enough
 /// for the recipient to know it is producing the right *shape* of artifact
-/// and for the queue to refuse to store an out-of-contract result. Full
-/// schema validation of artifact payloads is an R0.7 concern (typed
-/// task/artifact contracts land with the agent fabric).
+/// and for the queue to refuse to store an out-of-contract result. R0.7
+/// (Agent Fabric wave 1) adds the optional `schema` field — additive with a
+/// serde default, omitted from the wire when unset, so pre-R0.7 contracts
+/// and readers see no shape change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactContract {
     /// Artifact kind identifier — a media type (`application/json`), a
@@ -228,6 +229,20 @@ pub struct ArtifactContract {
     /// unbounded within the queue's own storage limits.
     #[serde(default)]
     pub max_bytes: Option<u64>,
+
+    /// Optional JSON Schema (draft 2020-12, per the design's open-questions
+    /// default) the artifact payload must validate against (R0.7). Declared
+    /// on the contract so an unacceptable message can fail fast as
+    /// [`ErrorClass::InvalidInput`] at submission — never retried — instead
+    /// of dead-lettering after the attempt budget is spent. `None` means
+    /// kind-and-size checking only, exactly the pre-R0.7 semantics.
+    ///
+    /// Wave 1 pins the field's *shape* (stored and golden-tested); payload
+    /// validation against it is wired at the mailbox submission path in a
+    /// later wave — the schema dialect constraint (design open question 5)
+    /// settles first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<serde_json::Value>,
 }
 
 /// The budget a task may consume across all of its attempts.
@@ -514,6 +529,7 @@ mod tests {
         envelope.output_contract = Some(ArtifactContract {
             kind: "application/json".into(),
             max_bytes: Some(65_536),
+            schema: None,
         });
         envelope.deadline = DateTime::<Utc>::from_timestamp_millis(1_760_000_000_000);
         envelope.budget = Some(TaskBudget {

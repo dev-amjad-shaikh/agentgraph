@@ -59,6 +59,14 @@
 //! | `POST /tasks/{id}/fail` | R0.6: record a failed attempt `{worker_id, error_class, message, retryable}` → `{requeued, next_attempt_at, dead}` (backoff + jitter requeue, or dead-letter); `409` when the lease is lost |
 //! | `GET /tasks/{id}` | R0.6: the task record (404 unknown/cross-tenant) |
 //! | `GET /tasks?status=…` | R0.6: the tenant's tasks, oldest first; `status=dead` is the DLQ listing |
+//! | `POST /agents` | R0.7 Agent Fabric (wave 1): register an agent `{agent_id, manifest, metadata?}` — the manifest is a core `CapabilityManifest` (`agent_kind`, `manifest_version`, `accepts`, …) → `201`; `409` when the id is taken |
+//! | `GET /agents` / `GET /agents/{id}` | R0.7: list the tenant's agents / fetch one registration (404 unknown/cross-tenant) |
+//! | `POST /agents/{id}/mailbox` | R0.7: send a message into the agent's mailbox `{kind, payload, idempotency_key?, …}` → `201 {task_id, deduplicated}` (`200` when the key already names a live message); `400` when the manifest's `accepts` does not declare the kind; same quota gate as `POST /tasks` |
+//! | `GET /agents/{id}/status` | R0.7: the agent's activation lease plus mailbox gauges (`queued` / `in_flight` / `dead` message counts) |
+//! | `POST /agents/{id}/activate` | R0.7: claim the agent's single activation lease `{worker_id, lease_ms}` → `200 {owner, fencing, lease_expires_at}`; `409` + the current lease when another host holds it live (expired leases are stolen, fencing bumped) |
+//! | `POST /agents/{id}/activate/heartbeat` | R0.7: renew the held activation `{worker_id, fencing, lease_ms}`; `409` on fencing loss |
+//! | `POST /agents/{id}/activate/release` | R0.7: drop the held activation `{worker_id, fencing}` so a draining host's replacement activates promptly; `409` on fencing loss |
+//! | `POST /agents/{id}/mailbox/next` | R0.7: claim the oldest queued mailbox message as one turn `{worker_id, fencing, lease_ms}` → `200 {task}` leased to the worker, `204` when empty or a turn is already in flight (one message at a time per agent is server-enforced), `409` when the activation lease is not held. The turn settles through the ordinary `/tasks/{id}/heartbeat|complete|fail` protocol |
 //!
 //! Runs support `command.resume` (HITL), `config.recursion_limit`, the
 //! `reject` / `enqueue` multitask strategies (one active run per thread),
@@ -66,6 +74,7 @@
 //! `config.recursion_limit` as a default), and `checkpoint.checkpoint_id`
 //! (time-travel replay from that checkpoint instead of the latest).
 
+mod agents;
 mod assistants;
 mod auth;
 mod crons;
@@ -107,14 +116,16 @@ pub use runs::RunStatus;
 pub const DEFAULT_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(25);
 
 /// Names the JSON-file layout already owns at the store root
-/// (`assistants/`, `crons/`, `journals/`, `outbox/`, `store/`, `tasks/`,
-/// `threads/`, plus the `latest` pointer file inside each thread's
-/// checkpoint dir).
+/// (`agent_leases/`, `agents/`, `assistants/`, `crons/`, `journals/`,
+/// `outbox/`, `store/`, `tasks/`, `threads/`, plus the `latest` pointer
+/// file inside each thread's checkpoint dir).
 /// Client-chosen ids and tenant ids claiming one of these would write
 /// checkpoints into platform directories (or platform records into
 /// checkpoint dirs), so both `validate_client_id` and
 /// [`ServerConfig::with_tenant_key`] reject them.
 pub(crate) const RESERVED_NAMES: &[&str] = &[
+    "agent_leases",
+    "agents",
     "assistants",
     "crons",
     "journals",

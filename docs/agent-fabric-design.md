@@ -512,6 +512,19 @@ agent registry, the activation lease, turn-serialized mailbox draining. Exit: an
 survives a server kill mid-turn and re-processes its mailbox message exactly once at the
 effect.
 
+> **Wave 1 status: implemented.** The core contracts and goldens landed as written
+> (`AgentId` / `agent:{id}` addressing, `CapabilityManifest`, `StateScope`, the inert
+> `RunEventKind` variants, `ArtifactContract.schema` pinned to JSON Schema draft 2020-12 —
+> field stored and golden-tested, payload validation deferred per open question 5). The
+> server surface is the `/agents` registry, mailbox send with manifest kind-membership
+> validation, the activation lease (claim / heartbeat / release, fencing ordinals), and
+> turn-serialized `mailbox/next` draining on both backends; pool claims never hand out
+> mailbox traffic (`recipient IS NULL`), and pool caps / worker-version pins deliberately do
+> not apply to agent claims. The exit criterion is automated as
+> `rusty-server/tests/agent_recovery.rs`: server and agent host SIGKILLed mid-turn,
+> mid-effect — the replacement host steals the expired activation (fencing bumped),
+> re-claims the turn, and the provider ledger holds exactly one effect invocation.
+
 **Wave 2 — supervision, deadlines, cancellation tree.** Restart policy with
 intensity/period, escalation-as-message, agent/team cancel endpoints composing
 `cancel_run_tasks` with `RunConfig::cancellation`, all journaled. Exit: a crash-looping agent
@@ -580,6 +593,9 @@ Flagged for the owner before wave 1 lands:
    documented one-writer-process precondition. Accept that (it is already the checkpoint
    rule), or add an in-process registry serializing activation claims? Leaning: document the
    precondition; ship the registry only if multi-process file-store deployments appear.
+   **Resolved for wave 1 as leaned:** the precondition is documented on the store contract;
+   in-process exactness comes from the one index lock, and Postgres enforces the same rule
+   with the lease row's `FOR UPDATE`.
 2. **Who supervises the root.** The design escalates the root supervisor's failures to the
    DLQ for an operator. Should there be a runtime-level root policy instead (bounded root
    restart with operator notification) — server config or a reserved system agent? Leaning:
@@ -594,4 +610,8 @@ Flagged for the owner before wave 1 lands:
    wave-4 benchmarks show the failure mode.
 5. **`ArtifactContract` schema dialect.** JSON Schema draft 2020-12 is the default assumption
    for the new validation field; if the SDKs need a lighter subset for codegen, that
-   constraint should arrive before the golden files pin the field's shape.
+   constraint should arrive before the golden files pin the field's shape. **Wave 1 shipped
+   the default:** the field's shape is pinned in the goldens as draft 2020-12; payload
+   validation against it is deliberately not wired yet (no validator dependency), so
+   tightening the dialect later only narrows what submissions declare, never what the wire
+   means.

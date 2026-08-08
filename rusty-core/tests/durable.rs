@@ -58,6 +58,7 @@ fn sample_task_envelope() -> TaskEnvelope {
     envelope.output_contract = Some(ArtifactContract {
         kind: "application/json".into(),
         max_bytes: Some(65_536),
+        schema: None,
     });
     envelope.deadline = DateTime::<Utc>::from_timestamp_millis(1_750_000_300_000);
     envelope.budget = Some(TaskBudget {

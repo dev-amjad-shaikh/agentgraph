@@ -344,6 +344,49 @@ pub enum RunEventKind {
     /// extended across the crash boundary between a run and its durable
     /// tasks.
     EffectReceipt,
+
+    /// An agent was spawned (R0.7 Agent Fabric): input carries the agent id,
+    /// its pinned [`crate::agents::CapabilityManifest`], and the declared
+    /// [`crate::agents::StateScope`]s — the manifest's scopes are journaled
+    /// with the spawn so later access checks replay against the same
+    /// declaration. Wave 1 lands the variant as an inert contract; the agent
+    /// host emits it.
+    AgentSpawn,
+
+    /// An agent terminated (R0.7): output carries the terminal disposition
+    /// (completed, failed, cancelled) and the final checkpoint reference.
+    /// Inert in wave 1 — emitted by the agent host.
+    AgentExit,
+
+    /// A mailbox message was submitted to an agent's mailbox (R0.7): output
+    /// carries the recipient (`agent:{agent_id}`), the message kind, and the
+    /// task id the queue assigned. The sender-side half of the mailbox
+    /// journal pair; the envelope's `parent` links it into the team's causal
+    /// tree. Inert in wave 1 — emission lands with the agent host.
+    MailboxSend,
+
+    /// An agent's activation began a turn on a mailbox message (R0.7): input
+    /// carries the task id and idempotency key the turn is processing.
+    /// The recipient-side half of the mailbox pair. Inert in wave 1.
+    MailboxReceive,
+
+    /// A supervision decision was made (R0.7 wave 2): output carries the
+    /// policy (`permanent` / `transient` / `temporary`), the triggering
+    /// failure's [`EventStatus`] / error class, and the restart ordinal —
+    /// the journaled decision record that makes "no restart without a
+    /// journaled decision" auditable. Contract only in wave 1.
+    SupervisionEvent,
+
+    /// A coordination pattern (delegate / fan-out / race / quorum) began
+    /// (R0.7 wave 3): output carries the pattern's typed contract — members,
+    /// thresholds, effect declarations. The team's causal root for every
+    /// event the pattern spawns. Contract only in wave 1.
+    CoordinationStart,
+
+    /// A coordination pattern settled (R0.7 wave 3): output carries the
+    /// result reference and the per-member dispositions (completed, failed,
+    /// cancelled) — the fan-in evidence record. Contract only in wave 1.
+    CoordinationEnd,
 }
 
 /// One recorded fact about a run: the Flight Recorder's atomic evidence.

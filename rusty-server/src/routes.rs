@@ -13,6 +13,7 @@ use axum::routing::{delete, get, post, put};
 use axum::{middleware, Extension, Json, Router};
 use chrono::Utc;
 use futures::Stream;
+use rusty_agent_runtime::agents::{AgentId, CapabilityManifest};
 use rusty_agent_runtime::checkpoint::{
     Checkpoint, Checkpointer, InMemoryCheckpointer, JsonFileCheckpointer,
 };
@@ -24,6 +25,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
+use crate::agents::{
+    self, ActivationMutation, ActivationOutcome, AgentRecord, MailboxClaim, MailboxClaimScope,
+};
 use crate::assistants::AssistantRecord;
 use crate::auth::TenantContext;
 use crate::crons::{self, CronRecord, OnRunCompleted};
@@ -166,6 +170,20 @@ pub(crate) fn router_with_shutdown(
         .route("/tasks/{task_id}/complete", post(complete_task))
         .route("/tasks/{task_id}/fail", post(fail_task))
         .route("/tasks/{task_id}/cancel", post(cancel_task))
+        .route("/agents", post(create_agent).get(list_agents))
+        .route("/agents/{agent_id}", get(get_agent))
+        .route("/agents/{agent_id}/mailbox", post(send_agent_message))
+        .route("/agents/{agent_id}/mailbox/next", post(claim_agent_message))
+        .route("/agents/{agent_id}/status", get(get_agent_status))
+        .route("/agents/{agent_id}/activate", post(activate_agent))
+        .route(
+            "/agents/{agent_id}/activate/heartbeat",
+            post(heartbeat_activation),
+        )
+        .route(
+            "/agents/{agent_id}/activate/release",
+            post(release_activation),
+        )
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             crate::auth::require_api_key,
@@ -1767,6 +1785,15 @@ struct EnqueueTaskPayload {
     /// in-flight execution. Exact match only; absent = unpinned, any worker.
     #[serde(default)]
     worker_version: Option<String>,
+    /// Mailbox recipient (R0.7 Agent Fabric, wave 1): when set, the task is
+    /// a message addressed to one agent (`agent:{id}`) and drains only
+    /// through the turn-serialized `POST /agents/{id}/mailbox/next` claim —
+    /// pool claims never hand it out. Pool capacity and worker-version pins
+    /// do not apply to mailbox traffic. `POST /agents/{id}/mailbox` is the
+    /// manifest-validating front door; this field is the direct-queue
+    /// equivalent for embedders.
+    #[serde(default)]
+    recipient: Option<String>,
 }
 
 /// Validate an enqueue payload and build the fresh [`TaskRecord`] it
@@ -1820,6 +1847,9 @@ fn build_task_record(
     if let Some(version) = &payload.worker_version {
         tasks::validate_label("worker_version", version, 256).map_err(ApiError::bad_request)?;
     }
+    if let Some(recipient) = &payload.recipient {
+        agents::validate_recipient(recipient).map_err(ApiError::bad_request)?;
+    }
 
     Ok(TaskRecord::new(
         tasks::NewTask {
@@ -1835,6 +1865,7 @@ fn build_task_record(
             thread_id: payload.thread_id,
             deadline,
             worker_version: payload.worker_version,
+            recipient: payload.recipient,
         },
         Utc::now(),
     ))
@@ -2429,4 +2460,478 @@ async fn list_tasks(
         .map_err(internal_err)?;
     let wire: Vec<Value> = tasks.iter().map(TaskRecord::wire).collect();
     Ok(Json(json!(wire)))
+}
+
+// --------------------------------------------------------------------- //
+// Agent Fabric (R0.7, wave 1): registry, activation, mailboxes
+// --------------------------------------------------------------------- //
+//
+// The HTTP face of the agent fabric contracts landed in core (`rusty_agent_runtime::agents`).
+// Wave 1 is single-activation only: one active host per agent, turn-serialized
+// mailbox draining, no supervision tree and no coordination sessions yet
+// (those are waves 2+ — see `docs/agent-fabric-design.md`).
+
+#[derive(Debug, Deserialize)]
+struct CreateAgentPayload {
+    /// Client-chosen agent id (a UUID v4 is generated when omitted).
+    #[serde(default)]
+    agent_id: Option<String>,
+    /// The agent's capability manifest — core's `CapabilityManifest` shape
+    /// (`agent_kind`, `manifest_version`, `accepts`, optional `scopes` /
+    /// `budget`). Unknown fields are tolerated (the manifest is
+    /// forward-compatible across waves); missing required fields are a 400.
+    manifest: Value,
+    #[serde(default)]
+    metadata: Option<Value>,
+}
+
+/// The activation lease as the wire shows it: external (unscoped) agent id,
+/// RFC 3339 timestamps — the same conventions as the task wire.
+fn activation_wire(agent_id: &str, lease: &agents::ActivationLease) -> Value {
+    json!({
+        "agent_id": agent_id,
+        "owner": lease.owner,
+        "fencing": lease.fencing,
+        "lease_expires_at": lease.expires_at,
+        "acquired_at": lease.acquired_at,
+    })
+}
+
+/// `POST /agents` — register an agent: `201` with the record, `409` when
+/// the id is taken, `400` when the manifest does not parse as a
+/// `CapabilityManifest` (the registration is the one place manifest shape
+/// is enforced; wave 1 stores `accepts` contracts without validating
+/// message payloads against their schemas — that is a later wave).
+async fn create_agent(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
+    Json(payload): Json<CreateAgentPayload>,
+) -> Result<(StatusCode, Json<AgentRecord>), ApiError> {
+    let manifest: CapabilityManifest = serde_json::from_value(payload.manifest)
+        .map_err(|e| ApiError::bad_request(format!("invalid `manifest`: {e}")))?;
+    tasks::validate_label("agent_kind", &manifest.agent_kind, 256)
+        .map_err(ApiError::bad_request)?;
+    tasks::validate_label("manifest_version", &manifest.manifest_version, 256)
+        .map_err(ApiError::bad_request)?;
+    let agent_id = payload
+        .agent_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    validate_client_id("agent_id", &agent_id)?;
+
+    // Persist under the tenant's internal id; the wire shows the external id.
+    let record = AgentRecord {
+        agent_id: tenant.scope(&agent_id),
+        manifest,
+        metadata: payload.metadata.unwrap_or(Value::Null),
+        created_at: Utc::now(),
+    };
+    let created = state
+        .server_store
+        .create_agent(&record)
+        .await
+        .map_err(internal_err)?;
+    if !created {
+        return Err(ApiError::conflict(format!(
+            "agent `{agent_id}` already exists"
+        )));
+    }
+    let mut wire = record;
+    wire.agent_id = agent_id;
+    Ok((StatusCode::CREATED, Json(wire)))
+}
+
+/// `GET /agents` — the tenant's registered agents, oldest first.
+async fn list_agents(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
+) -> Result<Json<Value>, ApiError> {
+    let records = state
+        .server_store
+        .list_agents()
+        .await
+        .map_err(internal_err)?;
+    // Only this tenant's agents, reported with their external ids.
+    let mut records: Vec<AgentRecord> = records
+        .into_iter()
+        .filter_map(|mut record| {
+            let external = tenant.unscope(&record.agent_id)?.to_string();
+            record.agent_id = external;
+            Some(record)
+        })
+        .collect();
+    records.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.agent_id.cmp(&b.agent_id))
+    });
+    Ok(Json(json!(records)))
+}
+
+/// `GET /agents/{id}` — one registration (404 unknown/cross-tenant).
+async fn get_agent(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
+    Path(agent_id): Path<String>,
+) -> Result<Json<AgentRecord>, ApiError> {
+    state
+        .server_store
+        .get_agent(&tenant.scope(&agent_id))
+        .await
+        .map_err(internal_err)?
+        .map(|mut record| {
+            record.agent_id = agent_id.clone();
+            Json(record)
+        })
+        .ok_or_else(|| ApiError::not_found(format!("agent `{agent_id}` not found")))
+}
+
+#[derive(Debug, Deserialize)]
+struct SendAgentMessagePayload {
+    /// Message kind; the agent's manifest must declare it in `accepts`.
+    kind: String,
+    /// Message payload: any JSON value, stored verbatim. Wave 1 does not
+    /// validate it against the contract's `schema` (later wave).
+    payload: Value,
+    /// Attempt ceiling before dead-lettering (default 3, max 100).
+    #[serde(default)]
+    max_attempts: Option<u32>,
+    /// Dedup key, unique per tenant across live tasks: re-sending with the
+    /// same key returns the existing message (`deduplicated: true`).
+    #[serde(default)]
+    idempotency_key: Option<String>,
+    /// Declared effect classification of the work (`pure` / `read_only` /
+    /// `idempotent` / `compensatable` / `non_idempotent`) — the retry
+    /// policy's effect gate, exactly as for pool tasks.
+    #[serde(default)]
+    effect: Option<String>,
+    /// Whole-message deadline (RFC 3339), across attempts.
+    #[serde(default)]
+    deadline: Option<String>,
+}
+
+/// `POST /agents/{id}/mailbox` — send a message into the agent's mailbox.
+/// The message is a durable task addressed to the agent (`recipient` set),
+/// so it inherits the queue's idempotency, retry, and deadline machinery;
+/// `400` when the manifest does not declare the kind in `accepts`, `404`
+/// for an unknown agent. Answers `201 {task_id, deduplicated: false}` /
+/// `200 {…, deduplicated: true}`, and `429` over the tenant's task quota.
+async fn send_agent_message(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
+    Path(agent_id): Path<String>,
+    Json(payload): Json<SendAgentMessagePayload>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let agent = state
+        .server_store
+        .get_agent(&tenant.scope(&agent_id))
+        .await
+        .map_err(internal_err)?
+        .ok_or_else(|| ApiError::not_found(format!("agent `{agent_id}` not found")))?;
+    tasks::validate_label("kind", &payload.kind, 256).map_err(ApiError::bad_request)?;
+    if agent.manifest.accepts_kind(&payload.kind).is_none() {
+        let declared: Vec<&str> = agent.manifest.accepts.keys().map(String::as_str).collect();
+        return Err(ApiError::bad_request(format!(
+            "agent `{agent_id}` does not accept kind `{}` (manifest declares: {})",
+            payload.kind,
+            declared.join(", ")
+        )));
+    }
+    // The shared validation surface (`build_task_record`) keeps the mailbox
+    // path from drifting from direct enqueue; pool and worker-version pins
+    // are forced to their defaults — they do not apply to agent claims.
+    let record = build_task_record(
+        EnqueueTaskPayload {
+            kind: payload.kind,
+            payload: payload.payload,
+            pool: None,
+            max_attempts: payload.max_attempts,
+            idempotency_key: payload.idempotency_key,
+            effect: payload.effect,
+            run_id: None,
+            thread_id: None,
+            deadline: payload.deadline,
+            worker_version: None,
+            recipient: Some(AgentId::new(agent_id.as_str()).mailbox_recipient()),
+        },
+        &tenant,
+    )?;
+    // Same quota gate as every other submission surface.
+    enforce_task_quota(&state, &tenant, 1).await?;
+    let (task, deduplicated) = state
+        .server_store
+        .enqueue_task(&record)
+        .await
+        .map_err(internal_err)?;
+    let status = if deduplicated {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((
+        status,
+        Json(json!({
+            "task_id": task.task_id,
+            "deduplicated": deduplicated,
+        })),
+    ))
+}
+
+/// `GET /agents/{id}/status` — the agent's activation lease (or `null`)
+/// plus mailbox gauges. `queued` counts messages waiting for a turn
+/// (including failed ones awaiting their retry schedule and expired leases
+/// back in visibility); `in_flight` counts the live-leased turn in progress
+/// (never more than one — turn serialization); `dead` is the mailbox's DLQ
+/// depth.
+async fn get_agent_status(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
+    Path(agent_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let scoped = tenant.scope(&agent_id);
+    state
+        .server_store
+        .get_agent(&scoped)
+        .await
+        .map_err(internal_err)?
+        .ok_or_else(|| ApiError::not_found(format!("agent `{agent_id}` not found")))?;
+    let lease = state
+        .server_store
+        .get_activation(&scoped)
+        .await
+        .map_err(internal_err)?;
+    let recipient = AgentId::new(agent_id.as_str()).mailbox_recipient();
+    let tasks = state
+        .server_store
+        .list_tasks(tenant.tenant(), None)
+        .await
+        .map_err(internal_err)?;
+    let now = Utc::now();
+    let (mut queued, mut in_flight, mut dead) = (0u64, 0u64, 0u64);
+    for task in tasks
+        .iter()
+        .filter(|t| t.recipient.as_deref() == Some(recipient.as_str()))
+    {
+        match task.status {
+            // `Failed` is awaiting its backoff — still pending work. An
+            // expired lease is visible again, so it counts as queued too.
+            TaskStatus::Queued | TaskStatus::Failed => queued += 1,
+            TaskStatus::Leased => {
+                if task.lease.as_ref().is_some_and(|l| l.expires_at > now) {
+                    in_flight += 1;
+                } else {
+                    queued += 1;
+                }
+            }
+            TaskStatus::Dead => dead += 1,
+            // Completed / cancelled messages are settled history.
+            _ => {}
+        }
+    }
+    Ok(Json(json!({
+        "agent_id": agent_id,
+        "activation": lease
+            .as_ref()
+            .map(|l| activation_wire(&agent_id, l))
+            .unwrap_or(Value::Null),
+        "mailbox": {
+            "queued": queued,
+            "in_flight": in_flight,
+            "dead": dead,
+        },
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ActivateAgentPayload {
+    /// Stable worker identity claiming the activation.
+    worker_id: String,
+    /// Lease duration in milliseconds (100..=3_600_000).
+    lease_ms: u64,
+}
+
+/// `POST /agents/{id}/activate` — claim the agent's single activation
+/// lease: `200 {owner, fencing, lease_expires_at, …}` when claimed (a
+/// fresh claim, or a steal of an expired lease with the fencing ordinal
+/// bumped); `409` when another host holds a live lease — the body names
+/// the current holder so the loser can back off until expiry.
+async fn activate_agent(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
+    Path(agent_id): Path<String>,
+    Json(payload): Json<ActivateAgentPayload>,
+) -> Result<Response, ApiError> {
+    tasks::validate_label("worker_id", &payload.worker_id, 256).map_err(ApiError::bad_request)?;
+    tasks::validate_lease_ms(payload.lease_ms).map_err(ApiError::bad_request)?;
+    let scoped = tenant.scope(&agent_id);
+    // Activation requires a registered agent: a lease for an id nobody
+    // registered would strand mailbox traffic behind a phantom host.
+    state
+        .server_store
+        .get_agent(&scoped)
+        .await
+        .map_err(internal_err)?
+        .ok_or_else(|| ApiError::not_found(format!("agent `{agent_id}` not found")))?;
+    let outcome = state
+        .server_store
+        .claim_activation(&scoped, &payload.worker_id, payload.lease_ms, Utc::now())
+        .await
+        .map_err(internal_err)?;
+    Ok(match outcome {
+        ActivationOutcome::Claimed(lease) => {
+            Json(activation_wire(&agent_id, &lease)).into_response()
+        }
+        ActivationOutcome::Held(lease) => ApiError::conflict(format!(
+            "agent `{agent_id}` activation is held by `{}` (fencing {}, lease expires {})",
+            lease.owner,
+            lease.fencing,
+            lease.expires_at.to_rfc3339()
+        ))
+        .into_response(),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct ActivationHeartbeatPayload {
+    worker_id: String,
+    /// The fencing ordinal the activate call granted — the stale-holder
+    /// guard: a host that lost the activation to a steal can never renew.
+    fencing: u64,
+    lease_ms: u64,
+}
+
+/// `POST /agents/{id}/activate/heartbeat` — renew the held activation:
+/// `200` with the refreshed lease, `409` when the owner + fencing pair no
+/// longer holds it (stolen or expired — the host must re-activate), `404`
+/// when no lease exists at all.
+async fn heartbeat_activation(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
+    Path(agent_id): Path<String>,
+    Json(payload): Json<ActivationHeartbeatPayload>,
+) -> Result<Response, ApiError> {
+    tasks::validate_label("worker_id", &payload.worker_id, 256).map_err(ApiError::bad_request)?;
+    tasks::validate_lease_ms(payload.lease_ms).map_err(ApiError::bad_request)?;
+    let outcome = state
+        .server_store
+        .renew_activation(
+            &tenant.scope(&agent_id),
+            &payload.worker_id,
+            payload.fencing,
+            payload.lease_ms,
+            Utc::now(),
+        )
+        .await
+        .map_err(internal_err)?;
+    Ok(match outcome {
+        ActivationMutation::Applied(lease) => {
+            Json(activation_wire(&agent_id, &lease)).into_response()
+        }
+        ActivationMutation::FencingLost => ApiError::conflict(format!(
+            "activation for agent `{agent_id}` is no longer held by this owner + fencing pair"
+        ))
+        .into_response(),
+        ActivationMutation::Unknown => {
+            ApiError::not_found(format!("no activation lease for agent `{agent_id}`"))
+                .into_response()
+        }
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct ActivationReleasePayload {
+    worker_id: String,
+    fencing: u64,
+}
+
+/// `POST /agents/{id}/activate/release` — drop the held activation so a
+/// draining host's replacement can activate promptly instead of waiting
+/// out the expiry. Same owner + fencing guard as the heartbeat: `200
+/// {released: true}`, `409` on fencing loss, `404` when no lease exists.
+async fn release_activation(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
+    Path(agent_id): Path<String>,
+    Json(payload): Json<ActivationReleasePayload>,
+) -> Result<Response, ApiError> {
+    tasks::validate_label("worker_id", &payload.worker_id, 256).map_err(ApiError::bad_request)?;
+    let outcome = state
+        .server_store
+        .release_activation(
+            &tenant.scope(&agent_id),
+            &payload.worker_id,
+            payload.fencing,
+            Utc::now(),
+        )
+        .await
+        .map_err(internal_err)?;
+    Ok(match outcome {
+        ActivationMutation::Applied(_) => {
+            Json(json!({ "released": true, "agent_id": agent_id })).into_response()
+        }
+        ActivationMutation::FencingLost => ApiError::conflict(format!(
+            "activation for agent `{agent_id}` is no longer held by this owner + fencing pair"
+        ))
+        .into_response(),
+        ActivationMutation::Unknown => {
+            ApiError::not_found(format!("no activation lease for agent `{agent_id}`"))
+                .into_response()
+        }
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaimAgentMessagePayload {
+    worker_id: String,
+    /// The activation fencing ordinal this claim runs under.
+    fencing: u64,
+    /// Task lease for the claimed turn, in milliseconds.
+    lease_ms: u64,
+}
+
+/// `POST /agents/{id}/mailbox/next` — claim the oldest queued mailbox
+/// message as one turn of work: `200 {task}` with a fresh task lease, `204`
+/// when the mailbox is empty **or a turn is already in flight** (one
+/// message at a time per agent is server-enforced), `409` when the caller
+/// does not hold the activation lease. The claimed turn settles through the
+/// unchanged `/tasks/{id}/heartbeat|complete|fail` protocol.
+async fn claim_agent_message(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
+    Path(agent_id): Path<String>,
+    Json(payload): Json<ClaimAgentMessagePayload>,
+) -> Result<Response, ApiError> {
+    tasks::validate_label("worker_id", &payload.worker_id, 256).map_err(ApiError::bad_request)?;
+    tasks::validate_lease_ms(payload.lease_ms).map_err(ApiError::bad_request)?;
+    let scoped = tenant.scope(&agent_id);
+    state
+        .server_store
+        .get_agent(&scoped)
+        .await
+        .map_err(internal_err)?
+        .ok_or_else(|| ApiError::not_found(format!("agent `{agent_id}` not found")))?;
+    let recipient = AgentId::new(agent_id.as_str()).mailbox_recipient();
+    let claimed = state
+        .server_store
+        .claim_agent_task(
+            tenant.tenant(),
+            &MailboxClaimScope {
+                agent_id: &scoped,
+                recipient: &recipient,
+                owner: &payload.worker_id,
+                fencing: payload.fencing,
+            },
+            payload.lease_ms,
+            Utc::now(),
+        )
+        .await
+        .map_err(internal_err)?;
+    Ok(match claimed {
+        MailboxClaim::Claimed(task) => Json(json!({ "task": task.wire() })).into_response(),
+        MailboxClaim::Empty => StatusCode::NO_CONTENT.into_response(),
+        MailboxClaim::ActivationLost => ApiError::conflict(format!(
+            "activation for agent `{agent_id}` is not held by this owner + fencing pair"
+        ))
+        .into_response(),
+    })
 }
