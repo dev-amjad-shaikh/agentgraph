@@ -270,10 +270,21 @@ where
 
 /// Allow `Arc<dyn Activity>` itself to be registered (useful for sharing one
 /// activity implementation across workers).
+///
+/// Both methods delegate: overriding only `run` would make the default
+/// `run_with_receipt` answer for the `Arc` — wrapping the inner `run` and
+/// silently dropping the receipt a receipt-carrying activity reported. The
+/// worker stores every registered handler as `Arc<dyn Activity>` and drives
+/// it through `run_with_receipt`, so this delegation is what carries the
+/// effect receipt from the handler to the completion call.
 #[async_trait]
 impl Activity for Arc<dyn Activity> {
     async fn run(&self, ctx: ActivityContext) -> Result<Value> {
         self.as_ref().run(ctx).await
+    }
+
+    async fn run_with_receipt(&self, ctx: ActivityContext) -> Result<ActivityCompletion> {
+        self.as_ref().run_with_receipt(ctx).await
     }
 }
 
@@ -1151,6 +1162,48 @@ mod tests {
         assert_eq!(receipt.provider_id, "ch_3PKd");
         assert_eq!(receipt.idempotency_key, "run-9:charge:7");
         assert_eq!(receipt.task_id.as_deref(), Some("t-7"));
+    }
+
+    #[tokio::test]
+    async fn arc_dyn_activity_delegates_run_with_receipt() {
+        // Regression: the worker stores every registered handler as
+        // `Arc<dyn Activity>` and drives it through `run_with_receipt`.
+        // When the `Arc<dyn Activity>` impl overrode only `run`, the
+        // default `run_with_receipt` answered for the Arc and silently
+        // dropped the receipt — the crash-recovery proof caught it.
+        struct Charger;
+        #[async_trait]
+        impl Activity for Charger {
+            async fn run(&self, _ctx: ActivityContext) -> Result<Value> {
+                unreachable!("the worker drives run_with_receipt")
+            }
+            async fn run_with_receipt(&self, ctx: ActivityContext) -> Result<ActivityCompletion> {
+                Ok(ActivityCompletion {
+                    result: json!({"charged": true}),
+                    receipt: Some(EffectReceipt {
+                        provider: "stripe".into(),
+                        provider_id: "ch_arc".into(),
+                        idempotency_key: ctx.idempotency_key().unwrap_or_default().to_owned(),
+                        task_id: Some(ctx.task_id().to_owned()),
+                    }),
+                })
+            }
+        }
+        let activity: Arc<dyn Activity> = Arc::new(Charger);
+        let ctx = ActivityContext {
+            task_id: "t-9".into(),
+            kind: "charge_card".into(),
+            attempt: 2,
+            idempotency_key: Some("run-1:charge:9".into()),
+            payload: json!({}),
+        };
+        let completion = activity.run_with_receipt(ctx).await.unwrap();
+        assert_eq!(completion.result, json!({"charged": true}));
+        let receipt = completion
+            .receipt
+            .expect("the Arc must delegate the receipt");
+        assert_eq!(receipt.provider_id, "ch_arc");
+        assert_eq!(receipt.idempotency_key, "run-1:charge:9");
     }
 
     #[test]

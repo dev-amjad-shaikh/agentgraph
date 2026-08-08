@@ -7,6 +7,13 @@
 //! fetched back over `GET /runs/{run_id}/events`.
 //!
 //! Run with: `cargo run --example server_demo`
+//!
+//! Test hooks (defaults unchanged — the interactive demo behaves exactly as
+//! before): `RUSTY_DEMO_ADDR` overrides the bind address and
+//! `RUSTY_DEMO_STORE` the JSON-file store directory. The crash-recovery
+//! release proof (`rusty-server/tests/crash_recovery.rs`) uses both to run
+//! this binary as a real process it can SIGKILL mid-effect and restart from
+//! the same store.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -104,44 +111,51 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     registry.register("react_agent", react, react_spec);
 
     let config = ServerConfig::new(
-        "127.0.0.1:8100".parse().unwrap(),
-        "./data/server-demo-checkpoints",
+        std::env::var("RUSTY_DEMO_ADDR")
+            .unwrap_or_else(|_| "127.0.0.1:8100".to_string())
+            .parse()
+            .expect("RUSTY_DEMO_ADDR must be a socket address"),
+        std::env::var("RUSTY_DEMO_STORE")
+            .unwrap_or_else(|_| "./data/server-demo-checkpoints".to_string()),
     );
 
-    println!("\nrusty-server demo on http://127.0.0.1:8100\n");
+    // The menu below is printed with the *actual* address so the test-hook
+    // override stays honest when a human runs the demo with it set.
+    let base = format!("localhost:{}", config.bind_addr.port());
+    println!("\nrusty-server demo on http://{base}\n");
     println!("  (Ctrl-C / SIGTERM drains gracefully: in-flight requests and runs");
     println!("   finish within the grace window, runs resume from their checkpoints)\n");
     println!("  # liveness + registered graphs");
-    println!("  curl localhost:8100/ok");
-    println!("  curl localhost:8100/info | jq\n");
+    println!("  curl {base}/ok");
+    println!("  curl {base}/info | jq\n");
     println!("  # create a thread (pipeline graph)");
-    println!("  THREAD=$(curl -s -X POST localhost:8100/threads \\");
+    println!("  THREAD=$(curl -s -X POST {base}/threads \\");
     println!("    -H 'content-type: application/json' \\");
     println!("    -d '{{\"graph\": \"pipeline\"}}' | jq -r .thread_id)\n");
     println!("  # blocking run");
-    println!("  curl -s -X POST localhost:8100/threads/$THREAD/runs/wait \\");
+    println!("  curl -s -X POST {base}/threads/$THREAD/runs/wait \\");
     println!("    -H 'content-type: application/json' -d '{{}}' | jq\n");
     println!("  # streaming run (SSE)");
-    println!("  curl -N -X POST localhost:8100/threads/$THREAD/runs/stream \\");
+    println!("  curl -N -X POST {base}/threads/$THREAD/runs/stream \\");
     println!("    -H 'content-type: application/json' -d '{{}}'\n");
     println!("  # state + history");
-    println!("  curl -s localhost:8100/threads/$THREAD/state | jq");
-    println!("  curl -s -X POST localhost:8100/threads/$THREAD/history \\");
+    println!("  curl -s {base}/threads/$THREAD/state | jq");
+    println!("  curl -s -X POST {base}/threads/$THREAD/history \\");
     println!("    -H 'content-type: application/json' -d '{{}}' | jq\n");
     println!("  # Flight Recorder: the run's journaled evidence (run_id is in the");
     println!("  # runs/wait terminal JSON, or poll GET /runs/$RUN_ID)");
-    println!("  curl -s localhost:8100/runs/$RUN_ID/events | jq");
-    println!("  curl -s localhost:8100/runs/$RUN_ID/fixture -o fixture.json  # CI replay bundle\n");
+    println!("  curl -s {base}/runs/$RUN_ID/events | jq");
+    println!("  curl -s {base}/runs/$RUN_ID/fixture -o fixture.json  # CI replay bundle\n");
     println!("  # server-side exact replay (verified:true = evidence reproduced),");
     println!("  # and branch diff of two runs' journals");
-    println!("  curl -s -X POST localhost:8100/runs/replay \\");
+    println!("  curl -s -X POST {base}/runs/replay \\");
     println!("    -H 'content-type: application/json' -d '{{\"run_id\": \"'$RUN_ID'\"}}' | jq");
-    println!("  curl -s 'localhost:8100/runs/diff?base='$RUN_ID'&branch='$FORK_RUN_ID'' | jq\n");
+    println!("  curl -s '{base}/runs/diff?base='$RUN_ID'&branch='$FORK_RUN_ID'' | jq\n");
     println!("  # ReAct agent (scripted model; no network)");
-    println!("  REACT=$(curl -s -X POST localhost:8100/threads \\");
+    println!("  REACT=$(curl -s -X POST {base}/threads \\");
     println!("    -H 'content-type: application/json' \\");
     println!("    -d '{{\"graph\": \"react_agent\"}}' | jq -r .thread_id)");
-    println!("  curl -s -X POST localhost:8100/threads/$REACT/runs/wait \\");
+    println!("  curl -s -X POST {base}/threads/$REACT/runs/wait \\");
     println!("    -H 'content-type: application/json' \\");
     println!("    -d '{{\"input\": {{\"messages\": [{{\"role\": \"user\", \"content\": \"say pong\"}}]}}}}' | jq\n");
 

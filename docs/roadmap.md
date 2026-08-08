@@ -83,7 +83,7 @@ Workers evolve from remote-execution helpers into a durable activity system. The
 - Task idempotency keys, deduplication, transactional outbox, effect receipts.
 - Named worker pools, concurrency limits, tenant quotas; version pinning for in-flight runs.
 
-**Release proof:** kill the server and a worker mid-effect; restart; the run completes without losing state or duplicating the external effect.
+**Release proof:** kill the server and a worker mid-effect; restart; the run completes without losing state or duplicating the external effect. Implemented as the automated integration test `rusty-server/tests/crash_recovery.rs` (real processes, real SIGKILLs — see [the design doc](durable-work-design.md#the-lease--visibility-timeout-model-wave-1)).
 
 ### R0.7 — Agent Fabric · durable agent teams + state scaling
 

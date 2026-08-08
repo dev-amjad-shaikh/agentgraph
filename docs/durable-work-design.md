@@ -155,6 +155,38 @@ carry the envelope, status, attempt count, lease owner, and lease expiry.
   leased task returns to visibility, and the idempotency key makes the
   re-attempt a no-op at the effect.
 
+  **As implemented (wave 3c), the proof is an automated integration test,
+  `rusty-server/tests/crash_recovery.rs` — not a manual demo.** It spawns
+  the real demo binaries as processes (`server_demo` on a JSON-file store
+  in a temp dir, `activity_worker_demo` running `send_receipt` against a
+  file-backed idempotent "provider" — a ledger file, outside the server's
+  store, keyed by the task's idempotency key; both binaries take
+  `RUSTY_DEMO_*` env hooks whose defaults leave the interactive demos
+  unchanged). Attempt 1 fires the effect: the worker appends the
+  invocation to the provider ledger, fsyncs it, and then pauses — the
+  classic window, **effect durable at the provider, completion never
+  reported**. Inside that window the test SIGKILLs the worker and then the
+  server (no drain, no signal handling — the graceful path is covered in
+  `shutdown.rs`). Both restart from the same store dir / ledger, and the
+  test asserts the promise end to end: the leased task returns to
+  visibility at lease expiry and a second attempt runs (the record ends
+  `completed` with `attempt == 2`, its idempotency key and attempt history
+  intact — no lost state); the provider ledger holds exactly **one**
+  invocation across both worker processes, and the stored result carries
+  the first attempt's provider confirmation with `deduplicated: true` —
+  the re-attempt was a no-op **at the effect**, not just at the queue; and
+  the effect receipt on the completed record matches that confirmation.
+  Flake resistance is by construction: 1 s leases make expiry fast, every
+  wait is a poll against a deadline (never a fixed sleep), and the
+  post-effect pause (30 s) can never be outrun by the SIGKILL. The whole
+  proof runs in seconds on the JSON-file backend — the restart-durability
+  reference; the lease, retry, and receipt semantics under test are
+  backend-shared, so Postgres parity is covered by the existing gated
+  suites rather than re-killed here. (The proof also caught a real bug on
+  first run: `Activity for Arc<dyn Activity>` delegated only `run`, so the
+  worker's stored handlers dropped reported receipts — fixed by
+  delegating `run_with_receipt`, with a regression test.)
+
 ## Dead-letter policy (wave 1)
 
 A task dead-letters when a retryable failure class exhausts its attempt
