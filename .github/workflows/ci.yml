@@ -47,6 +47,13 @@ jobs:
           cargo clippy -p ${{ matrix.pkg }} --all-targets -- -D warnings
           cargo clippy -p ${{ matrix.pkg }} --all-targets --all-features -- -D warnings
 
+      # rusty-server's crash-recovery proof spawns the demo server and
+      # worker as real processes; a package-scoped `cargo test` does not
+      # build cross-package example binaries, so build them first.
+      - name: Build examples (crash-recovery proof)
+        if: matrix.pkg == 'rusty-server'
+        run: cargo build --workspace --examples
+
       - name: Test
         run: cargo test -p ${{ matrix.pkg }}
 
