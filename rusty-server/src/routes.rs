@@ -160,6 +160,7 @@ pub(crate) fn router_with_shutdown(
         .route("/tasks", post(enqueue_task).get(list_tasks))
         .route("/tasks/outbox", post(enqueue_task_outbox))
         .route("/tasks/claim", post(claim_task))
+        .route("/tasks/metrics", get(task_metrics))
         .route("/tasks/{task_id}", get(get_task))
         .route("/tasks/{task_id}/heartbeat", post(heartbeat_task))
         .route("/tasks/{task_id}/complete", post(complete_task))
@@ -507,6 +508,14 @@ async fn update_state(
                 .collect::<Result<Vec<_>, _>>()
         })
         .transpose()?;
+    // The quota gate runs before any write, like validation: over quota
+    // fails the whole request — checkpoint included — preserving the
+    // all-or-nothing contract the Postgres transaction enforces.
+    if let Some(tasks) = &outbox_tasks {
+        if !tasks.is_empty() {
+            enforce_task_quota(&state, &tenant, tasks.len()).await?;
+        }
+    }
 
     let internal_id = tenant.scope(&thread_id);
     let new_state = State::from_value(values)
@@ -1752,6 +1761,12 @@ struct EnqueueTaskPayload {
     /// worker that sees it pass mid-attempt reports the attempt cancelled.
     #[serde(default)]
     deadline: Option<String>,
+    /// Version pin (R0.6 wave 3): the exact worker version string this task
+    /// may be leased to — a run stamps its tasks with the version it started
+    /// against, so a mid-run deploy never changes semantics under an
+    /// in-flight execution. Exact match only; absent = unpinned, any worker.
+    #[serde(default)]
+    worker_version: Option<String>,
 }
 
 /// Validate an enqueue payload and build the fresh [`TaskRecord`] it
@@ -1802,6 +1817,9 @@ fn build_task_record(
                 })
         })
         .transpose()?;
+    if let Some(version) = &payload.worker_version {
+        tasks::validate_label("worker_version", version, 256).map_err(ApiError::bad_request)?;
+    }
 
     Ok(TaskRecord::new(
         tasks::NewTask {
@@ -1816,20 +1834,78 @@ fn build_task_record(
             run_id: payload.run_id,
             thread_id: payload.thread_id,
             deadline,
+            worker_version: payload.worker_version,
         },
         Utc::now(),
     ))
 }
 
+/// The wave-3 tenant quota gate, shared by every task submission surface
+/// (`POST /tasks`, `POST /tasks/outbox`, `update_state`'s atomic `enqueue`
+/// list) — one enforcement point, so the paths can never drift apart the
+/// way [`build_task_record`] keeps validation singular. Runs **before any
+/// write**: over quota answers `429 quota_exceeded` and nothing persists
+/// (the update_state path keeps its all-or-nothing shape).
+///
+/// Semantics per gauge (see [`crate::tasks::TaskUsage`] for the counts):
+/// `max_queued` counts the `additional` would-be tasks against the backlog;
+/// `max_in_flight` and `max_dlq` are pure backpressure — already at/over
+/// the cap rejects, since a submission adds neither. A submission that
+/// would have deduplicated on its idempotency key can also answer 429
+/// under pressure: safe (the pre-existing task is untouched) and simpler
+/// than reaching inside the store's dedup decision.
+async fn enforce_task_quota(
+    state: &AppState,
+    tenant: &TenantContext,
+    additional: usize,
+) -> Result<(), ApiError> {
+    let quota = state.config.quota_for(tenant.tenant());
+    if quota.is_unlimited() {
+        return Ok(());
+    }
+    let usage = state
+        .server_store
+        .task_usage(tenant.tenant())
+        .await
+        .map_err(internal_err)?;
+    if let Some(max) = quota.max_queued {
+        if usage.queued as usize + additional > max {
+            return Err(ApiError::too_many_requests(format!(
+                "tenant task quota exceeded: {} tasks queued (+{additional} submitted) would pass the limit of {max} — let workers drain the queue or raise the quota",
+                usage.queued
+            )));
+        }
+    }
+    if let Some(max) = quota.max_in_flight {
+        if usage.in_flight as usize >= max {
+            return Err(ApiError::too_many_requests(format!(
+                "tenant task quota exceeded: {} tasks in flight at the limit of {max} — wait for workers to settle or raise the quota",
+                usage.in_flight
+            )));
+        }
+    }
+    if let Some(max) = quota.max_dlq {
+        if usage.dlq as usize >= max {
+            return Err(ApiError::too_many_requests(format!(
+                "tenant task quota exceeded: DLQ depth {} at the limit of {max} — inspect and re-drive the dead-letter queue before submitting more work",
+                usage.dlq
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// `POST /tasks` — enqueue a durable task. `201 {task_id, deduplicated:
 /// false}` on creation, `200 {task_id, deduplicated: true}` when the
-/// idempotency key already names a live task in this tenant.
+/// idempotency key already names a live task in this tenant. `429` when the
+/// tenant is over its configured task quota (R0.6 wave 3).
 async fn enqueue_task(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(tenant): Extension<TenantContext>,
     Json(payload): Json<EnqueueTaskPayload>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let record = build_task_record(payload, &tenant)?;
+    enforce_task_quota(&state, &tenant, 1).await?;
     let (task, deduplicated) = state
         .server_store
         .enqueue_task(&record)
@@ -1864,6 +1940,9 @@ async fn enqueue_task_outbox(
     Json(payload): Json<EnqueueTaskPayload>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let record = build_task_record(payload, &tenant)?;
+    // Same quota gate as direct enqueue: a pending outbox row counts
+    // against the tenant's backlog, so the outbox is not a quota bypass.
+    enforce_task_quota(&state, &tenant, 1).await?;
     let (task, deduplicated) = state
         .server_store
         .outbox_enqueue(&record)
@@ -1886,6 +1965,11 @@ struct ClaimTaskPayload {
     /// is a 400 — it could never match a task.
     #[serde(default)]
     pools: Option<Vec<String>>,
+    /// The worker's version (R0.6 wave 3), matched exactly against a task's
+    /// `worker_version` pin: versioned workers take pinned and unpinned
+    /// work they match; a claim without a version takes unpinned work only.
+    #[serde(default)]
+    worker_version: Option<String>,
     /// Visibility timeout in milliseconds (100..=3_600_000).
     lease_ms: u64,
 }
@@ -1893,7 +1977,10 @@ struct ClaimTaskPayload {
 /// `POST /tasks/claim` — take the oldest claimable task: `200 {"task": {…}}`
 /// with a fresh lease, or `204` (empty body) when nothing is claimable.
 /// Claimable means queued, failed past its backoff schedule, or leased past
-/// its visibility timeout (safe reassignment after worker loss).
+/// its visibility timeout (safe reassignment after worker loss) — and, since
+/// wave 3, in a pool below its configured concurrency limit
+/// ([`ServerConfig::with_pool_limit`]) and matched by the worker's
+/// advertised `worker_version` when the task is pinned.
 async fn claim_task(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(tenant): Extension<TenantContext>,
@@ -1901,6 +1988,9 @@ async fn claim_task(
 ) -> Result<Response, ApiError> {
     tasks::validate_label("worker_id", &payload.worker_id, 256).map_err(ApiError::bad_request)?;
     tasks::validate_lease_ms(payload.lease_ms).map_err(ApiError::bad_request)?;
+    if let Some(version) = &payload.worker_version {
+        tasks::validate_label("worker_version", version, 256).map_err(ApiError::bad_request)?;
+    }
     let pools = payload
         .pools
         .unwrap_or_else(|| vec![tasks::DEFAULT_POOL.to_string()]);
@@ -1918,7 +2008,11 @@ async fn claim_task(
         .claim_task(
             tenant.tenant(),
             &payload.worker_id,
-            &pools,
+            &tasks::ClaimScope {
+                pools: &pools,
+                pool_limits: &state.config.task_pool_limits,
+                worker_version: payload.worker_version.as_deref(),
+            },
             payload.lease_ms,
             Utc::now(),
         )
@@ -2209,6 +2303,81 @@ async fn cancel_task(
         ))),
         CancelOutcome::Unknown => Err(ApiError::not_found(format!("task `{task_id}` not found"))),
     }
+}
+
+/// `GET /tasks/metrics` — the wave-3 autoscaling signals, tenant-scoped:
+/// per-pool queue depth, live leases, lease saturation against the
+/// configured concurrency limit, and the age of the oldest task a claim
+/// would hand out right now. These are **signals, not a mechanism**: Rusty
+/// publishes the numbers an external autoscaler (HPA, KEDA, a script)
+/// scales worker deployments on; the scaling decision stays with the
+/// operator — there is no built-in autoscaler, by design.
+///
+/// Shape: `{ "pools": [{ "pool", "queue_depth", "leased",
+/// "concurrency_limit", "lease_saturation", "oldest_visible_task_age_ms"
+/// }…], "now" }`. `concurrency_limit` / `lease_saturation` are null for
+/// uncapped pools (saturation is undefined without a limit, never
+/// invented); `oldest_visible_task_age_ms` is null when nothing is
+/// visible. Saturation may exceed 1.0 transiently (claims racing the
+/// Postgres commit window, or a limit lowered below the current load) —
+/// see the `ServerStore::claim_task` contract. Pools with a configured
+/// limit but no tasks report zeros: an autoscaler scaling to zero needs
+/// the zero, not an absent entry.
+async fn task_metrics(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(tenant): Extension<TenantContext>,
+) -> Result<Json<Value>, ApiError> {
+    let now = Utc::now();
+    let stats = state
+        .server_store
+        .task_pool_stats(tenant.tenant(), now)
+        .await
+        .map_err(internal_err)?;
+    let mut pools: Vec<Value> = stats
+        .iter()
+        .map(|stat| {
+            let limit = state.config.task_pool_limits.get(&stat.pool).copied();
+            pool_metrics_json(stat, limit, now)
+        })
+        .collect();
+    for (pool, &limit) in &state.config.task_pool_limits {
+        if !stats.iter().any(|s| &s.pool == pool) {
+            pools.push(pool_metrics_json(
+                &tasks::PoolStat {
+                    pool: pool.clone(),
+                    queue_depth: 0,
+                    leased: 0,
+                    oldest_visible_at: None,
+                },
+                Some(limit),
+                now,
+            ));
+        }
+    }
+    pools.sort_by(|a, b| a["pool"].as_str().cmp(&b["pool"].as_str()));
+    Ok(Json(json!({ "pools": pools, "now": now })))
+}
+
+/// One pool's entry in the `GET /tasks/metrics` body (see [`task_metrics`]
+/// for the field semantics).
+fn pool_metrics_json(
+    stat: &tasks::PoolStat,
+    limit: Option<usize>,
+    now: chrono::DateTime<Utc>,
+) -> Value {
+    let oldest_age_ms = stat
+        .oldest_visible_at
+        .map(|at| (now - at).num_milliseconds().max(0));
+    json!({
+        "pool": stat.pool,
+        "queue_depth": stat.queue_depth,
+        "leased": stat.leased,
+        "concurrency_limit": limit,
+        // `limit.max(1)`: a zero cap (paused pool) would divide by zero;
+        // its saturation is 0 while paused and empty.
+        "lease_saturation": limit.map(|max| stat.leased as f64 / max.max(1) as f64),
+        "oldest_visible_task_age_ms": oldest_age_ms,
+    })
 }
 
 /// `GET /tasks/{id}` — the task record (tenant-scoped; unknown or

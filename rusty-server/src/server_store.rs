@@ -108,15 +108,32 @@ pub(crate) trait ServerStore: Send + Sync {
     /// true` — enqueue is safe to retry. Without a key the insert always
     /// creates (`false`).
     async fn enqueue_task(&self, record: &TaskRecord) -> StoreResult<(TaskRecord, bool)>;
-    /// Atomically claim the oldest claimable task in `pools` for `worker_id`
-    /// (tenant-scoped): queued tasks, backoff-elapsed failed tasks, and
-    /// leased tasks past their visibility timeout. `None` when nothing is
-    /// claimable (route answers 204).
+    /// Atomically claim the oldest claimable task in `scope.pools` for
+    /// `worker_id` (tenant-scoped): queued tasks, backoff-elapsed failed
+    /// tasks, and leased tasks past their visibility timeout. `None` when
+    /// nothing is claimable (route answers 204).
+    ///
+    /// Wave-3 placement rules, both applied before a candidate is chosen:
+    /// `scope.pool_limits` caps each pool's live (unexpired) leases — a
+    /// pool at its cap hands out nothing, so pools coexist without
+    /// starving each other; `scope.worker_version` is the version the
+    /// worker advertises, matched exactly against a task's version pin
+    /// ([`TaskRecord::worker_version`]) — unpinned tasks match any worker.
+    ///
+    /// On the JSON-file backend both rules hold exactly (the pick runs under
+    /// the one index lock). On Postgres the pool-capacity count and the
+    /// claim run in one transaction, but concurrent claim transactions do
+    /// not serialize against each other: claims racing inside the same
+    /// commit window can transiently overshoot a pool's cap by up to the
+    /// number of racing claimers. The cap is a scheduling guardrail keeping
+    /// pools from starving each other, not a hard invariant — overshoot
+    /// self-corrects on the next claim round, and no task is ever leased
+    /// twice (the row lock, which *is* exact, guarantees that).
     async fn claim_task(
         &self,
         tenant: &str,
         worker_id: &str,
-        pools: &[String],
+        scope: &tasks::ClaimScope<'_>,
         lease_ms: u64,
         now: chrono::DateTime<chrono::Utc>,
     ) -> StoreResult<Option<TaskRecord>>;
@@ -185,6 +202,22 @@ pub(crate) trait ServerStore: Send + Sync {
         run_id: &str,
         now: chrono::DateTime<chrono::Utc>,
     ) -> StoreResult<RunCancellation>;
+
+    /// The tenant's queue pressure (R0.6 wave 3) — the three gauges the
+    /// submission quota gate enforces. Read-only; the gauge definitions
+    /// (including why pending outbox rows count as queued) live on
+    /// [`crate::tasks::TaskUsage`].
+    async fn task_usage(&self, tenant: &str) -> StoreResult<tasks::TaskUsage>;
+
+    /// Per-pool autoscaling signals (R0.6 wave 3) for
+    /// `GET /tasks/metrics`, computed at `now`. Pools with no tasks are
+    /// absent — the route adds configured-but-empty pools itself, since
+    /// only the config knows their limits.
+    async fn task_pool_stats(
+        &self,
+        tenant: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<Vec<tasks::PoolStat>>;
 
     // -- Transactional outbox (R0.6 wave 2b) ---------------------------- //
 
@@ -493,7 +526,7 @@ impl ServerStore for JsonFileStore {
         &self,
         tenant: &str,
         worker_id: &str,
-        pools: &[String],
+        scope: &tasks::ClaimScope<'_>,
         lease_ms: u64,
         now: chrono::DateTime<chrono::Utc>,
     ) -> StoreResult<Option<TaskRecord>> {
@@ -517,13 +550,36 @@ impl ServerStore for JsonFileStore {
                 .map_err(io_err("persist task"))?;
             map.insert(task_id, task);
         }
+        // Pool capacity (wave 3): live — unexpired — leases per pool. An
+        // expired lease holds no capacity: its task is visible again. A pool
+        // at its configured limit is excluded from this claim, so one
+        // saturated pool can never starve the others.
+        let mut live_leases: HashMap<&str, u64> = HashMap::new();
+        for task in map.values() {
+            if task.tenant == tenant
+                && task.status == TaskStatus::Leased
+                && task.lease.as_ref().is_some_and(|l| l.expires_at > now)
+            {
+                *live_leases.entry(task.pool.as_str()).or_insert(0) += 1;
+            }
+        }
+        let saturated = |pool: &str| {
+            scope
+                .pool_limits
+                .get(pool)
+                .is_some_and(|&limit| live_leases.get(pool).copied().unwrap_or(0) >= limit as u64)
+        };
         // The whole claim (pick + mutate + persist) runs under the one
         // index lock, so two concurrent claims can never take the same
         // task — the file backend's SKIP LOCKED equivalent.
         let candidate = map
             .values()
             .filter(|t| {
-                t.tenant == tenant && pools.iter().any(|p| p == &t.pool) && t.claimable_at(now)
+                t.tenant == tenant
+                    && scope.pools.iter().any(|p| p == &t.pool)
+                    && t.claimable_at(now)
+                    && !saturated(&t.pool)
+                    && t.matches_worker_version(scope.worker_version)
             })
             .min_by(|a, b| {
                 a.created_at
@@ -676,6 +732,83 @@ impl ServerStore for JsonFileStore {
             }
         }
         Ok(outcome)
+    }
+
+    async fn task_usage(&self, tenant: &str) -> StoreResult<tasks::TaskUsage> {
+        // Both locks held for the whole count, in the publish path's order
+        // (outbox before tasks — see `outbox_publish_pending`). Two separate
+        // scans would race the relay: a publish landing between them moves a
+        // row from pending to queued while *both* scans miss it (tasks
+        // scanned before the insert, outbox scanned after the mark), and the
+        // quota gate would read zero for work that exists.
+        let outbox_map = self.outbox.lock().await;
+        let tasks_map = self.tasks.lock().await;
+        let mut usage = tasks::TaskUsage::default();
+        for task in tasks_map.values() {
+            if task.tenant != tenant {
+                continue;
+            }
+            match task.status {
+                TaskStatus::Queued => usage.queued += 1,
+                TaskStatus::Failed if task.next_attempt_at.is_some() => usage.queued += 1,
+                TaskStatus::Leased => usage.in_flight += 1,
+                TaskStatus::Dead => usage.dlq += 1,
+                _ => {}
+            }
+        }
+        // Pending outbox rows count against the queued gauge: they are
+        // accepted submissions not yet visible, and the quota exists to
+        // bound the whole pipeline.
+        usage.queued += outbox_map
+            .values()
+            .filter(|row| row.tenant == tenant && row.published_at.is_none())
+            .count() as u64;
+        Ok(usage)
+    }
+
+    async fn task_pool_stats(
+        &self,
+        tenant: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> StoreResult<Vec<tasks::PoolStat>> {
+        let mut by_pool: HashMap<String, tasks::PoolStat> = HashMap::new();
+        for task in self.tasks.lock().await.values() {
+            if task.tenant != tenant {
+                continue;
+            }
+            let stat = by_pool
+                .entry(task.pool.clone())
+                .or_insert_with(|| tasks::PoolStat {
+                    pool: task.pool.clone(),
+                    queue_depth: 0,
+                    leased: 0,
+                    oldest_visible_at: None,
+                });
+            match task.status {
+                TaskStatus::Queued => stat.queue_depth += 1,
+                TaskStatus::Failed if task.next_attempt_at.is_some() => stat.queue_depth += 1,
+                TaskStatus::Leased if task.lease.as_ref().is_some_and(|l| l.expires_at > now) => {
+                    stat.leased += 1
+                }
+                _ => {}
+            }
+            // Visible right now = what the claim path would consider:
+            // queued, backoff-elapsed, or lease-expired.
+            let visible = task.status == TaskStatus::Queued
+                || (task.status == TaskStatus::Failed
+                    && task.next_attempt_at.is_some_and(|at| at <= now))
+                || (task.status == TaskStatus::Leased
+                    && task.lease.as_ref().is_some_and(|l| l.expires_at <= now));
+            if visible {
+                stat.oldest_visible_at = match stat.oldest_visible_at {
+                    Some(oldest) if oldest <= task.created_at => Some(oldest),
+                    _ => Some(task.created_at),
+                };
+            }
+        }
+        let mut stats: Vec<tasks::PoolStat> = by_pool.into_values().collect();
+        stats.sort_by(|a, b| a.pool.cmp(&b.pool));
+        Ok(stats)
     }
 }
 
@@ -836,6 +969,7 @@ mod postgres {
             thread_id        TEXT,
             cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
             deadline         TIMESTAMPTZ,
+            worker_version   TEXT,
             next_attempt_at  TIMESTAMPTZ,
             created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -874,6 +1008,15 @@ mod postgres {
         ALTER TABLE server_tasks
             ADD COLUMN IF NOT EXISTS receipt JSONB";
 
+    /// Wave-3 additive column for databases whose `server_tasks` predates
+    /// version pinning: the exact worker version string the claim path may
+    /// lease the task to (`NULL` = unpinned, any worker). TEXT like the
+    /// other taxonomy-adjacent columns; exact-match filtering only, so no
+    /// index beyond the claimable one is needed.
+    pub(crate) const ALTER_TASKS_ADD_WORKER_VERSION_SQL: &str = "
+        ALTER TABLE server_tasks
+            ADD COLUMN IF NOT EXISTS worker_version TEXT";
+
     /// `server_outbox`: the transactional outbox (R0.6 wave 2b). One row per
     /// pending task submission, 1:1 with the task it carries (`outbox_id` is
     /// the task id — re-writing the same row is a no-op). The task travels
@@ -910,6 +1053,7 @@ mod postgres {
         ALTER_TASKS_ADD_CANCEL_REQUESTED_SQL,
         ALTER_TASKS_ADD_DEADLINE_SQL,
         ALTER_TASKS_ADD_RECEIPT_SQL,
+        ALTER_TASKS_ADD_WORKER_VERSION_SQL,
         CREATE_OUTBOX_SQL,
         CREATE_OUTBOX_PENDING_INDEX_SQL,
     ];
@@ -1007,9 +1151,9 @@ mod postgres {
         INSERT INTO server_tasks (
             task_id, tenant, kind, payload, pool, status,
             attempt, max_attempts, error_class, effect, idempotency_key,
-            run_id, thread_id, deadline, next_attempt_at, created_at, updated_at
+            run_id, thread_id, deadline, worker_version, next_attempt_at, created_at, updated_at
         ) VALUES (
-            $1, $2, $3, $4, $5, 'queued', 0, $6, NULL, $7, $8, $9, $10, $11, NULL, $12, $12
+            $1, $2, $3, $4, $5, 'queued', 0, $6, NULL, $7, $8, $9, $10, $11, $12, NULL, $13, $13
         )
         ON CONFLICT DO NOTHING
         RETURNING task_id";
@@ -1018,7 +1162,7 @@ mod postgres {
     pub(crate) const SELECT_TASK_BY_IDEMPOTENCY_SQL: &str = "
         SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, receipt, next_attempt_at, created_at, updated_at
+            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, next_attempt_at, created_at, updated_at
         FROM server_tasks
         WHERE tenant = $1 AND idempotency_key = $2";
 
@@ -1044,10 +1188,22 @@ mod postgres {
     /// SKIP LOCKED` makes concurrent workers take distinct tasks without
     /// blocking each other. Claimable = queued, backoff-elapsed failed, or
     /// leased past its visibility timeout.
+    ///
+    /// Wave-3 placement predicates: `$4` is the list of pools already at
+    /// their configured concurrency limit (computed by
+    /// [`CLAIM_INFLIGHT_SQL`] in the same transaction), excluded so one
+    /// saturated pool never starves the others; `$5` is the worker's
+    /// advertised version, matched exactly against the task's pin — NULL
+    /// (unpinned) tasks match everyone, a NULL advertisement matches only
+    /// unpinned tasks. This is the SQL spelling of
+    /// [`crate::tasks::TaskRecord::matches_worker_version`]; the two must
+    /// agree.
     pub(crate) const CLAIM_SELECT_SQL: &str = "
         SELECT task_id, attempt FROM server_tasks
         WHERE tenant = $1
           AND pool = ANY($2)
+          AND NOT (pool = ANY($4))
+          AND (worker_version IS NULL OR worker_version = $5)
           AND (
               (status IN ('queued', 'failed')
                   AND (next_attempt_at IS NULL OR next_attempt_at <= $3))
@@ -1056,6 +1212,17 @@ mod postgres {
         ORDER BY created_at, task_id
         LIMIT 1
         FOR UPDATE SKIP LOCKED";
+
+    /// Live-lease counts per pool, run before [`CLAIM_SELECT_SQL`] in the
+    /// same transaction: pools at their configured limit go into `$4` of
+    /// the candidate select. Only *unexpired* leases hold capacity — an
+    /// expired lease's task is visible again. Restricted to the limited
+    /// pools (`$3`): counting the whole tenant's leases on every claim
+    /// would make unconfigured pools pay for limits they never asked for.
+    pub(crate) const CLAIM_INFLIGHT_SQL: &str = "
+        SELECT pool, COUNT(*) AS live FROM server_tasks
+        WHERE tenant = $1 AND status = 'leased' AND lease_expires_at > $2 AND pool = ANY($3)
+        GROUP BY pool";
 
     /// The claim itself, applied to the row locked by [`CLAIM_SELECT_SQL`]
     /// in the same transaction.
@@ -1066,7 +1233,7 @@ mod postgres {
         WHERE task_id = $1
         RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, receipt, next_attempt_at, created_at, updated_at";
+            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, next_attempt_at, created_at, updated_at";
 
     /// Heartbeat: extends the lease only while the caller holds it. No row
     /// means unknown/cross-tenant (404) or lease lost (409), distinguished
@@ -1078,7 +1245,7 @@ mod postgres {
         WHERE task_id = $1 AND tenant = $2 AND lease_owner = $3 AND status = 'leased'
         RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, receipt, next_attempt_at, created_at, updated_at";
+            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, next_attempt_at, created_at, updated_at";
 
     /// Complete: settle only the caller's own lease, storing the result and
     /// the effect receipt the worker reported with it (`$6`, JSONB — `NULL`
@@ -1091,14 +1258,14 @@ mod postgres {
         WHERE task_id = $1 AND tenant = $2 AND lease_owner = $3 AND status = 'leased'
         RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, receipt, next_attempt_at, created_at, updated_at";
+            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, next_attempt_at, created_at, updated_at";
 
     /// Fail, step 1: lock the row (the requeue-vs-dead decision needs the
     /// current attempt count, and concurrent settlement must serialize).
     pub(crate) const FAIL_SELECT_SQL: &str = "
         SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, receipt, next_attempt_at, created_at, updated_at
+            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, next_attempt_at, created_at, updated_at
         FROM server_tasks
         WHERE task_id = $1 AND tenant = $2
         FOR UPDATE";
@@ -1113,14 +1280,14 @@ mod postgres {
         WHERE task_id = $1
         RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, receipt, next_attempt_at, created_at, updated_at";
+            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, next_attempt_at, created_at, updated_at";
 
     /// Cancel, step 1: lock the row (the terminal check and the transition
     /// must serialize against claims and settlements).
     pub(crate) const CANCEL_SELECT_SQL: &str = "
         SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, receipt, next_attempt_at, created_at, updated_at
+            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, next_attempt_at, created_at, updated_at
         FROM server_tasks
         WHERE task_id = $1 AND tenant = $2
         FOR UPDATE";
@@ -1137,7 +1304,7 @@ mod postgres {
         WHERE task_id = $1
         RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, receipt, next_attempt_at, created_at, updated_at";
+            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, next_attempt_at, created_at, updated_at";
 
     /// Run cancel, part 1: the run's non-leased, non-terminal tasks move to
     /// the terminal `cancelled` state immediately.
@@ -1149,7 +1316,7 @@ mod postgres {
           AND (status = 'queued' OR (status = 'failed' AND next_attempt_at IS NOT NULL))
         RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, receipt, next_attempt_at, created_at, updated_at";
+            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, next_attempt_at, created_at, updated_at";
 
     /// Run cancel, part 2: the run's leased tasks keep their leases and
     /// get `cancel_requested` set — their holders learn on the next
@@ -1160,7 +1327,7 @@ mod postgres {
         WHERE tenant = $1 AND run_id = $2 AND status = 'leased'
         RETURNING task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, receipt, next_attempt_at, created_at, updated_at";
+            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, next_attempt_at, created_at, updated_at";
 
     /// Tenant-scoped existence probe distinguishing 404 from 409 after a
     /// lease-guarded update matched no row.
@@ -1170,22 +1337,61 @@ mod postgres {
     pub(crate) const SELECT_TASK_SQL: &str =
         "SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, receipt, next_attempt_at, created_at, updated_at
+            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, next_attempt_at, created_at, updated_at
         FROM server_tasks WHERE task_id = $1 AND tenant = $2";
 
     pub(crate) const LIST_TASKS_SQL: &str = "
         SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, receipt, next_attempt_at, created_at, updated_at
+            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, next_attempt_at, created_at, updated_at
         FROM server_tasks
         WHERE tenant = $1 ORDER BY created_at, task_id";
 
     pub(crate) const LIST_TASKS_BY_STATUS_SQL: &str = "
         SELECT task_id, tenant, kind, payload, pool, status, lease_owner, lease_expires_at, \
             attempt, max_attempts, error_class, effect, last_error, idempotency_key, result, \
-            run_id, thread_id, cancel_requested, deadline, receipt, next_attempt_at, created_at, updated_at
+            run_id, thread_id, cancel_requested, deadline, receipt, worker_version, next_attempt_at, created_at, updated_at
         FROM server_tasks
         WHERE tenant = $1 AND status = $2 ORDER BY created_at, task_id";
+
+    /// The tenant's queue pressure (R0.6 wave 3) in one statement: the
+    /// three gauges [`crate::tasks::TaskUsage`] defines — backlog (queued +
+    /// retry-scheduled + pending outbox rows), in flight (status `leased`),
+    /// DLQ depth. `FILTER` keeps it one pass over the tenant's rows, and the
+    /// outbox count rides along as a subquery so the whole read is a single
+    /// MVCC snapshot: two statements would let a relay publish slip between
+    /// them and the moving row would be counted by neither.
+    pub(crate) const TASK_USAGE_SQL: &str = "
+        SELECT
+            COUNT(*) FILTER (WHERE status = 'queued'
+                OR (status = 'failed' AND next_attempt_at IS NOT NULL)) AS queued,
+            COUNT(*) FILTER (WHERE status = 'leased') AS in_flight,
+            COUNT(*) FILTER (WHERE status = 'dead') AS dlq,
+            (SELECT COUNT(*) FROM server_outbox
+                WHERE tenant = $1 AND published_at IS NULL) AS pending_outbox
+        FROM server_tasks
+        WHERE tenant = $1";
+
+    /// Per-pool autoscaling signals (R0.6 wave 3) for `GET /tasks/metrics`,
+    /// in one grouped scan at `$2` = now. Mirrors the JSON backend's
+    /// `task_pool_stats` exactly: backlog counts due *and* scheduled
+    /// retries; `leased` counts only unexpired leases (the saturation
+    /// numerator); `oldest_visible_at` is the oldest task a claim right now
+    /// would hand out. Pools with no rows are absent — the route adds
+    /// configured-but-empty pools itself.
+    pub(crate) const POOL_STATS_SQL: &str = "
+        SELECT
+            pool,
+            COUNT(*) FILTER (WHERE status = 'queued'
+                OR (status = 'failed' AND next_attempt_at IS NOT NULL)) AS queue_depth,
+            COUNT(*) FILTER (WHERE status = 'leased' AND lease_expires_at > $2) AS leased,
+            MIN(created_at) FILTER (WHERE status = 'queued'
+                OR (status = 'failed' AND next_attempt_at IS NOT NULL AND next_attempt_at <= $2)
+                OR (status = 'leased' AND lease_expires_at <= $2)) AS oldest_visible_at
+        FROM server_tasks
+        WHERE tenant = $1
+        GROUP BY pool
+        ORDER BY pool";
 
     // -- Transactional outbox statements (R0.6 wave 2b) ------------------ //
 
@@ -1323,6 +1529,7 @@ mod postgres {
             thread_id: row.get("thread_id"),
             cancel_requested: row.get("cancel_requested"),
             deadline: row.get("deadline"),
+            worker_version: row.get("worker_version"),
             next_attempt_at: row.get("next_attempt_at"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
@@ -1352,6 +1559,7 @@ mod postgres {
             .bind(&record.run_id)
             .bind(&record.thread_id)
             .bind(record.deadline)
+            .bind(&record.worker_version)
             .bind(record.created_at)
     }
 
@@ -1664,7 +1872,7 @@ mod postgres {
             &self,
             tenant: &str,
             worker_id: &str,
-            pools: &[String],
+            scope: &tasks::ClaimScope<'_>,
             lease_ms: u64,
             now: DateTime<Utc>,
         ) -> StoreResult<Option<TaskRecord>> {
@@ -1683,10 +1891,42 @@ mod postgres {
                 .execute(&mut *tx)
                 .await
                 .map_err(db_err("claim task finalization"))?;
+            // Pool capacity (wave 3): pools at their configured live-lease
+            // limit are excluded from the candidate select, so one
+            // saturated pool never starves the others. Counted in the same
+            // transaction as the claim — though concurrent claim
+            // transactions do not serialize against each other, so racing
+            // claims can transiently overshoot a pool's cap by up to the
+            // number of racers (see the trait's `claim_task` contract: a
+            // guardrail, not a hard invariant).
+            let saturated: Vec<String> = if scope.pool_limits.is_empty() {
+                Vec::new()
+            } else {
+                let limited: Vec<&String> = scope.pool_limits.keys().collect();
+                let counts = sqlx::query(CLAIM_INFLIGHT_SQL)
+                    .bind(tenant)
+                    .bind(now)
+                    .bind(&limited)
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(db_err("claim task pool capacity"))?;
+                let mut saturated = Vec::new();
+                for row in counts {
+                    let name: String = row.get("pool");
+                    let live = u64::try_from(row.get::<i64, _>("live"))
+                        .map_err(|_| "corrupt lease count (negative)".to_string())?;
+                    if live >= scope.pool_limits[&name] as u64 {
+                        saturated.push(name);
+                    }
+                }
+                saturated
+            };
             let candidate = sqlx::query(CLAIM_SELECT_SQL)
                 .bind(tenant)
-                .bind(pools.to_vec())
+                .bind(scope.pools.to_vec())
                 .bind(now)
+                .bind(&saturated)
+                .bind(scope.worker_version)
                 .fetch_optional(&mut *tx)
                 .await
                 .map_err(db_err("claim task"))?;
@@ -1909,6 +2149,51 @@ mod postgres {
                     .map(task_from_row)
                     .collect::<StoreResult<Vec<_>>>()?,
             })
+        }
+
+        async fn task_usage(&self, tenant: &str) -> StoreResult<tasks::TaskUsage> {
+            let pool = self.pool().await?;
+            let row = sqlx::query(TASK_USAGE_SQL)
+                .bind(tenant)
+                .fetch_one(pool)
+                .await
+                .map_err(db_err("task usage"))?;
+            let count = |column: &str| {
+                u64::try_from(row.get::<i64, _>(column))
+                    .map_err(|_| format!("corrupt task usage count `{column}` (negative)"))
+            };
+            Ok(tasks::TaskUsage {
+                queued: count("queued")? + count("pending_outbox")?,
+                in_flight: count("in_flight")?,
+                dlq: count("dlq")?,
+            })
+        }
+
+        async fn task_pool_stats(
+            &self,
+            tenant: &str,
+            now: DateTime<Utc>,
+        ) -> StoreResult<Vec<tasks::PoolStat>> {
+            let rows = sqlx::query(POOL_STATS_SQL)
+                .bind(tenant)
+                .bind(now)
+                .fetch_all(self.pool().await?)
+                .await
+                .map_err(db_err("task pool stats"))?;
+            rows.iter()
+                .map(|row| {
+                    let count = |column: &str| {
+                        u64::try_from(row.get::<i64, _>(column))
+                            .map_err(|_| format!("corrupt pool stat `{column}` (negative)"))
+                    };
+                    Ok(tasks::PoolStat {
+                        pool: row.get("pool"),
+                        queue_depth: count("queue_depth")?,
+                        leased: count("leased")?,
+                        oldest_visible_at: row.get("oldest_visible_at"),
+                    })
+                })
+                .collect()
         }
 
         async fn outbox_enqueue(&self, record: &TaskRecord) -> StoreResult<(TaskRecord, bool)> {
@@ -2215,7 +2500,7 @@ mod postgres {
 
         #[test]
         fn migration_sql_creates_all_tables_idempotently() {
-            assert_eq!(MIGRATION_SQL.len(), 13);
+            assert_eq!(MIGRATION_SQL.len(), 14);
             for stmt in MIGRATION_SQL {
                 assert!(
                     stmt.contains("IF NOT EXISTS"),
@@ -2243,6 +2528,9 @@ mod postgres {
             assert!(ALTER_TASKS_ADD_DEADLINE_SQL.contains("ALTER TABLE server_tasks"));
             assert!(ALTER_TASKS_ADD_RECEIPT_SQL.contains("ALTER TABLE server_tasks"));
             assert!(ALTER_TASKS_ADD_RECEIPT_SQL.contains("JSONB"));
+            // Wave 3: the version pin arrives the same additive way.
+            assert!(ALTER_TASKS_ADD_WORKER_VERSION_SQL.contains("ALTER TABLE server_tasks"));
+            assert!(ALTER_TASKS_ADD_WORKER_VERSION_SQL.contains("worker_version TEXT"));
             // The outbox table: 1:1 with its task, pending until published.
             assert!(CREATE_OUTBOX_SQL.contains("server_outbox"));
             assert!(CREATE_OUTBOX_SQL.contains("TEXT PRIMARY KEY"));
@@ -2267,6 +2555,7 @@ mod postgres {
                 "cancel_requested",
                 "deadline",
                 "receipt",
+                "worker_version",
             ] {
                 assert!(CREATE_TASKS_SQL.contains(col), "missing column {col}");
             }
@@ -2284,6 +2573,14 @@ mod postgres {
             assert!(CLAIM_SELECT_SQL.contains("status IN ('queued', 'failed')"));
             assert!(CLAIM_SELECT_SQL.contains("status = 'leased'"));
             assert!(CLAIM_SELECT_SQL.contains("lease_expires_at <= $3"));
+            // Wave 3: saturated pools are excluded and the version pin
+            // matches exactly (NULL pin = any worker; NULL advertisement =
+            // unpinned tasks only), mirroring
+            // `TaskRecord::matches_worker_version`.
+            assert!(CLAIM_SELECT_SQL.contains("NOT (pool = ANY($4))"));
+            assert!(CLAIM_SELECT_SQL.contains("worker_version IS NULL OR worker_version = $5"));
+            assert!(CLAIM_INFLIGHT_SQL.contains("status = 'leased'"));
+            assert!(CLAIM_INFLIGHT_SQL.contains("lease_expires_at > $2"));
             assert!(CLAIM_UPDATE_SQL.contains("status = 'leased'"));
             assert!(CLAIM_UPDATE_SQL.contains("next_attempt_at = NULL"));
             // Finalization turns unanswered cancels and elapsed deadlines
@@ -2335,6 +2632,26 @@ mod postgres {
             // ON CONFLICT, so a duplicate id aborts the whole transaction.
             assert!(INSERT_CHECKPOINT_SQL.contains("INSERT INTO rusty_checkpoints"));
             assert!(!INSERT_CHECKPOINT_SQL.to_uppercase().contains("ON CONFLICT"));
+        }
+
+        #[test]
+        fn usage_and_pool_stats_sql_match_the_json_backends_gauges() {
+            // The quota gauges: backlog counts scheduled retries, in-flight
+            // is status-based, pending outbox rows count as queued.
+            assert!(TASK_USAGE_SQL.contains("status = 'queued'"));
+            assert!(TASK_USAGE_SQL.contains("status = 'failed' AND next_attempt_at IS NOT NULL"));
+            assert!(TASK_USAGE_SQL.contains("status = 'leased'"));
+            assert!(TASK_USAGE_SQL.contains("status = 'dead'"));
+            // The pending-outbox count rides in the same statement (one
+            // MVCC snapshot), not a second query.
+            assert!(TASK_USAGE_SQL.contains("FROM server_outbox"));
+            assert!(TASK_USAGE_SQL.contains("published_at IS NULL"));
+            // The autoscaling signals: saturation counts only live leases;
+            // visibility is the claim path's own rule (queued, backoff-
+            // elapsed, or lease-expired).
+            assert!(POOL_STATS_SQL.contains("status = 'leased' AND lease_expires_at > $2"));
+            assert!(POOL_STATS_SQL.contains("status = 'leased' AND lease_expires_at <= $2"));
+            assert!(POOL_STATS_SQL.contains("GROUP BY pool"));
         }
 
         #[test]
@@ -2492,6 +2809,7 @@ mod postgres {
                     run_id: None,
                     thread_id: None,
                     deadline: None,
+                    worker_version: None,
                 },
                 Utc::now(),
             )

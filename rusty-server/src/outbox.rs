@@ -200,6 +200,7 @@ mod tests {
                 run_id: None,
                 thread_id: None,
                 deadline: None,
+                worker_version: None,
             },
             Utc::now(),
         )

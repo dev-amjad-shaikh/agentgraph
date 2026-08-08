@@ -285,6 +285,21 @@ pub struct TaskEnvelope {
     /// or a specific worker identity for pinned placement.
     pub recipient: String,
 
+    /// Version pin (R0.6 wave 3): the exact worker version string this task
+    /// may be dispatched to. A run started against worker version `w1`
+    /// stamps its tasks with `w1`, so a mid-run deploy never changes
+    /// semantics under an in-flight execution — the scheduler keeps handing
+    /// the task to `w1`-advertising workers until it finishes.
+    ///
+    /// The pin is an *exact string match*, deliberately: semver range
+    /// matching (`^1.4`) makes a claim's outcome depend on the version
+    /// grammar's rules rather than on what the run actually recorded, and
+    /// range resolution belongs to the scheduler's policy, not to a frozen
+    /// wire contract. Ranges are documented future work; `None` (the
+    /// default) means unpinned — any worker may claim the task.
+    #[serde(default)]
+    pub worker_version: Option<String>,
+
     /// The task input, inline or content-addressed. Small inputs travel
     /// inside the queue row; large ones are artifacts the recipient resolves
     /// through the journal's artifact map.
@@ -347,6 +362,7 @@ impl TaskEnvelope {
             parent: None,
             sender: sender.into(),
             recipient: recipient.into(),
+            worker_version: None,
             input,
             output_contract: None,
             deadline: None,
@@ -481,6 +497,7 @@ mod tests {
         assert_eq!(envelope.effect, Effect::NonIdempotent);
         assert!(envelope.parent.is_none());
         assert!(envelope.idempotency_key.is_none());
+        assert!(envelope.worker_version.is_none());
         assert!(envelope.deadline.is_none());
         assert!(envelope.budget.is_none());
     }
@@ -504,6 +521,7 @@ mod tests {
             timeout_ms: Some(30_000),
         });
         envelope.idempotency_key = Some("run-9:charge:7".into());
+        envelope.worker_version = Some("activity-worker/1.4.0".into());
         envelope.effect = Effect::Idempotent;
 
         let back: TaskEnvelope =

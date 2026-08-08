@@ -296,22 +296,51 @@ point for a later wave.
 
 ## Pools, quotas, version pinning, autoscaling signals (wave 3)
 
-- **Named pools** with per-pool concurrency limits: the envelope's
-  `recipient` is a pool name; the scheduler hands out leases up to the
-  pool's limit. A GPU-bound pool and an IO-bound pool coexist without
-  starving each other.
-- **Tenant quotas** — tasks queued, tasks in flight, DLQ depth — enforced
-  at submission under the existing `{tenant}/` id-namespacing isolation;
-  cross-tenant tasks do not exist, as with every other server resource.
-- **Version pinning** for in-flight runs: a run started against worker
-  version `w1` keeps dispatching its tasks to `w1`-capable workers until it
-  finishes, so a deploy mid-run never changes semantics under an in-flight
-  execution (the same fork-first conservatism as time travel).
-- **Autoscaling signals** are metrics, not mechanisms: queue depth,
-  oldest-visible-task age, lease saturation per pool. Rusty publishes the
-  signals; the autoscaler is the operator's HPA/KEDA/etc. Evidence over
-  claims: wave 3 ships with published numbers for these signals under load,
-  against the [benchmarks](benchmarks.md) baseline.
+**Implemented (wave 3a).** The run-side wiring — an executor pinning a
+run's tasks to the worker version that started it — is the documented
+later integration point; the queue-side mechanics below are live today.
+
+- **Named pools** with per-pool concurrency limits (`ServerConfig::
+  with_pool_limit(pool, max)`; unconfigured pools stay uncapped, and a
+  limit of `0` pauses a pool). The claim path counts the pool's
+  *unexpired* leases and skips a saturated pool, so a GPU-bound pool and
+  an IO-bound pool coexist without starving each other, and an expired
+  lease holds no capacity. Honest edge, by design: on Postgres the count
+  and the claim are one transaction, but two concurrent claim
+  transactions can each see the pool one lease short of the cap and both
+  succeed — the limit is a guardrail, not an invariant.
+- **Tenant quotas** — tasks queued, tasks in flight, DLQ depth
+  (`ServerConfig::with_task_quota` for the server-wide default,
+  `with_tenant_quota` per tenant) — enforced at submission under the
+  existing `{tenant}/` id-namespacing isolation: `POST /tasks`,
+  `POST /tasks/outbox`, and `update_state`'s `enqueue` answer
+  `429 quota_exceeded` (naming the gauge) before any write, preserving
+  `update_state`'s all-or-nothing contract. "Queued" counts the whole
+  accepted backlog — queued tasks, retry-scheduled failures, *and*
+  pending outbox rows — so the outbox is not a quota bypass. Enforcement
+  is at submission on purpose: a submission check is a backpressure
+  signal, while work already accepted must still flow. A submission that
+  would have deduplicated on its idempotency key can also answer `429`
+  under pressure — safe (the pre-existing task is untouched) and simpler
+  than reaching inside the store's dedup decision.
+- **Version pinning** is an exact string match: a task carrying
+  `worker_version` is claimable only by a worker advertising that exact
+  string (`POST /tasks/claim`'s additive `worker_version`; the activity
+  worker sets it with `ActivityWorker::with_worker_version`), and the pin
+  survives retries until the task finishes, so a deploy mid-flight never
+  changes semantics under an in-flight execution (the same fork-first
+  conservatism as time travel). Semver ranges are deliberately future
+  work — exact match is the only rule that cannot surprise.
+- **Autoscaling signals** are metrics, not mechanisms: `GET
+  /tasks/metrics` reports, per pool and tenant-scoped like every other
+  server resource, the queue depth, the oldest visible task's age, the
+  live-lease count, the configured limit, and lease saturation
+  (`leased / limit`, `null` for uncapped pools) — configured-but-idle
+  pools report zeros rather than vanishing. Rusty publishes the signals;
+  the autoscaler is the operator's HPA/KEDA/etc. Published under-load
+  numbers for these signals against the [benchmarks](benchmarks.md)
+  baseline remain evidence work for a later wave — the endpoint ships;
+  the numbers do not yet.
 
 ## Composition with the Flight Recorder
 

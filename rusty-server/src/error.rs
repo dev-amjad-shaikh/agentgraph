@@ -31,6 +31,14 @@ impl ApiError {
         Self::new(StatusCode::CONFLICT, "conflict", message)
     }
 
+    /// 429 — a tenant quota rejected the submission (R0.6 wave 3). 429, not
+    /// 409 or 503: the request is well-formed and the state is not
+    /// conflicting — the tenant is simply over its allowance, and standard
+    /// retry-after-backoff client behavior is exactly right.
+    pub fn too_many_requests(message: String) -> Self {
+        Self::new(StatusCode::TOO_MANY_REQUESTS, "quota_exceeded", message)
+    }
+
     /// 400 — malformed payload, unknown graph, bad strategy, non-object input.
     pub fn bad_request(message: String) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "bad_request", message)

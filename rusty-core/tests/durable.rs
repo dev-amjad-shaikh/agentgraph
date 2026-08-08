@@ -65,6 +65,7 @@ fn sample_task_envelope() -> TaskEnvelope {
         timeout_ms: Some(30_000),
     });
     envelope.idempotency_key = Some("019157c4-6f1f-7a3b-8c2d-9e4f5a6b7c8d:charge:7".into());
+    envelope.worker_version = Some("activity-worker/1.4.0".into());
     envelope.effect = Effect::Idempotent;
     envelope
 }

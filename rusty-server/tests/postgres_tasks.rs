@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use axum::body::{to_bytes, Body, Bytes};
 use axum::http::{Request, StatusCode};
 use axum::Router;
-use rusty_server::{router, GraphRegistry, ServerConfig};
+use rusty_server::{router, GraphRegistry, ServerConfig, TaskQuota};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -473,4 +473,204 @@ async fn postgres_cancel_and_claim_race_leaves_a_consistent_record() {
             other => panic!("incoherent race outcome: {other:?}"),
         }
     }
+}
+
+// --------------------------------------------------------------------- //
+// Pools, pinning, quotas, and signals (R0.6 wave 3a) — parity with the
+// file backend's `pools.rs`
+// --------------------------------------------------------------------- //
+
+#[tokio::test]
+#[ignore = "requires a live Postgres (DATABASE_URL)"]
+async fn postgres_pool_limits_pinning_and_metrics_match_the_file_backend() {
+    let pool = format!("pg-pools-{}", uniq());
+    let idle_pool = format!("pg-idle-{}", uniq());
+    // Tests in this file share the scratch database and run concurrently,
+    // and pre-existing tests claim across *all* pools in the default
+    // tenant — so this test works in its own tenant, where its tasks are
+    // invisible to every other test's claims (and theirs to its metrics).
+    let tenant = format!("pools-{}", uniq());
+    let secret = "pools-secret";
+    let store_path: PathBuf =
+        std::env::temp_dir().join(format!("rusty-server-pg-tasks-{}", uuid::Uuid::new_v4()));
+    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap(), store_path)
+        .with_postgres(database_url())
+        .with_tenant_key(&tenant, secret)
+        .with_pool_limit(&pool, 2)
+        .with_pool_limit(&idle_pool, 4);
+    let app = router(GraphRegistry::new(), config);
+    let auth = Some(("x-api-key", secret));
+
+    // One pinned, one unpinned task in the capped pool.
+    let version = format!("pg-worker/{}", uniq());
+    let (status, v) = call_as(
+        &app,
+        auth,
+        "POST",
+        "/tasks",
+        Some(json!({"kind": "plain", "payload": {}, "pool": pool})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "enqueue failed: {v}");
+    let (status, v) = call_as(
+        &app,
+        auth,
+        "POST",
+        "/tasks",
+        Some(json!({"kind": "pinned", "payload": {}, "pool": pool,
+                    "worker_version": version})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "pinned enqueue failed: {v}");
+
+    // An unversioned worker gets the unpinned task; the pinned one is
+    // invisible to it even with pool capacity to spare.
+    let (status, v) = call_as(
+        &app,
+        auth,
+        "POST",
+        "/tasks/claim",
+        Some(json!({"worker_id": "pg-w1", "pools": [pool], "lease_ms": 60_000})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "claim failed: {v}");
+    assert_eq!(v["task"]["kind"], json!("plain"));
+    let (status, _) = call_as(
+        &app,
+        auth,
+        "POST",
+        "/tasks/claim",
+        Some(json!({"worker_id": "pg-w1", "pools": [pool], "lease_ms": 60_000})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "unversioned worker saw pinned work"
+    );
+
+    // A different version does not match; the exact string does.
+    let (status, _) = call_as(
+        &app,
+        auth,
+        "POST",
+        "/tasks/claim",
+        Some(
+            json!({"worker_id": "pg-w2", "pools": [pool], "lease_ms": 60_000,
+                    "worker_version": format!("{version}-other")}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "wrong version saw pinned work"
+    );
+    let (status, v) = call_as(
+        &app,
+        auth,
+        "POST",
+        "/tasks/claim",
+        Some(
+            json!({"worker_id": "pg-w2", "pools": [pool], "lease_ms": 60_000,
+                    "worker_version": version}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "versioned claim failed: {v}");
+    assert_eq!(v["task"]["kind"], json!("pinned"));
+
+    // Both leases live: the pool is at its limit of 2, so a third worker
+    // gets nothing even though an uncapped pool would still hand out work.
+    let (status, _) = call_as(
+        &app,
+        auth,
+        "POST",
+        "/tasks/claim",
+        Some(json!({"worker_id": "pg-w3", "pools": [pool], "lease_ms": 60_000})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "saturated pool handed out work"
+    );
+
+    // The autoscaling signals: the capped pool reads fully saturated, and
+    // the configured-but-idle pool reports zeros rather than vanishing.
+    let (status, v) = call_as(&app, auth, "GET", "/tasks/metrics", None).await;
+    assert_eq!(status, StatusCode::OK, "metrics failed: {v}");
+    assert!(v["now"].is_string());
+    let pools = v["pools"].as_array().unwrap();
+    let entry = pools
+        .iter()
+        .find(|p| p["pool"] == json!(pool))
+        .expect("capped pool missing from metrics");
+    assert_eq!(entry["queue_depth"], json!(0));
+    assert_eq!(entry["leased"], json!(2));
+    assert_eq!(entry["concurrency_limit"], json!(2));
+    assert_eq!(entry["lease_saturation"], json!(1.0));
+    assert_eq!(entry["oldest_visible_task_age_ms"], Value::Null);
+    let idle = pools
+        .iter()
+        .find(|p| p["pool"] == json!(idle_pool))
+        .expect("configured-but-idle pool missing from metrics");
+    assert_eq!(idle["queue_depth"], json!(0));
+    assert_eq!(idle["leased"], json!(0));
+    assert_eq!(idle["concurrency_limit"], json!(4));
+    assert_eq!(idle["lease_saturation"], json!(0.0));
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres (DATABASE_URL)"]
+async fn postgres_quota_rejects_submission_with_429() {
+    // Tests in this file share the scratch database, so the quota attaches
+    // to a unique tenant — the default tenant carries other tests' rows.
+    let tenant = format!("quota-{}", uniq());
+    let secret = "quota-secret";
+    let store_path: PathBuf =
+        std::env::temp_dir().join(format!("rusty-server-pg-tasks-{}", uuid::Uuid::new_v4()));
+    let config = ServerConfig::new("127.0.0.1:0".parse().unwrap(), store_path)
+        .with_postgres(database_url())
+        .with_tenant_key(&tenant, secret)
+        .with_tenant_quota(
+            &tenant,
+            TaskQuota {
+                max_queued: Some(1),
+                ..TaskQuota::default()
+            },
+        );
+    let app = router(GraphRegistry::new(), config);
+    let auth = Some(("x-api-key", secret));
+
+    let (status, v) = call_as(
+        &app,
+        auth,
+        "POST",
+        "/tasks",
+        Some(json!({"kind": "work", "payload": {}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "first enqueue failed: {v}");
+
+    // Backlog at the cap: the next submission is refused, and the refusal
+    // names the gauge so an operator knows what to drain or raise.
+    let (status, v) = call_as(
+        &app,
+        auth,
+        "POST",
+        "/tasks",
+        Some(json!({"kind": "work", "payload": {}})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "over-quota enqueue: {v}"
+    );
+    assert_eq!(v["error"], json!("quota_exceeded"));
+    assert!(
+        v["message"].as_str().unwrap().contains("queued"),
+        "429 message must name the gauge: {v}"
+    );
 }

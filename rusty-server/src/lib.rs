@@ -50,9 +50,10 @@
 //! | `PUT /store/{ns}/{key}` | upsert a JSON value in a namespace (`201` create, `200` replace) |
 //! | `GET /store/{ns}/{key}` / `DELETE /store/{ns}/{key}` | fetch / delete one item |
 //! | `GET /store/{ns}` | list a namespace's items |
-//! | `POST /tasks` | R0.6 durable task queue: enqueue a task `{kind, payload, pool?, max_attempts?, idempotency_key?}` → `201 {task_id, deduplicated}` (`200` + `deduplicated: true` when the idempotency key already names a live task in this tenant) |
-//! | `POST /tasks/outbox` | R0.6 wave 2b: enqueue through the transactional outbox (same payload as `POST /tasks`) → `202 {task_id, deduplicated}`; the relay publishes the task into the queue within one poll interval, at-least-once, deduped on the idempotency key |
-//! | `POST /tasks/claim` | R0.6: claim the oldest claimable task `{worker_id, pools?, lease_ms}` → `200 {task}` with a fresh lease, `204` when nothing is claimable |
+//! | `POST /tasks` | R0.6 durable task queue: enqueue a task `{kind, payload, pool?, max_attempts?, idempotency_key?, worker_version?}` → `201 {task_id, deduplicated}` (`200` + `deduplicated: true` when the idempotency key already names a live task in this tenant; `429 quota_exceeded` when the tenant is over its wave-3 task quota — see `ServerConfig::with_task_quota`) |
+//! | `POST /tasks/outbox` | R0.6 wave 2b: enqueue through the transactional outbox (same payload as `POST /tasks`, same quota gate) → `202 {task_id, deduplicated}`; the relay publishes the task into the queue within one poll interval, at-least-once, deduped on the idempotency key |
+//! | `POST /tasks/claim` | R0.6: claim the oldest claimable task `{worker_id, pools?, worker_version?, lease_ms}` → `200 {task}` with a fresh lease, `204` when nothing is claimable. Wave 3: pools at their configured concurrency limit (`ServerConfig::with_pool_limit`) hand out nothing, and a task pinned with `worker_version` is leased only to a worker advertising that exact version |
+//! | `GET /tasks/metrics` | R0.6 wave 3: the autoscaling signals, tenant-scoped — per-pool queue depth, live leases, lease saturation against the configured limit, and oldest-visible-task age. Metrics, not a mechanism: the autoscaler is the operator's |
 //! | `POST /tasks/{id}/heartbeat` | R0.6: extend the held lease `{worker_id, lease_ms}` → `{lease_expires_at}`; `409` when the lease is lost |
 //! | `POST /tasks/{id}/complete` | R0.6: settle the held lease `{worker_id, result, receipt?}` → updated task record; `409` when the lease is lost. The optional `receipt` (wave 2b: `{provider, provider_id, idempotency_key, task_id?}`) is the worker's report of an idempotent effect's provider confirmation; the server journals it into the task's run as an `effect_receipt` event |
 //! | `POST /tasks/{id}/fail` | R0.6: record a failed attempt `{worker_id, error_class, message, retryable}` → `{requeued, next_attempt_at, dead}` (backoff + jitter requeue, or dead-letter); `409` when the lease is lost |
@@ -189,6 +190,55 @@ impl GraphRegistry {
     }
 }
 
+/// Tenant quota for the durable task queue (R0.6 wave 3): three gauges,
+/// each capped independently — tasks queued, tasks in flight, dead-letter
+/// depth — enforced at **submission** (`POST /tasks`, `POST /tasks/outbox`,
+/// and `update_state`'s atomic `enqueue` list). Over quota answers `429
+/// quota_exceeded`, the honest shape for "retry this submission later".
+///
+/// The gauges are the store's `TaskUsage` definitions: the backlog
+/// counts scheduled retries *and* outbox rows pending publication (a flood
+/// through the outbox must not bypass the quota), in flight counts every
+/// `leased` record, and the DLQ counts because an unbounded dead-letter
+/// queue is a quiet disk-full outage. `None` (the default for every field)
+/// means unlimited, preserving pre-wave-3 behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TaskQuota {
+    /// Cap on the tenant's backlog (queued + retry-scheduled + pending
+    /// outbox rows). A submission that would push the backlog past the cap
+    /// is rejected.
+    pub max_queued: Option<usize>,
+
+    /// Cap on tasks in flight (status `leased`). Pure backpressure: a
+    /// tenant already at the cap has its new submissions rejected until
+    /// workers settle.
+    pub max_in_flight: Option<usize>,
+
+    /// Cap on dead-letter depth. A tenant at the cap must inspect and
+    /// re-drive its DLQ before more work is accepted.
+    pub max_dlq: Option<usize>,
+}
+
+impl TaskQuota {
+    /// Every gauge capped: `TaskQuota { max_queued: Some(q),
+    /// max_in_flight: Some(f), max_dlq: Some(d) }`. Field-by-field
+    /// construction works too — the struct's fields are public and each
+    /// `None` means unlimited.
+    pub fn capped(max_queued: usize, max_in_flight: usize, max_dlq: usize) -> Self {
+        Self {
+            max_queued: Some(max_queued),
+            max_in_flight: Some(max_in_flight),
+            max_dlq: Some(max_dlq),
+        }
+    }
+
+    /// `true` when no gauge is capped — the quota gate short-circuits
+    /// without a store read (the default configuration's fast path).
+    pub(crate) fn is_unlimited(&self) -> bool {
+        self.max_queued.is_none() && self.max_in_flight.is_none() && self.max_dlq.is_none()
+    }
+}
+
 /// Server configuration.
 ///
 /// Checkpointing is rooted at `store_path` via
@@ -256,6 +306,26 @@ pub struct ServerConfig {
     /// regardless. Runs stopped by the drain are resumable from their last
     /// checkpoint, so a short grace costs a resume, never work.
     pub shutdown_grace: std::time::Duration,
+
+    /// Per-pool in-flight caps for the durable task queue (R0.6 wave 3):
+    /// pool name → maximum live leases. The claim path counts a pool's
+    /// unexpired leases and stops handing out new ones at the cap, so
+    /// pools coexist without starving each other (a saturated GPU pool
+    /// never blocks IO-pool claims). Pools without an entry are
+    /// uncapped — the pre-wave-3 behavior. See
+    /// [`ServerConfig::with_pool_limit`].
+    pub task_pool_limits: HashMap<String, usize>,
+
+    /// The default tenant quota (R0.6 wave 3), applied to every tenant
+    /// without an entry in [`ServerConfig::tenant_task_quotas`]. All
+    /// gauges uncapped by default. See [`TaskQuota`].
+    pub task_quota: TaskQuota,
+
+    /// Per-tenant quota overrides (R0.6 wave 3), replacing
+    /// [`ServerConfig::task_quota`] wholesale for the named tenant (an
+    /// override *is* the tenant's quota, not a patch on the default).
+    /// See [`ServerConfig::with_tenant_quota`].
+    pub tenant_task_quotas: HashMap<String, TaskQuota>,
 }
 
 impl Default for ServerConfig {
@@ -270,6 +340,9 @@ impl Default for ServerConfig {
             event_log_capacity: 1000,
             outbox_relay_interval: crate::outbox::DEFAULT_RELAY_INTERVAL,
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
+            task_pool_limits: HashMap::new(),
+            task_quota: TaskQuota::default(),
+            tenant_task_quotas: HashMap::new(),
         }
     }
 }
@@ -386,6 +459,71 @@ impl ServerConfig {
     pub fn with_shutdown_grace(mut self, grace: std::time::Duration) -> Self {
         self.shutdown_grace = grace;
         self
+    }
+
+    /// Builder-style: cap the named pool's live leases (R0.6 wave 3). The
+    /// claim path counts a pool's unexpired leases and stops handing out
+    /// new ones at `max_in_flight`, so a saturated pool (GPU-bound work)
+    /// never starves the others (IO-bound work). A cap of `0` pauses the
+    /// pool: nothing is leased from it until the cap is raised. Pools
+    /// without an entry stay uncapped.
+    ///
+    /// # Panics
+    ///
+    /// Panics on an invalid pool name (configuration is a programmer error,
+    /// caught at startup); names must match `[A-Za-z0-9._-]` (1–128 chars),
+    /// the same rule the enqueue and claim paths validate.
+    pub fn with_pool_limit(mut self, pool: impl Into<String>, max_in_flight: usize) -> Self {
+        let pool = pool.into();
+        assert!(
+            crate::tasks::validate_pool(&pool).is_ok(),
+            "invalid pool name `{pool}` (allowed: [A-Za-z0-9._-], 1..=128 chars)"
+        );
+        self.task_pool_limits.insert(pool, max_in_flight);
+        self
+    }
+
+    /// Builder-style: set the default tenant quota for the durable task
+    /// queue (R0.6 wave 3), applied to every tenant without a
+    /// [`ServerConfig::with_tenant_quota`] override. Over quota, task
+    /// submissions answer `429 quota_exceeded`. The default is uncapped on
+    /// every gauge. See [`TaskQuota`] for the gauge definitions.
+    pub fn with_task_quota(mut self, quota: TaskQuota) -> Self {
+        self.task_quota = quota;
+        self
+    }
+
+    /// Builder-style: override the task quota for one tenant (R0.6 wave 3).
+    /// The override replaces [`ServerConfig::task_quota`] wholesale for
+    /// that tenant — an uncapped gauge in the override is unlimited even if
+    /// the default caps it.
+    ///
+    /// # Panics
+    ///
+    /// Panics on an invalid tenant id (same rule as
+    /// [`ServerConfig::with_tenant_key`]).
+    pub fn with_tenant_quota(mut self, tenant: impl Into<String>, quota: TaskQuota) -> Self {
+        let tenant = tenant.into();
+        let valid = !tenant.is_empty()
+            && tenant.len() <= 64
+            && tenant
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+            && !RESERVED_NAMES.contains(&tenant.as_str());
+        assert!(
+            valid,
+            "invalid tenant id `{tenant}` (allowed: [A-Za-z0-9._-], 1..=64 chars, not a reserved name)"
+        );
+        self.tenant_task_quotas.insert(tenant, quota);
+        self
+    }
+
+    /// The quota governing `tenant`: its override when one is configured,
+    /// else the server-wide default ([`ServerConfig::task_quota`]).
+    pub(crate) fn quota_for(&self, tenant: &str) -> &TaskQuota {
+        self.tenant_task_quotas
+            .get(tenant)
+            .unwrap_or(&self.task_quota)
     }
 }
 

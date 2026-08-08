@@ -27,6 +27,17 @@
 //! server-minted UUIDs; tenant isolation goes through the record's `tenant`
 //! field (set from the request's [`crate::auth::TenantContext`]), which every
 //! store operation is scoped by — a cross-tenant id simply does not resolve.
+//!
+//! Wave 3 layers placement and pressure controls onto the same records:
+//! named pools carry per-pool concurrency limits (the claim path counts live
+//! leases against the configured cap and stops handing out leases at it, so
+//! a GPU-bound pool and an IO-bound pool coexist without starving each
+//! other), tenant quotas cap tasks queued / in flight / dead-lettered at
+//! submission (`429`), an optional exact-match `worker_version` pin keeps a
+//! run dispatching to the worker version it started against, and
+//! `GET /tasks/metrics` publishes the per-pool autoscaling signals (queue
+//! depth, oldest-visible age, lease saturation) an operator's autoscaler
+//! consumes — metrics, never a built-in autoscaler.
 
 use std::collections::HashMap;
 use std::io;
@@ -205,6 +216,14 @@ pub(crate) struct TaskRecord {
     /// [`ErrorClass::Cancelled`] — deadline expiry is cancellation by clock.
     #[serde(default)]
     pub deadline: Option<DateTime<Utc>>,
+    /// Version pin (R0.6 wave 3): the exact worker version string the claim
+    /// path may lease this task to. A run stamps its tasks with the worker
+    /// version it started against, so a mid-run deploy never changes
+    /// semantics under an in-flight execution. `None` (the default) means
+    /// unpinned — any worker may claim it. Exact string match only; semver
+    /// ranges are documented future work (see `docs/durable-work-design.md`).
+    #[serde(default)]
+    pub worker_version: Option<String>,
     /// When a `failed` task becomes claimable again (`None` while queued,
     /// leased, or terminal).
     #[serde(default)]
@@ -229,6 +248,8 @@ pub(crate) struct NewTask {
     pub run_id: Option<String>,
     pub thread_id: Option<String>,
     pub deadline: Option<DateTime<Utc>>,
+    /// Version pin (see [`TaskRecord::worker_version`]).
+    pub worker_version: Option<String>,
 }
 
 /// A worker's report of a failed attempt: the shared [`ErrorClass`]
@@ -256,6 +277,7 @@ impl TaskRecord {
             run_id,
             thread_id,
             deadline,
+            worker_version,
         } = new;
         Self {
             task_id,
@@ -277,6 +299,7 @@ impl TaskRecord {
             thread_id,
             cancel_requested: false,
             deadline,
+            worker_version,
             next_attempt_at: None,
             created_at: now,
             updated_at: now,
@@ -293,6 +316,18 @@ impl TaskRecord {
             TaskStatus::Leased => self.lease.as_ref().is_some_and(|l| l.expires_at <= now),
             TaskStatus::Completed | TaskStatus::Dead | TaskStatus::Cancelled => false,
         }
+    }
+
+    /// `true` when a worker advertising `worker_version` may claim this
+    /// task (R0.6 wave 3): an unpinned task matches any worker — including
+    /// one advertising no version — while a pinned task matches only the
+    /// exact version string it names. The Postgres claim path expresses the
+    /// same rule in SQL (`worker_version IS NULL OR worker_version = $5`);
+    /// the two must agree, and the SQL-shape tests pin that they do.
+    pub(crate) fn matches_worker_version(&self, worker_version: Option<&str>) -> bool {
+        self.worker_version
+            .as_deref()
+            .is_none_or(|pin| Some(pin) == worker_version)
     }
 
     /// `true` for a record cancellation can no longer change: `completed`,
@@ -478,6 +513,7 @@ impl TaskRecord {
             "thread_id": self.thread_id,
             "cancel_requested": self.cancel_requested,
             "deadline": self.deadline,
+            "worker_version": self.worker_version,
             "lease": self.lease.as_ref().map(|lease| json!({
                 "owner": lease.owner,
                 "expires_at": lease.expires_at,
@@ -547,6 +583,75 @@ pub(crate) struct RunCancellation {
     pub cancelled: Vec<TaskRecord>,
     /// Leased tasks whose holders were signalled via `cancel_requested`.
     pub signalled: Vec<TaskRecord>,
+}
+
+/// What a worker will take right now (R0.6 wave 3): the pools it serves,
+/// each pool's configured concurrency limit, and the exact worker version
+/// it advertises. Bundled because every claim carries all three — the
+/// placement rules (pool saturation, version pinning) are applied together
+/// before any candidate is chosen, and passing them separately invited
+/// half-applied checks.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClaimScope<'a> {
+    /// Pools the worker serves; a claim considers only these pools' tasks.
+    pub pools: &'a [String],
+    /// Per-pool live-lease caps. A pool absent here is uncapped; a cap of
+    /// `0` pauses the pool (it hands out nothing until the cap is raised).
+    pub pool_limits: &'a HashMap<String, usize>,
+    /// The version the worker advertises, matched exactly against a task's
+    /// pin ([`TaskRecord::worker_version`]); `None` claims unpinned work
+    /// only.
+    pub worker_version: Option<&'a str>,
+}
+
+/// A tenant's queue pressure (R0.6 wave 3): the three gauges tenant quotas
+/// enforce at submission (`429` when exceeded — see
+/// `ServerConfig::with_task_quota` and `docs/durable-work-design.md`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TaskUsage {
+    /// The backlog: `queued` tasks plus `failed` ones with a retry
+    /// scheduled — every task waiting for a worker — **plus outbox rows
+    /// still pending publication**. The pending rows count because the
+    /// quota exists to bound a tenant's work in the pipeline, and a flood
+    /// through the outbox must not bypass it.
+    pub queued: u64,
+    /// Tasks with status `leased` — in flight with a worker. The gauge is
+    /// the record's status, not the wall clock: an expired-but-unreclaimed
+    /// lease still counts until the claim path takes it back, so the quota
+    /// never under-counts a worker that is merely unreachable.
+    pub in_flight: u64,
+    /// Dead-lettered tasks. Counted against the tenant because an unbounded
+    /// DLQ is a quiet disk-full outage; the cap forces inspection and
+    /// re-drive before more work is accepted.
+    pub dlq: u64,
+}
+
+/// One pool's autoscaling signals (R0.6 wave 3), as read by
+/// `GET /tasks/metrics`: the numbers an external autoscaler (HPA, KEDA, a
+/// cron-and-kubectl script) scales the pool's workers on. Rusty publishes
+/// the signals; the scaling decision stays with the operator — there is no
+/// built-in autoscaler, by design.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PoolStat {
+    /// The pool these signals describe.
+    pub pool: String,
+    /// Backlog depth: tasks waiting for a worker (`queued`, plus `failed`
+    /// with a retry scheduled — due or not; the autoscaler must drain all
+    /// of it).
+    pub queue_depth: u64,
+    /// Live leases: `leased` tasks whose visibility timeout has not
+    /// expired. This is the numerator of the pool's lease saturation — and
+    /// the same count the claim path enforces the pool's concurrency limit
+    /// against, so the signal and the mechanism can never disagree. An
+    /// expired-but-unreclaimed lease is excluded: it is visible to claimers
+    /// again, hence part of the backlog, not of in-flight capacity.
+    pub leased: u64,
+    /// Creation time of the oldest task a claim right now would hand out
+    /// (`queued`, backoff-elapsed `failed`, or lease-expired). `None` when
+    /// nothing is visible. Reported on the wire as an age in milliseconds
+    /// against the response's `now`, so a consumer needs no clock-skew
+    /// correction of its own.
+    pub oldest_visible_at: Option<DateTime<Utc>>,
 }
 
 /// A `[0, 1)` jitter sample for [`classify_retry`], from OS entropy via the
@@ -729,6 +834,7 @@ mod tests {
                 run_id: None,
                 thread_id: None,
                 deadline: None,
+                worker_version: None,
             },
             Utc::now(),
         )
@@ -1127,6 +1233,7 @@ mod tests {
         assert_eq!(wire["run_id"], Value::Null);
         assert_eq!(wire["cancel_requested"], json!(false));
         assert_eq!(wire["deadline"], Value::Null);
+        assert_eq!(wire["worker_version"], Value::Null);
         assert_eq!(wire["next_attempt_at"], Value::Null);
     }
 
@@ -1164,6 +1271,26 @@ mod tests {
         assert!(back.lease.is_none() && back.result.is_none() && back.run_id.is_none());
         assert!(back.effect.is_none() && back.error_class.is_none());
         assert!(!back.cancel_requested && back.deadline.is_none());
+        assert!(
+            back.worker_version.is_none(),
+            "wave-3 pin defaults to unpinned"
+        );
+    }
+
+    #[test]
+    fn worker_version_pin_matches_only_the_exact_string() {
+        let mut pinned = record();
+        pinned.worker_version = Some("activity-worker/1.4.0".to_string());
+        assert!(pinned.matches_worker_version(Some("activity-worker/1.4.0")));
+        assert!(!pinned.matches_worker_version(Some("activity-worker/1.5.0")));
+        assert!(
+            !pinned.matches_worker_version(None),
+            "a worker advertising no version cannot take a pinned task"
+        );
+        // Unpinned work is claimable by anyone, versioned or not.
+        let unpinned = record();
+        assert!(unpinned.matches_worker_version(None));
+        assert!(unpinned.matches_worker_version(Some("activity-worker/1.4.0")));
     }
 
     #[test]

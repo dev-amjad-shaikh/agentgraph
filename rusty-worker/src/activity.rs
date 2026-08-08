@@ -20,9 +20,12 @@
 //!
 //! ## The lease protocol (client side)
 //!
-//! - `POST {base}/tasks/claim` — body `{worker_id, pools?, lease_ms}`; a
-//!   `200` carries `{"task": {…}}` (a [`ClaimedTask`]), a `204` means no
-//!   work is available in the claimed pools.
+//! - `POST {base}/tasks/claim` — body `{worker_id, pools?, worker_version?,
+//!   lease_ms}`; a `200` carries `{"task": {…}}` (a [`ClaimedTask`]), a `204`
+//!   means no work is available in the claimed pools. `worker_version` (R0.6
+//!   wave 3) is the worker's advertised version: the server matches it
+//!   exactly against a task's version pin, so a run pinned to a version
+//!   keeps dispatching to workers running it until the run finishes.
 //! - `POST {base}/tasks/{task_id}/heartbeat` — body `{worker_id, lease_ms}`,
 //!   sent from a background task every `lease / 3`; a `200` renews the lease
 //!   (`{lease_expires_at, cancel_requested}`), a `409` means the lease is
@@ -333,6 +336,12 @@ struct ClaimRequest<'a> {
     worker_id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pools: Option<&'a [String]>,
+    /// The worker's advertised version (R0.6 wave 3), matched exactly
+    /// against a task's `worker_version` pin. Omitted (not null) when
+    /// unconfigured — an unversioned worker takes unpinned work only, and
+    /// pre-wave-3 servers never see the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker_version: Option<&'a str>,
     lease_ms: u64,
 }
 
@@ -491,6 +500,10 @@ pub struct ActivityWorker {
     lease: Duration,
     /// Pool names to claim from; empty means the server's default pool.
     pools: Vec<String>,
+    /// The version advertised on every claim (R0.6 wave 3), matched
+    /// exactly against tasks' `worker_version` pins; `None` claims
+    /// unpinned work only.
+    worker_version: Option<String>,
     claim_backoff_base: Duration,
     claim_backoff_max: Duration,
     /// How long an in-flight activity may run after draining starts before
@@ -520,6 +533,7 @@ impl ActivityWorker {
                 .expect("reqwest client builder with rustls must succeed"),
             lease: DEFAULT_LEASE,
             pools: Vec::new(),
+            worker_version: None,
             claim_backoff_base: DEFAULT_CLAIM_BACKOFF_BASE,
             claim_backoff_max: DEFAULT_CLAIM_BACKOFF_MAX,
             drain_grace: DEFAULT_DRAIN_GRACE,
@@ -565,6 +579,22 @@ impl ActivityWorker {
         S: Into<String>,
     {
         self.pools = pools.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Advertise this worker's version on every claim (R0.6 wave 3). The
+    /// server matches it **exactly** against a task's `worker_version`
+    /// pin: tasks a run pinned to this version are leased to this worker
+    /// (and its version-mates) until the run finishes, so a mid-run deploy
+    /// never changes semantics under an in-flight execution; unpinned
+    /// tasks remain claimable regardless. With no version configured the
+    /// claim omits the field and the worker takes unpinned work only —
+    /// a worker that should serve pinned runs must advertise the version
+    /// it actually runs. Free-form string, but make it the real build
+    /// identity (crate version, image tag): a stale advertisement defeats
+    /// the pin's purpose.
+    pub fn with_worker_version(mut self, version: impl Into<String>) -> Self {
+        self.worker_version = Some(version.into());
         self
     }
 
@@ -624,6 +654,7 @@ impl ActivityWorker {
             base_url = %self.base_url,
             lease_ms = self.lease_ms(),
             pools = ?self.pools,
+            worker_version = %self.worker_version.as_deref().unwrap_or(""),
             kinds = ?self.registered_kinds(),
             drain_grace_ms = self.drain_grace.as_millis() as u64,
             "activity worker started"
@@ -679,6 +710,7 @@ impl ActivityWorker {
             } else {
                 Some(self.pools.as_slice())
             },
+            worker_version: self.worker_version.as_deref(),
             lease_ms: self.lease_ms(),
         };
         let response = match self
@@ -1232,6 +1264,7 @@ mod tests {
         let body = ClaimRequest {
             worker_id: "w-1",
             pools: None,
+            worker_version: None,
             lease_ms: 100,
         };
         let value = serde_json::to_value(&body).unwrap();
@@ -1241,12 +1274,30 @@ mod tests {
         let body = ClaimRequest {
             worker_id: "w-1",
             pools: Some(pools.as_slice()),
+            worker_version: None,
             lease_ms: 100,
         };
         let value = serde_json::to_value(&body).unwrap();
         assert_eq!(
             value,
             json!({"worker_id": "w-1", "pools": ["gpu"], "lease_ms": 100})
+        );
+    }
+
+    #[test]
+    fn claim_request_carries_the_advertised_worker_version() {
+        // Wave 3: a configured version travels on the claim; unconfigured
+        // the field is omitted entirely (pre-wave-3 servers never see it).
+        let body = ClaimRequest {
+            worker_id: "w-1",
+            pools: None,
+            worker_version: Some("activity-worker/1.4.0"),
+            lease_ms: 100,
+        };
+        let value = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            value,
+            json!({"worker_id": "w-1", "worker_version": "activity-worker/1.4.0", "lease_ms": 100})
         );
     }
 
